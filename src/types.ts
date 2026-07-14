@@ -1,3 +1,14 @@
+export type Environment = {
+  id: string;
+  name: string;
+  /** "local" | "ssh" */
+  kind: string;
+  sshHost?: string | null;
+  remoteGrokPath?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type Project = {
   id: string;
   name: string;
@@ -6,9 +17,17 @@ export type Project = {
   updatedAt: string;
   /** Built-in temp workspace for chats without a real project. */
   isScratch?: boolean;
+  /** `local` or `ssh:<host>` */
+  environmentId?: string;
 };
 
 export const SCRATCH_PROJECT_ID = "scratch";
+export const LOCAL_ENV_ID = "local";
+
+export function scratchProjectIdForEnv(environmentId: string): string {
+  if (!environmentId || environmentId === LOCAL_ENV_ID) return SCRATCH_PROJECT_ID;
+  return `scratch:${environmentId}`;
+}
 
 export type ChatMeta = {
   id: string;
@@ -88,10 +107,13 @@ export type AppData = {
   chats: ChatMeta[];
   activeProjectId?: string | null;
   activeChatId?: string | null;
+  environments?: Environment[];
+  activeEnvironmentId?: string | null;
 };
 
 export type PermissionRequest = {
-  requestId: number;
+  /** JSON-RPC id from the agent (number or string). */
+  requestId: number | string;
   sessionId: string;
   toolCall: {
     toolCallId?: string;
@@ -105,12 +127,12 @@ export type PermissionRequest = {
     name: string;
     kind: string;
   }>;
+  environmentId?: string;
 };
 
 export type AgentStatus = {
   connected: boolean;
   message: string;
   agentInfo?: unknown;
+  environmentId?: string;
 };
-
-

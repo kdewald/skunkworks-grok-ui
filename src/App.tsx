@@ -53,33 +53,50 @@ function App() {
         ),
         listen<PermissionRequest>("permission-request", (event) => {
           const p = event.payload as PermissionRequest & {
-            request_id?: number;
+            request_id?: number | string;
           };
+          const requestId = p.requestId ?? p.request_id;
+          if (requestId === undefined || requestId === null) {
+            pushLog("[permission] missing request id");
+            return;
+          }
           setPermission({
-            requestId: p.requestId ?? p.request_id ?? 0,
+            requestId,
             sessionId: p.sessionId,
             toolCall: p.toolCall as PermissionRequest["toolCall"],
             options: (p.options ?? []) as PermissionRequest["options"],
+            environmentId: p.environmentId,
           });
         }),
-        listen<{ connected: boolean; message: string }>(
-          "agent-status",
-          (event) => {
-            setAgentStatus({
-              connected: event.payload.connected,
-              message: event.payload.message,
-            });
-          },
-        ),
+        listen<{
+          connected: boolean;
+          message: string;
+          environmentId?: string;
+        }>("agent-status", (event) => {
+          setAgentStatus({
+            connected: event.payload.connected,
+            message: event.payload.message,
+            environmentId: event.payload.environmentId,
+          });
+        }),
         listen<{ level?: string; message?: string }>("agent-log", (event) => {
           pushLog(
             `[${event.payload.level ?? "log"}] ${event.payload.message ?? ""}`,
           );
         }),
-        listen<{ chatId: string }>("prompt-finished", (event) => {
-          void refreshChat(event.payload.chatId);
-          useAppStore.setState({ busy: false });
-        }),
+        listen<{ chatId: string; ok?: boolean; error?: string | null }>(
+          "prompt-finished",
+          (event) => {
+            void refreshChat(event.payload.chatId);
+            useAppStore.setState({
+              busy: false,
+              error:
+                event.payload.ok === false && event.payload.error
+                  ? String(event.payload.error)
+                  : null,
+            });
+          },
+        ),
         listen<{ chatId: string }>("chat-updated", (event) => {
           void refreshChat(event.payload.chatId);
         }),

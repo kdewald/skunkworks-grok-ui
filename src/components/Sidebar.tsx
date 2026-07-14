@@ -4,13 +4,15 @@ import {
   FolderPlus,
   MoreVertical,
   MessageSquarePlus,
+  Server,
   Sparkles,
   Trash2,
   X,
 } from "lucide-react";
-import { chatsForProject, useAppStore } from "../store";
+import { chatsForProject, projectsForEnv, useAppStore } from "../store";
 import { displayPath } from "../pathDisplay";
-import { SCRATCH_PROJECT_ID } from "../types";
+import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID } from "../types";
+import { ConnectionsPanel } from "./ConnectionsPanel";
 
 export function Sidebar() {
   const {
@@ -20,6 +22,9 @@ export function Sidebar() {
     activeChatId,
     agent,
     busy,
+    environments,
+    activeEnvironmentId,
+    connectedEnvironments,
     selectProject,
     createChat,
     selectChat,
@@ -27,15 +32,25 @@ export function Sidebar() {
     addProject,
     removeProject,
     connectAgent,
+    setActiveEnvironment,
+    setConnectionsOpen,
   } = useAppStore();
 
   const [menuProjectId, setMenuProjectId] = useState<string | null>(null);
+  const [remotePathOpen, setRemotePathOpen] = useState(false);
+  const [remotePath, setRemotePath] = useState("");
   const menuRef = useRef<HTMLDivElement>(null);
 
+  const envProjects = projectsForEnv(projects, activeEnvironmentId);
   const projectChats = chatsForProject(chats, activeProjectId);
   const activeProject = projects.find((p) => p.id === activeProjectId);
+  const activeEnv = environments.find((e) => e.id === activeEnvironmentId);
   const isScratch =
-    activeProject?.isScratch || activeProjectId === SCRATCH_PROJECT_ID;
+    activeProject?.isScratch ||
+    activeProjectId === SCRATCH_PROJECT_ID ||
+    (activeProjectId?.startsWith("scratch:") ?? false);
+  const isRemote = activeEnvironmentId !== LOCAL_ENV_ID;
+  const envConnected = connectedEnvironments.includes(activeEnvironmentId);
 
   useEffect(() => {
     if (!menuProjectId) return;
@@ -56,13 +71,30 @@ export function Sidebar() {
   }, [menuProjectId]);
 
   async function onAddProject() {
+    if (isRemote) {
+      setRemotePath("");
+      setRemotePathOpen(true);
+      return;
+    }
     const selected = await open({
       directory: true,
       multiple: false,
       title: "Open project folder",
     });
     if (typeof selected === "string") {
-      await addProject(selected);
+      await addProject(selected, activeEnvironmentId);
+    }
+  }
+
+  async function submitRemotePath() {
+    const path = remotePath.trim();
+    if (!path) return;
+    try {
+      await addProject(path, activeEnvironmentId);
+      setRemotePathOpen(false);
+      setRemotePath("");
+    } catch (e) {
+      alert(String(e));
     }
   }
 
@@ -77,6 +109,12 @@ export function Sidebar() {
     }
   }
 
+  const statusLabel = envConnected
+    ? isRemote
+      ? activeEnv?.name ?? "Remote"
+      : "Local"
+    : "Connect";
+
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
@@ -88,14 +126,49 @@ export function Sidebar() {
           </div>
         </div>
         <button
-          className={`status-pill ${agent.connected ? "ok" : "bad"}`}
-          onClick={() => connectAgent()}
+          className={`status-pill ${envConnected ? "ok" : "bad"}`}
+          onClick={() => connectAgent(activeEnvironmentId)}
           title={agent.message}
           disabled={busy}
         >
           <span className="dot" />
-          {agent.connected ? "Connected" : "Connect"}
+          {statusLabel}
         </button>
+      </div>
+
+      <div className="sidebar-section env-section">
+        <div className="section-label-row">
+          <span className="section-label">Environment</span>
+          <button
+            className="icon-btn"
+            onClick={() => setConnectionsOpen(true)}
+            title="Connections"
+          >
+            <Server size={14} strokeWidth={1.75} />
+          </button>
+        </div>
+        <select
+          className="env-select"
+          value={activeEnvironmentId}
+          onChange={(e) => void setActiveEnvironment(e.target.value)}
+          disabled={busy}
+        >
+          {environments.map((env) => {
+            const on = connectedEnvironments.includes(env.id);
+            return (
+              <option key={env.id} value={env.id}>
+                {on ? "● " : "○ "}
+                {env.name}
+                {env.kind === "ssh" ? " (SSH)" : ""}
+              </option>
+            );
+          })}
+        </select>
+        {isRemote && (
+          <div className="env-hint" title={activeEnv?.sshHost ?? undefined}>
+            SSH · {activeEnv?.sshHost ?? activeEnvironmentId}
+          </div>
+        )}
       </div>
 
       <div className="sidebar-section projects-section">
@@ -103,8 +176,10 @@ export function Sidebar() {
           <span className="section-label">Projects</span>
           <button
             className="icon-btn"
-            onClick={onAddProject}
-            title="Open project folder"
+            onClick={() => void onAddProject()}
+            title={
+              isRemote ? "Add remote project path" : "Open project folder"
+            }
           >
             <FolderPlus size={14} strokeWidth={1.75} />
           </button>
@@ -112,10 +187,17 @@ export function Sidebar() {
         <div
           className={`project-list ${menuProjectId ? "has-open-menu" : ""}`}
         >
-          {projects.map((p) => {
-            const scratch = p.isScratch || p.id === SCRATCH_PROJECT_ID;
+          {envProjects.map((p) => {
+            const scratch =
+              p.isScratch ||
+              p.id === SCRATCH_PROJECT_ID ||
+              p.id.startsWith("scratch:");
             const menuOpen = menuProjectId === p.id;
-            const displayName = scratch ? "Scratch" : p.name || "Untitled";
+            const displayName = scratch
+              ? isRemote
+                ? "Scratch"
+                : "Scratch"
+              : p.name || "Untitled";
             return (
               <div
                 key={p.id}
@@ -149,12 +231,13 @@ export function Sidebar() {
                   </div>
                   <div className="project-path" title={p.path}>
                     {scratch
-                      ? "No project · private temp folders"
+                      ? isRemote
+                        ? "Remote temp folders"
+                        : "No project · private temp folders"
                       : displayPath(p.path)}
                   </div>
                 </button>
 
-                {/* Always reserve the action column so rows align */}
                 <div
                   className="project-menu-wrap"
                   ref={menuOpen ? menuRef : undefined}
@@ -255,6 +338,54 @@ export function Sidebar() {
           ))}
         </div>
       </div>
+
+      {remotePathOpen && (
+        <div
+          className="remote-path-overlay"
+          onClick={() => setRemotePathOpen(false)}
+        >
+          <div
+            className="remote-path-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="remote-path-title">Remote project path</div>
+            <p className="connections-hint">
+              Absolute path on{" "}
+              <strong>{activeEnv?.name ?? activeEnvironmentId}</strong>
+            </p>
+            <input
+              className="text-input"
+              autoFocus
+              placeholder="/home/you/src/my-project"
+              value={remotePath}
+              onChange={(e) => setRemotePath(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void submitRemotePath();
+                if (e.key === "Escape") setRemotePathOpen(false);
+              }}
+            />
+            <div className="remote-path-actions">
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => setRemotePathOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary-btn"
+                disabled={!remotePath.trim() || busy}
+                onClick={() => void submitRemotePath()}
+              >
+                Add project
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConnectionsPanel />
     </aside>
   );
 }

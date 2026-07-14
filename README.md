@@ -22,7 +22,7 @@ Project-scoped chats, collapsible agent work, attachments, and permission prompt
 - [Grok Build CLI](https://docs.x.ai/build/overview) installed and authenticated (`grok` on `PATH`, or `GROK_PATH`)
 - macOS, Linux, or Windows (Tauri 2 platform deps)
 
-## Build and run (local only)
+## Build and run
 
 ```bash
 git clone git@github.com:kdewald/skunkworks-grok-ui.git
@@ -30,6 +30,18 @@ cd skunkworks-grok-ui
 npm install
 npm run tauri:dev      # development with hot reload
 ```
+
+### Remote SSH (Codex-style)
+
+The desktop window can drive a **remote** `grok agent stdio` over SSH so tools and project files run on another machine.
+
+1. Passwordless SSH to the host (`Host` in `~/.ssh/config`, key auth, `BatchMode` OK).
+2. Install a current [Grok Build CLI](https://docs.x.ai/build/overview) **on the remote host** (`grok` on the login-shell `PATH`, e.g. `~/.local/bin`).
+3. Sign in **on the remote host** so `~/.grok/auth.json` has a valid cached token (`grok` once interactively, or copy a fresh auth file). Expired tokens only offer browser login, which this UI cannot complete over SSH.
+4. In the app: **Connections** (server icon) → pick a host from SSH config or enter `user@host` → **Add & connect**.
+5. Switch the **Environment** dropdown, open a remote project path, and chat as usual.
+
+Chat transcripts stay in the local app data dir; the agent process and `cwd` are remote.
 
 ### Install as a macOS app (recommended for daily use)
 
@@ -60,7 +72,9 @@ Prebuilt binaries, app stores, and auto-update are not provided yet.
 
 | Env | Purpose |
 |-----|---------|
-| `GROK_PATH` | Path to `grok` if not on `PATH` |
+| `GROK_PATH` | Path to local `grok` if not on `PATH` |
+
+Remote hosts may set an optional absolute remote `grok` path in Connections if it is not on the remote login-shell `PATH`.
 
 | Data | Where |
 |------|--------|
@@ -71,7 +85,9 @@ Prebuilt binaries, app stores, and auto-update are not provided yet.
 ## Architecture
 
 ```
-React UI -> Tauri (Rust store + ACP client) -> grok agent stdio
+React UI -> Tauri (Rust store + ACP client)
+              ├─ local:  grok agent --no-leader stdio
+              └─ remote: ssh host -- bash -lc 'grok agent --no-leader stdio'
 ```
 
 ## Scripts

@@ -5,10 +5,11 @@ import type {
   AppData,
   ChatDocument,
   ChatMeta,
+  Environment,
   PermissionRequest,
   Project,
 } from "./types";
-import { SCRATCH_PROJECT_ID } from "./types";
+import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID, scratchProjectIdForEnv } from "./types";
 
 /** Serialize apply_session_update invokes so UI state never lands out of order. */
 let applyQueue: Promise<void> = Promise.resolve();
@@ -17,6 +18,10 @@ type AppStore = {
   ready: boolean;
   dataDir: string;
   agent: AgentStatus;
+  environments: Environment[];
+  activeEnvironmentId: string;
+  connectedEnvironments: string[];
+  sshHosts: string[];
   projects: Project[];
   chats: ChatMeta[];
   activeProjectId: string | null;
@@ -26,10 +31,21 @@ type AppStore = {
   busy: boolean;
   error: string | null;
   logs: string[];
+  connectionsOpen: boolean;
 
   bootstrap: () => Promise<void>;
-  connectAgent: () => Promise<void>;
-  addProject: (path: string) => Promise<void>;
+  connectAgent: (environmentId?: string) => Promise<void>;
+  disconnectAgent: (environmentId?: string) => Promise<void>;
+  setActiveEnvironment: (environmentId: string) => Promise<void>;
+  addSshEnvironment: (
+    host: string,
+    name?: string,
+    remoteGrokPath?: string,
+  ) => Promise<void>;
+  removeEnvironment: (environmentId: string) => Promise<void>;
+  refreshSshHosts: () => Promise<void>;
+  setConnectionsOpen: (open: boolean) => void;
+  addProject: (path: string, environmentId?: string) => Promise<void>;
   removeProject: (projectId: string) => Promise<void>;
   selectProject: (projectId: string) => Promise<void>;
   createChat: () => Promise<void>;
@@ -59,6 +75,7 @@ type AppStore = {
   setPermission: (p: PermissionRequest | null) => void;
   pushLog: (msg: string) => void;
   setAgentStatus: (s: Partial<AgentStatus>) => void;
+  isEnvConnected: (environmentId: string) => boolean;
 };
 
 function chatsForProject(chats: ChatMeta[], projectId: string | null) {
@@ -71,10 +88,20 @@ function chatsForProject(chats: ChatMeta[], projectId: string | null) {
     );
 }
 
+function projectsForEnv(projects: Project[], environmentId: string) {
+  return projects.filter(
+    (p) => (p.environmentId || LOCAL_ENV_ID) === environmentId,
+  );
+}
+
 export const useAppStore = create<AppStore>((set, get) => ({
   ready: false,
   dataDir: "",
   agent: { connected: false, message: "Not connected" },
+  environments: [],
+  activeEnvironmentId: LOCAL_ENV_ID,
+  connectedEnvironments: [],
+  sshHosts: [],
   projects: [],
   chats: [],
   activeProjectId: null,
@@ -84,6 +111,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   busy: false,
   error: null,
   logs: [],
+  connectionsOpen: false,
+
+  isEnvConnected: (environmentId: string) =>
+    get().connectedEnvironments.includes(environmentId),
 
   bootstrap: async () => {
     try {
@@ -91,17 +122,32 @@ export const useAppStore = create<AppStore>((set, get) => ({
         data: AppData;
         dataDir: string;
         agentConnected: boolean;
+        connectedEnvironments: string[];
+        activeEnvironmentId: string;
+        sshHosts: string[];
       }>("get_bootstrap");
+      const activeEnv =
+        res.activeEnvironmentId ||
+        res.data.activeEnvironmentId ||
+        LOCAL_ENV_ID;
+      const connected = res.connectedEnvironments ?? [];
       set({
         ready: true,
         dataDir: res.dataDir,
+        environments: res.data.environments ?? [],
+        activeEnvironmentId: activeEnv,
+        connectedEnvironments: connected,
+        sshHosts: res.sshHosts ?? [],
         projects: res.data.projects ?? [],
         chats: res.data.chats ?? [],
         activeProjectId: res.data.activeProjectId ?? null,
         activeChatId: res.data.activeChatId ?? null,
         agent: {
-          connected: res.agentConnected,
-          message: res.agentConnected ? "Connected" : "Not connected",
+          connected: connected.includes(activeEnv),
+          message: connected.includes(activeEnv)
+            ? "Connected"
+            : "Not connected",
+          environmentId: activeEnv,
         },
       });
       if (res.data.activeChatId) {
@@ -112,41 +158,211 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  connectAgent: async () => {
+  connectAgent: async (environmentId?: string) => {
+    const envId = environmentId ?? get().activeEnvironmentId;
     set({ busy: true, error: null });
     try {
-      await invoke("connect_agent");
+      const res = await invoke<{
+        environmentId: string;
+        message: string;
+      }>("connect_agent", { environmentId: envId });
+      const connectedEnv = res.environmentId || envId;
+      const connected = Array.from(
+        new Set([...get().connectedEnvironments, connectedEnv]),
+      );
       set({
-        agent: { connected: true, message: "Connected to Grok agent" },
+        connectedEnvironments: connected,
+        activeEnvironmentId: connectedEnv,
+        agent: {
+          connected: true,
+          message: res.message || "Connected to Grok agent",
+          environmentId: connectedEnv,
+        },
         busy: false,
       });
     } catch (e) {
       set({
-        agent: { connected: false, message: String(e) },
+        agent: {
+          connected: false,
+          message: String(e),
+          environmentId: envId,
+        },
         error: String(e),
         busy: false,
+        connectedEnvironments: get().connectedEnvironments.filter(
+          (id) => id !== envId,
+        ),
       });
       throw e;
     }
   },
 
-  addProject: async (path: string) => {
-    const project = await invoke<Project>("add_project", { path });
-    const projects = [...get().projects.filter((p) => p.id !== project.id), project];
-    set({ projects, activeProjectId: project.id });
+  disconnectAgent: async (environmentId?: string) => {
+    const envId = environmentId ?? get().activeEnvironmentId;
+    await invoke("disconnect_agent", { environmentId: envId });
+    const connected = get().connectedEnvironments.filter((id) => id !== envId);
+    set({
+      connectedEnvironments: connected,
+      agent: {
+        connected: connected.includes(get().activeEnvironmentId),
+        message: `Disconnected (${envId})`,
+        environmentId: envId,
+      },
+    });
+  },
+
+  setActiveEnvironment: async (environmentId: string) => {
+    const data = await invoke<AppData>("set_active_environment", {
+      environmentId,
+    });
+    const envId = data.activeEnvironmentId || environmentId;
+    set({
+      environments: data.environments ?? get().environments,
+      projects: data.projects ?? get().projects,
+      chats: data.chats ?? get().chats,
+      activeEnvironmentId: envId,
+      activeProjectId: data.activeProjectId ?? null,
+      activeChatId: data.activeChatId ?? null,
+      agent: {
+        ...get().agent,
+        connected: get().connectedEnvironments.includes(envId),
+        environmentId: envId,
+        message: get().connectedEnvironments.includes(envId)
+          ? get().agent.message
+          : "Not connected",
+      },
+    });
+    if (data.activeChatId) {
+      await get().refreshChat(data.activeChatId);
+    } else {
+      set({ activeChat: null });
+    }
+  },
+
+  addSshEnvironment: async (host, name, remoteGrokPath) => {
+    set({ busy: true, error: null });
+    try {
+      const env = await invoke<Environment>("add_ssh_environment", {
+        host,
+        name: name ?? null,
+        remoteGrokPath: remoteGrokPath ?? null,
+      });
+      const environments = [
+        ...get().environments.filter((e) => e.id !== env.id),
+        env,
+      ];
+      // Re-bootstrap projects (scratch for new env)
+      const boot = await invoke<{
+        data: AppData;
+        connectedEnvironments: string[];
+        activeEnvironmentId: string;
+        sshHosts: string[];
+      }>("get_bootstrap");
+      set({
+        environments: boot.data.environments ?? environments,
+        projects: boot.data.projects ?? get().projects,
+        sshHosts: boot.sshHosts ?? get().sshHosts,
+        busy: false,
+      });
+      await get().setActiveEnvironment(env.id);
+      await get().connectAgent(env.id);
+    } catch (e) {
+      set({ error: String(e), busy: false });
+      throw e;
+    }
+  },
+
+  removeEnvironment: async (environmentId: string) => {
+    if (environmentId === LOCAL_ENV_ID) {
+      throw new Error("Cannot remove the local environment");
+    }
+    await invoke("remove_environment", { environmentId });
+    const environments = get().environments.filter((e) => e.id !== environmentId);
+    const projects = get().projects.filter(
+      (p) => (p.environmentId || LOCAL_ENV_ID) !== environmentId,
+    );
+    const projectIds = new Set(
+      get()
+        .projects.filter(
+          (p) => (p.environmentId || LOCAL_ENV_ID) === environmentId,
+        )
+        .map((p) => p.id),
+    );
+    const chats = get().chats.filter((c) => !projectIds.has(c.projectId));
+    const connectedEnvironments = get().connectedEnvironments.filter(
+      (id) => id !== environmentId,
+    );
+    const activeEnvironmentId =
+      get().activeEnvironmentId === environmentId
+        ? LOCAL_ENV_ID
+        : get().activeEnvironmentId;
+    set({
+      environments,
+      projects,
+      chats,
+      connectedEnvironments,
+      activeEnvironmentId,
+      activeProjectId:
+        get().activeProjectId && projectIds.has(get().activeProjectId!)
+          ? SCRATCH_PROJECT_ID
+          : get().activeProjectId,
+      activeChatId:
+        get().activeChat && projectIds.has(get().activeChat!.projectId)
+          ? null
+          : get().activeChatId,
+      activeChat:
+        get().activeChat && projectIds.has(get().activeChat!.projectId)
+          ? null
+          : get().activeChat,
+      agent: {
+        connected: connectedEnvironments.includes(activeEnvironmentId),
+        message: connectedEnvironments.includes(activeEnvironmentId)
+          ? "Connected"
+          : "Not connected",
+        environmentId: activeEnvironmentId,
+      },
+    });
+  },
+
+  refreshSshHosts: async () => {
+    const hosts = await invoke<string[]>("list_ssh_hosts");
+    set({ sshHosts: hosts });
+  },
+
+  setConnectionsOpen: (open) => set({ connectionsOpen: open }),
+
+  addProject: async (path: string, environmentId?: string) => {
+    const envId = environmentId ?? get().activeEnvironmentId;
+    const project = await invoke<Project>("add_project", {
+      path,
+      environmentId: envId,
+    });
+    const projects = [
+      ...get().projects.filter((p) => p.id !== project.id),
+      project,
+    ];
+    set({
+      projects,
+      activeProjectId: project.id,
+      activeEnvironmentId: project.environmentId || envId,
+    });
     await invoke("set_active_project", { projectId: project.id });
   },
 
   removeProject: async (projectId: string) => {
-    if (projectId === SCRATCH_PROJECT_ID) {
+    if (
+      projectId === SCRATCH_PROJECT_ID ||
+      projectId.startsWith("scratch:")
+    ) {
       throw new Error("Scratch workspace can't be removed");
     }
     await invoke("remove_project", { projectId });
     const projects = get().projects.filter((p) => p.id !== projectId);
     const chats = get().chats.filter((c) => c.projectId !== projectId);
+    const envId = get().activeEnvironmentId;
     const activeProjectId =
       get().activeProjectId === projectId
-        ? SCRATCH_PROJECT_ID
+        ? scratchProjectIdForEnv(envId)
         : get().activeProjectId;
     set({
       projects,
@@ -160,8 +376,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   selectProject: async (projectId: string) => {
+    const project = get().projects.find((p) => p.id === projectId);
+    const envId = project?.environmentId || get().activeEnvironmentId;
+    if (envId !== get().activeEnvironmentId) {
+      await get().setActiveEnvironment(envId);
+    }
     await invoke("set_active_project", { projectId });
-    set({ activeProjectId: projectId });
+    set({ activeProjectId: projectId, activeEnvironmentId: envId });
+    // Auto-connect if needed for this env
+    if (!get().connectedEnvironments.includes(envId)) {
+      try {
+        await get().connectAgent(envId);
+      } catch {
+        // status shows error
+      }
+    }
     const first = chatsForProject(get().chats, projectId)[0];
     if (first) {
       await get().selectChat(first.id);
@@ -171,10 +400,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   createChat: async () => {
-    // No project selected → Scratch (temp folder under the home directory)
-    const projectId = get().activeProjectId ?? SCRATCH_PROJECT_ID;
-    if (!get().agent.connected) {
-      await get().connectAgent();
+    const projectId =
+      get().activeProjectId ??
+      scratchProjectIdForEnv(get().activeEnvironmentId);
+    const project = get().projects.find((p) => p.id === projectId);
+    const envId = project?.environmentId || get().activeEnvironmentId;
+    if (!get().connectedEnvironments.includes(envId)) {
+      await get().connectAgent(envId);
     }
     set({ busy: true, error: null });
     try {
@@ -208,8 +440,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await invoke("set_active_chat", { chatId });
     set({ activeChatId: chatId });
     await get().refreshChat(chatId);
-    // Restore ACP session so follow-up messages don't hit "unknown session id".
-    if (get().agent.connected) {
+
+    const chat = get().activeChat;
+    const project = get().projects.find((p) => p.id === chat?.projectId);
+    const envId = project?.environmentId || get().activeEnvironmentId;
+
+    if (!get().connectedEnvironments.includes(envId)) {
+      try {
+        await get().connectAgent(envId);
+      } catch (e) {
+        get().pushLog(`[session] connect failed: ${e}`);
+        return;
+      }
+    }
+
+    if (get().connectedEnvironments.includes(envId)) {
       try {
         const res = await invoke<{
           chat: ChatDocument;
@@ -229,13 +474,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
           ),
         });
         if (res.status === "recreated") {
-          set({
-            error: null,
-          });
           get().pushLog(`[session] ${res.message}`);
         }
       } catch (e) {
-        // Non-fatal for browsing; send will retry ensure.
         get().pushLog(`[session] ensure failed: ${e}`);
       }
     }
@@ -273,8 +514,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
       chatId = get().activeChatId;
     }
     if (!chatId) throw new Error("No active chat");
-    if (!get().agent.connected) {
-      await get().connectAgent();
+
+    const project = get().projects.find(
+      (p) => p.id === (get().activeChat?.projectId || get().activeProjectId),
+    );
+    const envId = project?.environmentId || get().activeEnvironmentId;
+    if (!get().connectedEnvironments.includes(envId)) {
+      await get().connectAgent(envId);
     }
     set({ busy: true, error: null });
     try {
@@ -385,9 +631,35 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   setPermission: (p) => set({ permission: p }),
-  pushLog: (msg) =>
-    set({ logs: [...get().logs.slice(-200), msg] }),
-  setAgentStatus: (s) => set({ agent: { ...get().agent, ...s } }),
+  pushLog: (msg) => set({ logs: [...get().logs.slice(-200), msg] }),
+  setAgentStatus: (s) => {
+    const envId = s.environmentId ?? get().agent.environmentId;
+    let connectedEnvironments = get().connectedEnvironments;
+    if (typeof s.connected === "boolean" && envId) {
+      if (s.connected) {
+        connectedEnvironments = Array.from(
+          new Set([...connectedEnvironments, envId]),
+        );
+      } else {
+        connectedEnvironments = connectedEnvironments.filter((id) => id !== envId);
+      }
+    }
+    const activeConnected = connectedEnvironments.includes(
+      get().activeEnvironmentId,
+    );
+    set({
+      connectedEnvironments,
+      agent: {
+        ...get().agent,
+        ...s,
+        // Status pill reflects active environment connectivity
+        connected:
+          envId === get().activeEnvironmentId
+            ? (s.connected ?? get().agent.connected)
+            : activeConnected,
+      },
+    });
+  },
 }));
 
-export { chatsForProject };
+export { chatsForProject, projectsForEnv };

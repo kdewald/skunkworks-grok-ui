@@ -17,7 +17,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap,
             commands::connect_agent,
+            commands::disconnect_agent,
             commands::set_grok_path,
+            commands::list_ssh_hosts,
+            commands::probe_environment,
+            commands::add_ssh_environment,
+            commands::remove_environment,
+            commands::set_active_environment,
             commands::list_projects,
             commands::add_project,
             commands::remove_project,

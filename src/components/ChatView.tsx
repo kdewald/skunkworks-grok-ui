@@ -199,9 +199,10 @@ export function ChatView() {
                   <span />
                 </div>
               )}
-              {turn.status === "error" && (
-                <div className="error-banner">Turn failed</div>
-              )}
+              {turn.status === "error" &&
+                !turn.assistantMessage.includes("**Turn failed:**") && (
+                  <div className="error-banner">Turn failed</div>
+                )}
             </div>
           </div>
         ))}

@@ -1,4 +1,4 @@
-//! Local persistence for projects and chats.
+//! Local persistence for projects, chats, and SSH environments.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,79 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Stable id for the built-in no-project workspace.
+/// Stable id for the built-in no-project workspace on the local machine.
 pub const SCRATCH_PROJECT_ID: &str = "scratch";
+
+/// Built-in local environment id.
+pub const LOCAL_ENV_ID: &str = "local";
+
+fn default_local_env() -> String {
+    LOCAL_ENV_ID.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Environment {
+    pub id: String,
+    pub name: String,
+    /// "local" | "ssh"
+    pub kind: String,
+    /// SSH Host alias or user@host (ssh only).
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// Optional absolute path to grok on the remote host.
+    #[serde(default)]
+    pub remote_grok_path: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Environment {
+    pub fn local() -> Self {
+        let ts = now();
+        Self {
+            id: LOCAL_ENV_ID.to_string(),
+            name: local_env_display_name(),
+            kind: "local".into(),
+            ssh_host: None,
+            remote_grok_path: None,
+            created_at: ts,
+            updated_at: ts,
+        }
+    }
+
+    pub fn ssh(host: &str, name: Option<String>, remote_grok_path: Option<String>) -> Self {
+        let host = host.trim();
+        let ts = now();
+        Self {
+            id: ssh_env_id(host),
+            name: name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| host.to_string()),
+            kind: "ssh".into(),
+            ssh_host: Some(host.to_string()),
+            remote_grok_path: remote_grok_path.filter(|s| !s.trim().is_empty()),
+            created_at: ts,
+            updated_at: ts,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.kind == "local" || self.id == LOCAL_ENV_ID
+    }
+}
+
+pub fn ssh_env_id(host: &str) -> String {
+    format!("ssh:{}", host.trim())
+}
+
+pub fn scratch_project_id_for_env(environment_id: &str) -> String {
+    if environment_id.is_empty() || environment_id == LOCAL_ENV_ID {
+        SCRATCH_PROJECT_ID.to_string()
+    } else {
+        format!("scratch:{environment_id}")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +93,9 @@ pub struct Project {
     /// Built-in temp workspace (no real project folder).
     #[serde(default)]
     pub is_scratch: bool,
+    /// Which machine this project lives on (`local` or `ssh:host`).
+    #[serde(default = "default_local_env")]
+    pub environment_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +223,11 @@ pub struct AppData {
     pub chats: Vec<ChatMeta>,
     pub active_project_id: Option<String>,
     pub active_chat_id: Option<String>,
+    /// Saved environments (local is always ensured at runtime).
+    #[serde(default)]
+    pub environments: Vec<Environment>,
+    #[serde(default)]
+    pub active_environment_id: Option<String>,
 }
 
 pub struct Store {
@@ -281,12 +360,71 @@ pub fn remove_scratch_chat_dir(chat_id: &str) {
     }
 }
 
-/// Resolve the ACP session cwd for a project (+ chat when scratch).
-pub fn resolve_session_cwd(project: &Project, chat_id: &str) -> Result<String> {
-    if project.is_scratch || project.id == SCRATCH_PROJECT_ID {
+/// Resolve the ACP session cwd for a **local** project (+ chat when scratch).
+/// For SSH projects/scratch, callers must resolve via remote helpers.
+pub fn resolve_local_session_cwd(project: &Project, chat_id: &str) -> Result<String> {
+    if project.is_scratch || project.id == SCRATCH_PROJECT_ID || project.id.starts_with("scratch:")
+    {
         let path = ensure_scratch_chat_dir(chat_id)?;
         Ok(path.to_string_lossy().to_string())
     } else {
         Ok(project.path.clone())
+    }
+}
+
+/// Display path for remote scratch root (not created locally).
+pub fn remote_scratch_display_path(remote_home: Option<&str>) -> String {
+    match remote_home {
+        Some(h) if !h.is_empty() => format!("{h}/.grok-ui/scratch"),
+        _ => "~/.grok-ui/scratch".into(),
+    }
+}
+
+/// Normalize loaded AppData: environments, project env ids, scratch rows.
+pub fn migrate_app_data(data: &mut AppData) {
+    // Ensure local environment exists.
+    if !data.environments.iter().any(|e| e.id == LOCAL_ENV_ID) {
+        data.environments.insert(0, Environment::local());
+    } else {
+        // Keep local first
+        if let Some(idx) = data.environments.iter().position(|e| e.id == LOCAL_ENV_ID) {
+            if idx != 0 {
+                let e = data.environments.remove(idx);
+                data.environments.insert(0, e);
+            }
+        }
+        // Refresh local display name for this platform
+        if let Some(local) = data.environments.iter_mut().find(|e| e.id == LOCAL_ENV_ID) {
+            local.name = local_env_display_name();
+            local.kind = "local".into();
+        }
+    }
+
+    // Backfill project environment_id
+    for p in &mut data.projects {
+        if p.environment_id.is_empty() {
+            p.environment_id = LOCAL_ENV_ID.to_string();
+        }
+    }
+
+    if data.active_environment_id.is_none() {
+        data.active_environment_id = Some(LOCAL_ENV_ID.to_string());
+    }
+
+    // Drop environments that reference nothing special but ensure active is valid
+    if let Some(active) = data.active_environment_id.clone() {
+        if !data.environments.iter().any(|e| e.id == active) {
+            data.active_environment_id = Some(LOCAL_ENV_ID.to_string());
+        }
+    }
+}
+
+pub fn local_env_display_name() -> String {
+    if cfg!(target_os = "macos") {
+        "This Mac".into()
+    } else if cfg!(target_os = "windows") {
+        "This PC".into()
+    } else {
+        "This machine".into()
     }
 }
