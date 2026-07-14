@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+src-tauri/target/
+
+# Logs / OS
+*.log
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Env
+.env
+.env.*
+
+# Local design dumps / screenshots (not for release trees)
+design-review/
+
+# Optional local notes
+*.local.md
