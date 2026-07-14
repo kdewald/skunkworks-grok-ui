@@ -28,16 +28,24 @@ Project-scoped chats, collapsible agent work, attachments, and permission prompt
 git clone git@github.com:kdewald/skunkworks-grok-ui.git
 cd skunkworks-grok-ui
 npm install
-npm run tauri:dev      # development
-# or
-npm run tauri:build    # release bundle under src-tauri/target/release/bundle/
+npm run tauri:dev      # development with hot reload
 ```
 
-Cargo-oriented (after UI build):
+### Install as a macOS app (recommended for daily use)
+
+`cargo install` is **not** recommended: it often ships without embedded UI assets and opens a blank white window.
 
 ```bash
-npm install && npm run build
-cargo install --path src-tauri
+npm run tauri:build
+# App:   src-tauri/target/release/bundle/macos/Skunkworks Grok UI.app
+# DMG:   src-tauri/target/release/bundle/dmg/Skunkworks Grok UI_0.1.0_*.dmg
+```
+
+Copy the `.app` into `/Applications` or `~/Applications`, then open it from Spotlight or Finder (no terminal required). After UI or backend changes you care about in that install:
+
+```bash
+npm run tauri:build
+cp -R "src-tauri/target/release/bundle/macos/Skunkworks Grok UI.app" ~/Applications/
 ```
 
 Prebuilt binaries, app stores, and auto-update are not provided yet.
