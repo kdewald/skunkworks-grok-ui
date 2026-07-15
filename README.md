@@ -50,7 +50,7 @@ Chat transcripts stay in the local app data dir; the agent process and `cwd` are
 ```bash
 npm run tauri:build
 # App:   src-tauri/target/release/bundle/macos/Skunkworks Grok UI.app
-# DMG:   src-tauri/target/release/bundle/dmg/Skunkworks Grok UI_0.1.0_*.dmg
+# DMG:   src-tauri/target/release/bundle/dmg/Skunkworks Grok UI_0.2.0_*.dmg
 ```
 
 Copy the `.app` into `/Applications` or `~/Applications`, then open it from Spotlight or Finder (no terminal required). After UI or backend changes you care about in that install:

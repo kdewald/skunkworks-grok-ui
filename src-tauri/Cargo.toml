@@ -1,6 +1,6 @@
 [package]
 name = "skunkworks-grok-ui"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial skunkworks desktop UI for Grok Build via ACP. Not affiliated with xAI."
 authors = ["kdewald"]
 license = "Apache-2.0"
