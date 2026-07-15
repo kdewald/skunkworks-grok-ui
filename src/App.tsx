@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { PermissionModal } from "./components/PermissionModal";
-import { useAppStore } from "./store";
+import { useAppStore, waitForApplyDrain } from "./store";
 import type { PermissionRequest } from "./types";
 import "./App.css";
 
@@ -78,28 +78,223 @@ function App() {
             message: event.payload.message,
             environmentId: event.payload.environmentId,
           });
+          // If the agent dies mid-turn, unlock the composer immediately.
+          // Backend also fails pending session/prompt so prompt-finished follows.
+          if (!event.payload.connected) {
+            const state = useAppStore.getState();
+            const active = state.activeChat;
+            if (active?.turns.some((t) => t.status === "streaming")) {
+              useAppStore.setState({
+                busy: false,
+                permission: null,
+                activeChat: {
+                  ...active,
+                  turns: active.turns.map((t) =>
+                    t.status === "streaming"
+                      ? {
+                          ...t,
+                          status: "error",
+                          intermediateCollapsed: true,
+                          assistantMessage: t.assistantMessage
+                            ? `${t.assistantMessage}\n\n---\n**Turn aborted:** agent disconnected (${event.payload.message})`
+                            : `**Turn aborted:** agent disconnected (${event.payload.message})`,
+                        }
+                      : t,
+                  ),
+                },
+              });
+            } else {
+              useAppStore.setState({ busy: false, permission: null });
+            }
+          }
         }),
         listen<{ level?: string; message?: string }>("agent-log", (event) => {
           pushLog(
             `[${event.payload.level ?? "log"}] ${event.payload.message ?? ""}`,
           );
         }),
-        listen<{ chatId: string; ok?: boolean; error?: string | null }>(
-          "prompt-finished",
+        listen<{
+          chatId: string;
+          turnId?: string | null;
+          ok?: boolean;
+          error?: string | null;
+          stopReason?: string | null;
+        }>("prompt-finished", (event) => {
+          void (async () => {
+            const state = useAppStore.getState();
+            const isActiveChat = state.activeChatId === event.payload.chatId;
+            const active = isActiveChat ? state.activeChat : null;
+            const finishedTurnId = event.payload.turnId ?? null;
+            const last = active?.turns[active.turns.length - 1];
+            // Only clear busy if this finish is for the chat/turn the user is on.
+            const shouldClearBusy =
+              isActiveChat &&
+              (!last ||
+                !finishedTurnId ||
+                last.id === finishedTurnId ||
+                last.status !== "streaming");
+
+            if (shouldClearBusy) {
+              useAppStore.setState({
+                busy: false,
+                error:
+                  event.payload.ok === false && event.payload.error
+                    ? String(event.payload.error)
+                    : null,
+                permission:
+                  event.payload.stopReason === "cancelled"
+                    ? null
+                    : state.permission,
+              });
+            } else if (
+              isActiveChat &&
+              event.payload.ok === false &&
+              event.payload.error
+            ) {
+              useAppStore.setState({ error: String(event.payload.error) });
+            }
+
+            // Mark only the finished turn cancelled when needed.
+            if (
+              event.payload.stopReason === "cancelled" &&
+              active &&
+              finishedTurnId
+            ) {
+              useAppStore.setState({
+                activeChat: {
+                  ...active,
+                  turns: active.turns.map((t) =>
+                    t.id === finishedTurnId
+                      ? {
+                          ...t,
+                          status: "cancelled",
+                          intermediateCollapsed: true,
+                        }
+                      : t,
+                  ),
+                },
+              });
+            }
+
+            // Drain any still-buffered stream chunks before refresh so the UI
+            // jumps to the final doc instead of dripping late applies after busy=false.
+            await waitForApplyDrain();
+
+            if (isActiveChat) {
+              try {
+                await refreshChat(event.payload.chatId);
+              } catch {
+                // ignore
+              }
+            }
+
+            // Disk may still say streaming for the cancelled turn — re-assert.
+            if (
+              isActiveChat &&
+              event.payload.stopReason === "cancelled" &&
+              finishedTurnId
+            ) {
+              const after = useAppStore.getState();
+              if (after.activeChat?.id === event.payload.chatId) {
+                const chat = after.activeChat;
+                const t = chat.turns.find((x) => x.id === finishedTurnId);
+                if (t && (t.status === "streaming" || t.status === "cancelling")) {
+                  useAppStore.setState({
+                    activeChat: {
+                      ...chat,
+                      turns: chat.turns.map((x) =>
+                        x.id === finishedTurnId
+                          ? {
+                              ...x,
+                              status: "cancelled",
+                              intermediateCollapsed: true,
+                            }
+                          : x,
+                      ),
+                    },
+                  });
+                }
+              }
+            }
+
+            if (shouldClearBusy) {
+              await useAppStore
+                .getState()
+                .flushMessageQueue(event.payload.chatId);
+            }
+          })();
+        }),
+        listen<{ chatId: string }>("chat-updated", (event) => {
+          // Ignore updates for chats the user is not viewing (was also stealing
+          // focus via refreshChat before that guard existed).
+          const state = useAppStore.getState();
+          if (state.activeChatId !== event.payload.chatId) return;
+          const cancelledIds = new Set(
+            state.activeChat?.turns
+              .filter((t) => t.status === "cancelled")
+              .map((t) => t.id) ?? [],
+          );
+          void (async () => {
+            await refreshChat(event.payload.chatId);
+            if (cancelledIds.size === 0) return;
+            const after = useAppStore.getState();
+            if (after.activeChat?.id !== event.payload.chatId) return;
+            const active = after.activeChat;
+            let changed = false;
+            const turns = active.turns.map((t) => {
+              if (
+                cancelledIds.has(t.id) &&
+                (t.status === "streaming" || t.status === "cancelling")
+              ) {
+                changed = true;
+                return { ...t, status: "cancelled", intermediateCollapsed: true };
+              }
+              return t;
+            });
+            if (changed) {
+              useAppStore.setState({ activeChat: { ...active, turns } });
+            }
+          })();
+        }),
+        listen("permission-cleared", () => {
+          useAppStore.setState({ permission: null });
+        }),
+        listen<{ chatId: string; turnId?: string | null }>(
+          "cancel-started",
           (event) => {
-            void refreshChat(event.payload.chatId);
+            const state = useAppStore.getState();
+            if (state.activeChat?.id !== event.payload.chatId) return;
+            const active = state.activeChat;
+            if (!active) return;
+            const turnId = event.payload.turnId;
             useAppStore.setState({
               busy: false,
-              error:
-                event.payload.ok === false && event.payload.error
-                  ? String(event.payload.error)
-                  : null,
+              permission: null,
+              activeChat: {
+                ...active,
+                turns: active.turns.map((t) => {
+                  const match = turnId
+                    ? t.id === turnId
+                    : t.status === "streaming" || t.status === "cancelling";
+                  if (!match) return t;
+                  return {
+                    ...t,
+                    status: "cancelled",
+                    intermediateCollapsed: true,
+                    intermediate: t.intermediate.map((b) =>
+                      b.type === "tool" &&
+                      (b.status === "pending" ||
+                        b.status === "in_progress" ||
+                        b.status === "running")
+                        ? { ...b, status: "cancelled" }
+                        : b,
+                    ),
+                  };
+                }),
+              },
             });
           },
         ),
-        listen<{ chatId: string }>("chat-updated", (event) => {
-          void refreshChat(event.payload.chatId);
-        }),
       ];
 
       const resolved = await Promise.all(pairs);

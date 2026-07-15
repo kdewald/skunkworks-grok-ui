@@ -98,9 +98,13 @@ pub struct AcpConnection {
     pub environment_id: String,
     stdin: AsyncMutex<ChildStdin>,
     next_id: AtomicU64,
-    pending: Mutex<HashMap<RpcId, oneshot::Sender<Result<Value>>>>,
+    pending: Arc<Mutex<HashMap<RpcId, oneshot::Sender<Result<Value>>>>>,
     /// Outstanding agent→client permission request IDs awaiting UI response.
-    pending_permissions: Mutex<HashMap<RpcId, ()>>,
+    /// Value is the ACP session id the permission belongs to.
+    pending_permissions: Mutex<HashMap<RpcId, String>>,
+    /// In-flight `session/prompt` request ids keyed by ACP session id.
+    /// Used to force-complete a hung cancel.
+    active_prompts: Arc<Mutex<HashMap<String, RpcId>>>,
     app: AppHandle,
     _child: Child,
     /// Channel kept so the write side can be closed cleanly later.
@@ -176,8 +180,9 @@ impl AcpConnection {
             environment_id: environment_id.clone(),
             stdin: AsyncMutex::new(stdin),
             next_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             pending_permissions: Mutex::new(HashMap::new()),
+            active_prompts: Arc::new(Mutex::new(HashMap::new())),
             app: app.clone(),
             _child: child,
             _shutdown_tx: shutdown_tx,
@@ -228,6 +233,12 @@ impl AcpConnection {
                                 }
                             }
                             Ok(None) => {
+                                // Critical: resolve every in-flight RPC (esp. session/prompt)
+                                // or the UI stays "streaming" forever after agent death /
+                                // tauri-dev rebuild / crash.
+                                reader_conn.fail_all_pending(
+                                    "Agent process exited while a request was in flight",
+                                );
                                 let _ = reader_conn.app.emit(
                                     "agent-status",
                                     AgentStatusEvent {
@@ -240,6 +251,9 @@ impl AcpConnection {
                                 break;
                             }
                             Err(err) => {
+                                reader_conn.fail_all_pending(&format!(
+                                    "Agent stdout error while a request was in flight: {err}"
+                                ));
                                 let _ = reader_conn.app.emit(
                                     "agent-log",
                                     json!({
@@ -247,6 +261,15 @@ impl AcpConnection {
                                         "message": format!("stdout read error: {err}"),
                                         "environmentId": reader_conn.environment_id,
                                     }),
+                                );
+                                let _ = reader_conn.app.emit(
+                                    "agent-status",
+                                    AgentStatusEvent {
+                                        connected: false,
+                                        message: format!("Agent stdout error: {err}"),
+                                        agent_info: None,
+                                        environment_id: env_for_exit.clone(),
+                                    },
                                 );
                                 break;
                             }
@@ -266,6 +289,35 @@ impl AcpConnection {
         self.pending_permissions.lock().contains_key(&id)
     }
 
+    /// Fail every outstanding client→agent RPC and clear prompt tracking.
+    /// Must be called when the agent process dies or is replaced, otherwise
+    /// `session/prompt` awaits forever and the UI turn stays "streaming".
+    pub fn fail_all_pending(&self, reason: &str) {
+        let pending: Vec<(RpcId, oneshot::Sender<Result<Value>>)> = {
+            let mut map = self.pending.lock();
+            map.drain().collect()
+        };
+        let n = pending.len();
+        for (_id, tx) in pending {
+            let _ = tx.send(Err(anyhow!("{reason}")));
+        }
+        self.active_prompts.lock().clear();
+        // Drop permission waiters (UI will clear on agent-status).
+        self.pending_permissions.lock().clear();
+        if n > 0 {
+            let _ = self.app.emit(
+                "agent-log",
+                json!({
+                    "level": "warn",
+                    "message": format!(
+                        "Failed {n} in-flight ACP request(s): {reason}"
+                    ),
+                    "environmentId": self.environment_id,
+                }),
+            );
+        }
+    }
+
     async fn handle_line(&self, line: &str) -> Result<()> {
         let msg: Value = serde_json::from_str(line)?;
 
@@ -278,6 +330,10 @@ impl AcpConnection {
                     } else {
                         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
                     };
+                    // Clear any session→prompt mapping that pointed at this id.
+                    self.active_prompts
+                        .lock()
+                        .retain(|_, prompt_id| prompt_id != &id);
                     if let Some(tx) = self.pending.lock().remove(&id) {
                         let _ = tx.send(result);
                     }
@@ -350,7 +406,10 @@ impl AcpConnection {
 
                 // Support both numeric and string JSON-RPC ids (remote agents often use strings).
                 // Never auto-cancel: that aborts long-running tool turns.
-                self.pending_permissions.lock().insert(id.clone(), ());
+                // Track session id so cancel can reject outstanding permissions (ACP requires this).
+                self.pending_permissions
+                    .lock()
+                    .insert(id.clone(), session_id.clone());
 
                 let _ = self.app.emit(
                     "permission-request",
@@ -432,6 +491,19 @@ impl AcpConnection {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id.clone(), tx);
 
+        // Track in-flight prompts so cancel can force-complete a hung turn.
+        let prompt_session = if method == "session/prompt" {
+            params
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        if let Some(ref sid) = prompt_session {
+            self.active_prompts.lock().insert(sid.clone(), id.clone());
+        }
+
         let msg = json!({
             "jsonrpc": "2.0",
             "id": id_num,
@@ -443,8 +515,13 @@ impl AcpConnection {
         // session/prompt can run for a very long time (tools, remote SSH, etc.).
         // Other RPC methods should complete quickly.
         let result = if method == "session/prompt" {
-            rx.await
-                .map_err(|_| anyhow!("response channel closed: {method}"))?
+            let res = rx
+                .await
+                .map_err(|_| anyhow!("response channel closed: {method}"))?;
+            if let Some(sid) = prompt_session {
+                self.active_prompts.lock().remove(&sid);
+            }
+            res
         } else {
             tokio::time::timeout(std::time::Duration::from_secs(120), rx)
                 .await
@@ -577,8 +654,84 @@ impl AcpConnection {
     }
 
     pub async fn session_cancel(&self, session_id: &str) -> Result<()> {
+        // ACP: pending permission requests MUST be answered with cancelled
+        // before/when the client cancels the turn — otherwise the agent stalls.
+        self.cancel_pending_permissions_for_session(session_id)
+            .await?;
         self.notify("session/cancel", json!({ "sessionId": session_id }))
-            .await
+            .await?;
+
+        // Safety net: if the agent never resolves session/prompt after cancel,
+        // force-complete so the UI does not stay stuck forever.
+        let session_id = session_id.to_string();
+        let pending = Arc::clone(&self.pending);
+        let active_prompts = Arc::clone(&self.active_prompts);
+        let prompt_id = active_prompts.lock().get(&session_id).cloned();
+        if let Some(id) = prompt_id {
+            let app = self.app.clone();
+            let env_id = self.environment_id.clone();
+            tokio::spawn(async move {
+                // Long-running shell tools often ignore cancel until the process exits.
+                // Unstick the pending session/prompt quickly so the next turn can start.
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                // Only force-complete if this prompt is still the active one.
+                let still_active = active_prompts
+                    .lock()
+                    .get(&session_id)
+                    .map(|cur| cur == &id)
+                    .unwrap_or(false);
+                if !still_active {
+                    return;
+                }
+                if let Some(tx) = pending.lock().remove(&id) {
+                    active_prompts.lock().remove(&session_id);
+                    let _ = app.emit(
+                        "agent-log",
+                        json!({
+                            "level": "warn",
+                            "message": format!(
+                                "Force-completing cancelled prompt for session {session_id} (agent did not respond in time)"
+                            ),
+                            "environmentId": env_id,
+                        }),
+                    );
+                    let _ = tx.send(Ok(json!({ "stopReason": "cancelled" })));
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject all outstanding permission requests for a session (ACP cancel rule).
+    pub async fn cancel_pending_permissions_for_session(&self, session_id: &str) -> Result<()> {
+        let ids: Vec<RpcId> = {
+            let mut map = self.pending_permissions.lock();
+            let ids: Vec<RpcId> = map
+                .iter()
+                .filter(|(_, sid)| sid.as_str() == session_id || session_id.is_empty())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                map.remove(id);
+            }
+            ids
+        };
+        for id in ids {
+            self.write_response(
+                id,
+                Ok(json!({ "outcome": { "outcome": "cancelled" } })),
+            )
+            .await?;
+        }
+        // Tell the UI to dismiss any permission modal.
+        let _ = self.app.emit(
+            "permission-cleared",
+            json!({
+                "sessionId": session_id,
+                "environmentId": self.environment_id,
+            }),
+        );
+        Ok(())
     }
 
     pub async fn respond_permission(
@@ -764,6 +917,173 @@ pub async fn resolve_remote_project_path(host: &str, path: &str) -> Result<Strin
         "p='{escaped}'; if [ ! -d \"$p\" ]; then echo \"not a directory: $p\" >&2; exit 1; fi; cd \"$p\" && pwd"
     );
     ssh_exec(host, &cmd).await
+}
+
+/// One directory entry from a remote folder listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirEntry {
+    pub name: String,
+    pub path: String,
+}
+
+/// Listing for the remote folder browser (SSH).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub home: String,
+    pub entries: Vec<RemoteDirEntry>,
+    /// True when `query` was applied (recursive search under `path`).
+    #[serde(default)]
+    pub searched: bool,
+}
+
+/// List directories on a remote host, or search under a path when `query` is set.
+///
+/// - Empty/None `path` → start at `$HOME`
+/// - Empty/None `query` → immediate child directories only
+/// - Non-empty `query` → case-insensitive name match under `path` (max depth 5, cap 150)
+pub async fn list_remote_directory(
+    host: &str,
+    path: Option<&str>,
+    query: Option<&str>,
+) -> Result<RemoteDirListing> {
+    let path_init = match path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let escaped = p.replace('\'', "'\\''");
+            format!("p='{escaped}'")
+        }
+        None => "p=\"$HOME\"".to_string(),
+    };
+
+    let query = query.map(str::trim).filter(|s| !s.is_empty());
+    let searched = query.is_some();
+
+    let entries_script = if let Some(q) = query {
+        // Restrict metacharacters so the remote shell/find stay well-behaved.
+        let safe: String = q
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ' | '@' | '+'))
+            .take(80)
+            .collect();
+        if safe.is_empty() {
+            anyhow::bail!("search query has no usable characters");
+        }
+        let q_esc = safe.replace('\'', "'\\''");
+        format!(
+            r#"q='{q_esc}'
+# Recursive name search (dirs only). Prefer find; fall back to shallow listing.
+if command -v find >/dev/null 2>&1; then
+  find "$curr" -maxdepth 5 \( -type d -o -type l \) -iname "*$q*" 2>/dev/null \
+    | head -n 150 \
+    | while IFS= read -r full; do
+        [ -d "$full" ] || continue
+        [ "$full" = "$curr" ] && continue
+        name="${{full##*/}}"
+        printf '%s\t%s\n' "$name" "$full"
+      done
+else
+  ls -1A 2>/dev/null | while IFS= read -r n; do
+    case "$n" in
+      *"$q"*|*"$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"*) ;;
+      *) continue ;;
+    esac
+    [ -d "$n" ] || continue
+    full="$curr/$n"
+    printf '%s\t%s\n' "$n" "$full"
+  done
+fi"#
+        )
+    } else {
+        r#"ls -1A 2>/dev/null | while IFS= read -r n; do
+  [ -d "$n" ] || continue
+  full="$curr/$n"
+  printf '%s\t%s\n' "$n" "$full"
+done"#
+            .to_string()
+    };
+
+    let cmd = format!(
+        r#"{path_init}
+if [ ! -d "$p" ]; then echo "not a directory: $p" >&2; exit 1; fi
+cd "$p" || exit 1
+curr=$(pwd -P 2>/dev/null || pwd)
+home="$HOME"
+parent=$(dirname -- "$curr" 2>/dev/null || dirname "$curr")
+if [ "$parent" = "$curr" ]; then parent=""; fi
+printf 'CURR=%s\n' "$curr"
+printf 'HOME=%s\n' "$home"
+printf 'PARENT=%s\n' "$parent"
+printf 'BEGIN_ENTRIES\n'
+{entries_script}
+printf 'END_ENTRIES\n'"#
+    );
+
+    let out = ssh_exec(host, &cmd).await?;
+    let mut curr = String::new();
+    let mut home = String::new();
+    let mut parent = String::new();
+    let mut entries = Vec::new();
+    let mut in_entries = false;
+
+    for line in out.lines() {
+        if line == "BEGIN_ENTRIES" {
+            in_entries = true;
+            continue;
+        }
+        if line == "END_ENTRIES" {
+            in_entries = false;
+            continue;
+        }
+        if !in_entries {
+            if let Some(rest) = line.strip_prefix("CURR=") {
+                curr = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("HOME=") {
+                home = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("PARENT=") {
+                parent = rest.to_string();
+            }
+            continue;
+        }
+        // name\tpath — path may contain spaces but not tabs/newlines
+        let Some((name, full)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.is_empty() || full.is_empty() {
+            continue;
+        }
+        entries.push(RemoteDirEntry {
+            name: name.to_string(),
+            path: full.to_string(),
+        });
+    }
+
+    if curr.is_empty() {
+        anyhow::bail!("remote listing returned no current path");
+    }
+
+    // Stable order for browsing; search results keep find order (often depth-first).
+    if !searched {
+        entries.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        });
+    }
+
+    Ok(RemoteDirListing {
+        path: curr,
+        parent: if parent.is_empty() {
+            None
+        } else {
+            Some(parent)
+        },
+        home,
+        entries,
+        searched,
+    })
 }
 
 /// Probe remote host: PATH-visible grok + home directory.

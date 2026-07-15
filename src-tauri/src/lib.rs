@@ -25,6 +25,7 @@ pub fn run() {
             commands::remove_environment,
             commands::set_active_environment,
             commands::list_projects,
+            commands::list_remote_dir,
             commands::add_project,
             commands::remove_project,
             commands::set_active_project,
@@ -40,6 +41,7 @@ pub fn run() {
             commands::cancel_prompt,
             commands::respond_permission,
             commands::apply_session_update,
+            commands::apply_session_updates,
             commands::set_turn_collapsed,
             commands::set_block_collapsed,
         ])

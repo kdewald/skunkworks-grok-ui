@@ -13,6 +13,7 @@ import { chatsForProject, projectsForEnv, useAppStore } from "../store";
 import { displayPath } from "../pathDisplay";
 import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID } from "../types";
 import { ConnectionsPanel } from "./ConnectionsPanel";
+import { RemoteFolderBrowser } from "./RemoteFolderBrowser";
 
 export function Sidebar() {
   const {
@@ -37,8 +38,7 @@ export function Sidebar() {
   } = useAppStore();
 
   const [menuProjectId, setMenuProjectId] = useState<string | null>(null);
-  const [remotePathOpen, setRemotePathOpen] = useState(false);
-  const [remotePath, setRemotePath] = useState("");
+  const [remoteBrowserOpen, setRemoteBrowserOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const envProjects = projectsForEnv(projects, activeEnvironmentId);
@@ -72,8 +72,7 @@ export function Sidebar() {
 
   async function onAddProject() {
     if (isRemote) {
-      setRemotePath("");
-      setRemotePathOpen(true);
+      setRemoteBrowserOpen(true);
       return;
     }
     const selected = await open({
@@ -86,16 +85,9 @@ export function Sidebar() {
     }
   }
 
-  async function submitRemotePath() {
-    const path = remotePath.trim();
-    if (!path) return;
-    try {
-      await addProject(path, activeEnvironmentId);
-      setRemotePathOpen(false);
-      setRemotePath("");
-    } catch (e) {
-      alert(String(e));
-    }
+  async function onRemoteFolderSelect(path: string) {
+    await addProject(path, activeEnvironmentId);
+    setRemoteBrowserOpen(false);
   }
 
   function onRemoveProject(projectId: string, name: string) {
@@ -178,7 +170,7 @@ export function Sidebar() {
             className="icon-btn"
             onClick={() => void onAddProject()}
             title={
-              isRemote ? "Add remote project path" : "Open project folder"
+              isRemote ? "Browse remote project folder" : "Open project folder"
             }
           >
             <FolderPlus size={14} strokeWidth={1.75} />
@@ -318,7 +310,7 @@ export function Sidebar() {
             <div
               key={c.id}
               className={`chat-item ${c.id === activeChatId ? "active" : ""}`}
-              onClick={() => selectChat(c.id)}
+              onClick={() => void selectChat(c.id)}
             >
               <div className="chat-item-main">
                 <div className="chat-title">{c.title || "Untitled"}</div>
@@ -339,51 +331,14 @@ export function Sidebar() {
         </div>
       </div>
 
-      {remotePathOpen && (
-        <div
-          className="remote-path-overlay"
-          onClick={() => setRemotePathOpen(false)}
-        >
-          <div
-            className="remote-path-dialog"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="remote-path-title">Remote project path</div>
-            <p className="connections-hint">
-              Absolute path on{" "}
-              <strong>{activeEnv?.name ?? activeEnvironmentId}</strong>
-            </p>
-            <input
-              className="text-input"
-              autoFocus
-              placeholder="/home/you/src/my-project"
-              value={remotePath}
-              onChange={(e) => setRemotePath(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void submitRemotePath();
-                if (e.key === "Escape") setRemotePathOpen(false);
-              }}
-            />
-            <div className="remote-path-actions">
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={() => setRemotePathOpen(false)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="primary-btn"
-                disabled={!remotePath.trim() || busy}
-                onClick={() => void submitRemotePath()}
-              >
-                Add project
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <RemoteFolderBrowser
+        open={remoteBrowserOpen}
+        environmentId={activeEnvironmentId}
+        environmentName={activeEnv?.name ?? activeEnvironmentId}
+        busy={busy}
+        onClose={() => setRemoteBrowserOpen(false)}
+        onSelect={onRemoteFolderSelect}
+      />
 
       <ConnectionsPanel />
     </aside>

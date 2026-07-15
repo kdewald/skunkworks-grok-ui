@@ -11,8 +11,169 @@ import type {
 } from "./types";
 import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID, scratchProjectIdForEnv } from "./types";
 
-/** Serialize apply_session_update invokes so UI state never lands out of order. */
-let applyQueue: Promise<void> = Promise.resolve();
+/**
+ * Stream apply path:
+ * - Buffer every session-update in memory (no per-token IPC).
+ * - Drain with one `apply_session_updates` invoke per batch.
+ * - Paint React only on rAF / after drain so UI doesn't drip after the agent is done.
+ */
+type PendingBatch = { sessionId: string; updates: unknown[] };
+const pendingBatches: PendingBatch[] = [];
+let applyDrainRunning = false;
+let applyDrainPromise: Promise<void> = Promise.resolve();
+/** Latest chat doc waiting to paint. */
+let pendingUiChat: ChatDocument | null = null;
+let uiRaf: number | null = null;
+
+function flushPendingUiChat(
+  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
+  get: () => AppStore,
+) {
+  if (uiRaf != null) {
+    cancelAnimationFrame(uiRaf);
+    uiRaf = null;
+  }
+  const chat = pendingUiChat;
+  pendingUiChat = null;
+  if (!chat) return;
+  if (get().activeChatId === chat.id) {
+    set({ activeChat: chat });
+  }
+}
+
+/** Coalesce paints to one frame while streaming; force-paint when drain ends. */
+function scheduleUiChat(
+  chat: ChatDocument,
+  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
+  get: () => AppStore,
+  immediate = false,
+) {
+  pendingUiChat = chat;
+  if (immediate) {
+    flushPendingUiChat(set, get);
+    return;
+  }
+  if (uiRaf != null) return;
+  uiRaf = requestAnimationFrame(() => {
+    uiRaf = null;
+    flushPendingUiChat(set, get);
+  });
+}
+
+function resolveChatIdForSession(
+  get: () => AppStore,
+  sessionId: string,
+): string | null {
+  const bySession = get().chats.find((c) => c.acpSessionId === sessionId);
+  if (bySession) return bySession.id;
+  const active = get().activeChat;
+  if (active?.acpSessionId === sessionId) return active.id;
+  if (active) return active.id;
+  return null;
+}
+
+function updateKind(update: unknown): string {
+  if (update && typeof update === "object" && "sessionUpdate" in update) {
+    return String((update as { sessionUpdate?: string }).sessionUpdate ?? "");
+  }
+  return "";
+}
+
+const URGENT_KINDS = new Set([
+  "tool_call",
+  "subagent_spawned",
+  "subagent_finished",
+  "task_backgrounded",
+  "task_completed",
+  "turn_completed",
+  "plan",
+]);
+
+function enqueueSessionUpdate(sessionId: string, update: unknown) {
+  const last = pendingBatches[pendingBatches.length - 1];
+  if (last && last.sessionId === sessionId) {
+    last.updates.push(update);
+    return;
+  }
+  pendingBatches.push({ sessionId, updates: [update] });
+}
+
+function drainSessionApplies(
+  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
+  get: () => AppStore,
+): Promise<void> {
+  // Coalesce concurrent kicks onto the in-flight promise so waiters see the full drain.
+  if (applyDrainRunning) return applyDrainPromise;
+  applyDrainRunning = true;
+  applyDrainPromise = (async () => {
+    try {
+      while (pendingBatches.length > 0) {
+        // Take the front batch; fold any same-session batches that piled up mid-IPC.
+        const batch = pendingBatches.shift()!;
+        while (
+          pendingBatches.length > 0 &&
+          pendingBatches[0].sessionId === batch.sessionId
+        ) {
+          batch.updates.push(...pendingBatches.shift()!.updates);
+        }
+        if (batch.updates.length === 0) continue;
+
+        const targetId = resolveChatIdForSession(get, batch.sessionId);
+        if (!targetId) continue;
+
+        try {
+          const updated = await invoke<ChatDocument>("apply_session_updates", {
+            chatId: targetId,
+            updates: batch.updates,
+          });
+          if (get().activeChatId !== updated.id) continue;
+
+          const urgent = batch.updates.some((u) =>
+            URGENT_KINDS.has(updateKind(u)),
+          );
+          const morePending = pendingBatches.length > 0;
+          scheduleUiChat(updated, set, get, urgent || !morePending);
+        } catch (err) {
+          console.error("apply_session_updates failed", err);
+        }
+      }
+    } finally {
+      applyDrainRunning = false;
+      if (pendingBatches.length === 0 && pendingUiChat) {
+        flushPendingUiChat(set, get);
+      }
+    }
+    // Batches may have been enqueued after we cleared the running flag.
+    if (pendingBatches.length > 0) {
+      await drainSessionApplies(set, get);
+    }
+  })();
+  return applyDrainPromise;
+}
+
+/** Wait until all buffered stream applies have hit Rust + painted. */
+export async function waitForApplyDrain(): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    await applyDrainPromise;
+    if (!applyDrainRunning && pendingBatches.length === 0) return;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+export type QueuedAttachment = {
+  kind: string;
+  data: string;
+  mimeType: string;
+  name?: string;
+  dataUrl?: string;
+};
+
+export type QueuedMessage = {
+  id: string;
+  chatId: string;
+  text: string;
+  attachments: QueuedAttachment[];
+};
 
 type AppStore = {
   ready: boolean;
@@ -32,6 +193,8 @@ type AppStore = {
   error: string | null;
   logs: string[];
   connectionsOpen: boolean;
+  /** Follow-ups typed while a turn is still running (FIFO per chat). */
+  messageQueue: QueuedMessage[];
 
   bootstrap: () => Promise<void>;
   connectAgent: (environmentId?: string) => Promise<void>;
@@ -54,14 +217,12 @@ type AppStore = {
   renameChat: (chatId: string, title: string) => Promise<void>;
   sendMessage: (
     text: string,
-    attachments?: Array<{
-      kind: string;
-      data: string;
-      mimeType: string;
-      name?: string;
-      dataUrl?: string;
-    }>,
+    attachments?: QueuedAttachment[],
   ) => Promise<void>;
+  /** Drain next queued follow-up for a chat after a turn ends. */
+  flushMessageQueue: (chatId?: string) => Promise<void>;
+  removeQueuedMessage: (id: string) => void;
+  clearMessageQueue: (chatId?: string) => void;
   cancelPrompt: () => Promise<void>;
   refreshChat: (chatId?: string) => Promise<void>;
   applySessionUpdate: (sessionId: string, update: unknown) => Promise<void>;
@@ -77,6 +238,67 @@ type AppStore = {
   setAgentStatus: (s: Partial<AgentStatus>) => void;
   isEnvConnected: (environmentId: string) => boolean;
 };
+
+function queueId() {
+  return `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+type Get = () => AppStore;
+type Set = (
+  partial:
+    | Partial<AppStore>
+    | ((state: AppStore) => Partial<AppStore>),
+) => void;
+
+async function dispatchSend(
+  get: Get,
+  set: Set,
+  chatId: string,
+  text: string,
+  attachments: QueuedAttachment[] = [],
+) {
+  const project = get().projects.find(
+    (p) => p.id === (get().activeChat?.projectId || get().activeProjectId),
+  );
+  const envId = project?.environmentId || get().activeEnvironmentId;
+  if (!get().connectedEnvironments.includes(envId)) {
+    await get().connectAgent(envId);
+  }
+  set({ busy: true, error: null });
+  try {
+    const chat = await invoke<ChatDocument>("send_message", {
+      args: {
+        chatId,
+        text,
+        attachments: attachments.map((a) => ({
+          kind: a.kind,
+          data: a.data,
+          mimeType: a.mimeType,
+          name: a.name ?? null,
+          dataUrl: a.dataUrl ?? null,
+        })),
+        images: [],
+      },
+    });
+    set({
+      activeChat: chat,
+      chats: get().chats.map((c) =>
+        c.id === chat.id
+          ? {
+              ...c,
+              title: chat.title,
+              updatedAt: chat.updatedAt,
+              preview: (text || "Attachment").slice(0, 120),
+              acpSessionId: chat.acpSessionId,
+            }
+          : c,
+      ),
+    });
+  } catch (e) {
+    set({ error: String(e), busy: false });
+    throw e;
+  }
+}
 
 function chatsForProject(chats: ChatMeta[], projectId: string | null) {
   if (!projectId) return [];
@@ -112,6 +334,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   error: null,
   logs: [],
   connectionsOpen: false,
+  messageQueue: [],
 
   isEnvConnected: (environmentId: string) =>
     get().connectedEnvironments.includes(environmentId),
@@ -395,7 +618,26 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (first) {
       await get().selectChat(first.id);
     } else {
-      set({ activeChatId: null, activeChat: null });
+      // Leaving an unused draft behind when switching projects.
+      const prevId = get().activeChatId;
+      const prevEmpty =
+        get().activeChat?.id === prevId &&
+        (get().activeChat?.turns.length ?? 0) === 0;
+      try {
+        const discarded = await invoke<string | null>("set_active_chat", {
+          chatId: null,
+        });
+        const dropId = discarded ?? (prevEmpty ? prevId : null);
+        set({
+          chats: dropId
+            ? get().chats.filter((c) => c.id !== dropId)
+            : get().chats,
+          activeChatId: null,
+          activeChat: null,
+        });
+      } catch {
+        set({ activeChatId: null, activeChat: null });
+      }
     }
   },
 
@@ -408,6 +650,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!get().connectedEnvironments.includes(envId)) {
       await get().connectAgent(envId);
     }
+    // Already on an unused draft for this project — keep it.
+    const cur = get().activeChat;
+    if (
+      cur &&
+      cur.projectId === projectId &&
+      cur.turns.length === 0 &&
+      get().activeChatId === cur.id
+    ) {
+      return;
+    }
+    const prevId = get().activeChatId;
     set({ busy: true, error: null });
     try {
       const chat = await invoke<ChatDocument>("create_chat", {
@@ -423,8 +676,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
         createdAt: chat.createdAt,
         updatedAt: chat.updatedAt,
       };
+      // Drop the previous empty draft from the sidebar if backend discarded it.
+      let chats = get().chats.filter((c) => c.id !== meta.id);
+      if (prevId && prevId !== chat.id) {
+        const prev = get().activeChat;
+        if (prev?.id === prevId && prev.turns.length === 0) {
+          chats = chats.filter((c) => c.id !== prevId);
+        } else if (
+          get().chats.find((c) => c.id === prevId && !c.preview && c.title === "New chat")
+        ) {
+          // Backend may have purged an empty draft we only know via meta.
+          chats = chats.filter((c) => c.id !== prevId);
+        }
+      }
       set({
-        chats: [meta, ...get().chats.filter((c) => c.id !== meta.id)],
+        chats: [meta, ...chats],
         activeProjectId: chat.projectId,
         activeChatId: chat.id,
         activeChat: chat,
@@ -437,30 +703,64 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   selectChat: async (chatId: string) => {
-    await invoke("set_active_chat", { chatId });
-    set({ activeChatId: chatId });
-    await get().refreshChat(chatId);
-
-    const chat = get().activeChat;
-    const project = get().projects.find((p) => p.id === chat?.projectId);
-    const envId = project?.environmentId || get().activeEnvironmentId;
-
-    if (!get().connectedEnvironments.includes(envId)) {
-      try {
-        await get().connectAgent(envId);
-      } catch (e) {
-        get().pushLog(`[session] connect failed: ${e}`);
-        return;
+    // Optimistic: switch the UI immediately so a slow ensure/session/load
+    // (or a late chat-updated for another chat) can't leave the old transcript up.
+    const prevId = get().activeChatId;
+    const prevWasEmpty =
+      get().activeChat?.id === prevId &&
+      (get().activeChat?.turns.length ?? 0) === 0;
+    set({ activeChatId: chatId, error: null });
+    try {
+      const discarded = await invoke<string | null>("set_active_chat", {
+        chatId,
+      });
+      const chat = await invoke<ChatDocument>("get_chat", { chatId });
+      // User may have clicked another chat while we loaded.
+      if (get().activeChatId !== chatId) return;
+      let chats = get().chats;
+      const dropId = discarded ?? (prevWasEmpty && prevId !== chatId ? prevId : null);
+      if (dropId) {
+        chats = chats.filter((c) => c.id !== dropId);
       }
+      set({
+        chats,
+        activeChat: chat,
+        activeChatId: chatId,
+        activeProjectId: chat.projectId,
+      });
+    } catch (e) {
+      if (get().activeChatId === chatId) {
+        set({ error: String(e) });
+      }
+      return;
     }
 
-    if (get().connectedEnvironments.includes(envId)) {
+    const chat = get().activeChat;
+    if (!chat || get().activeChatId !== chatId) return;
+    const project = get().projects.find((p) => p.id === chat.projectId);
+    const envId = project?.environmentId || get().activeEnvironmentId;
+
+    // Session restore is best-effort and can hang on SSH/session-load — never
+    // block the open-chat path on it.
+    void (async () => {
+      if (get().activeChatId !== chatId) return;
+      if (!get().connectedEnvironments.includes(envId)) {
+        try {
+          await get().connectAgent(envId);
+        } catch (e) {
+          get().pushLog(`[session] connect failed: ${e}`);
+          return;
+        }
+      }
+      if (get().activeChatId !== chatId) return;
+      if (!get().connectedEnvironments.includes(envId)) return;
       try {
         const res = await invoke<{
           chat: ChatDocument;
           status: string;
           message: string;
         }>("ensure_chat_session", { chatId });
+        if (get().activeChatId !== chatId) return;
         set({
           activeChat: res.chat,
           chats: get().chats.map((c) =>
@@ -479,7 +779,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       } catch (e) {
         get().pushLog(`[session] ensure failed: ${e}`);
       }
-    }
+    })();
   },
 
   deleteChat: async (chatId: string) => {
@@ -515,85 +815,147 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
     if (!chatId) throw new Error("No active chat");
 
-    const project = get().projects.find(
-      (p) => p.id === (get().activeChat?.projectId || get().activeProjectId),
-    );
-    const envId = project?.environmentId || get().activeEnvironmentId;
-    if (!get().connectedEnvironments.includes(envId)) {
-      await get().connectAgent(envId);
-    }
-    set({ busy: true, error: null });
-    try {
-      const chat = await invoke<ChatDocument>("send_message", {
-        args: {
-          chatId,
-          text,
-          attachments: attachments.map((a) => ({
-            kind: a.kind,
-            data: a.data,
-            mimeType: a.mimeType,
-            name: a.name ?? null,
-            dataUrl: a.dataUrl ?? null,
-          })),
-          images: [],
-        },
-      });
-      set({
-        activeChat: chat,
-        chats: get().chats.map((c) =>
-          c.id === chat.id
-            ? {
-                ...c,
-                title: chat.title,
-                updatedAt: chat.updatedAt,
-                preview: (text || "Attachment").slice(0, 120),
-                acpSessionId: chat.acpSessionId,
-              }
-            : c,
+    const active = get().activeChat;
+    const streaming = active?.turns.some((t) => t.status === "streaming");
+    // CLI: when blocked on a running tool/command, Enter is cancel-and-send.
+    const blockedOnTool = active?.turns.some(
+      (t) =>
+        t.status === "streaming" &&
+        t.intermediate.some(
+          (b) =>
+            b.type === "tool" &&
+            (b.status === "in_progress" ||
+              b.status === "pending" ||
+              b.status === "running"),
         ),
-      });
-    } catch (e) {
-      set({ error: String(e), busy: false });
-      throw e;
+    );
+
+    if (streaming || get().busy) {
+      const item: QueuedMessage = {
+        id: queueId(),
+        chatId,
+        text,
+        attachments: attachments.map((a) => ({ ...a })),
+      };
+      set({ messageQueue: [...get().messageQueue, item], error: null });
+      // If a command/tool is actively running, interrupt so the follow-up can run.
+      if (blockedOnTool) {
+        void get().cancelPrompt();
+      }
+      return;
     }
+
+    await dispatchSend(get, set, chatId, text, attachments);
+  },
+
+  flushMessageQueue: async (chatId) => {
+    const id = chatId ?? get().activeChatId;
+    if (!id) return;
+    if (get().busy) return;
+    // Only drain when this chat is active and idle.
+    if (get().activeChatId !== id) return;
+    if (get().activeChat?.turns.some((t) => t.status === "streaming")) {
+      return;
+    }
+
+    const next = get().messageQueue.find((m) => m.chatId === id);
+    if (!next) return;
+
+    set({
+      messageQueue: get().messageQueue.filter((m) => m.id !== next.id),
+    });
+    try {
+      await dispatchSend(get, set, next.chatId, next.text, next.attachments);
+    } catch (e) {
+      // Put it back at the front so the user can retry / edit.
+      set({
+        messageQueue: [next, ...get().messageQueue.filter((m) => m.id !== next.id)],
+        error: String(e),
+      });
+    }
+  },
+
+  removeQueuedMessage: (id) => {
+    set({ messageQueue: get().messageQueue.filter((m) => m.id !== id) });
+  },
+
+  clearMessageQueue: (chatId) => {
+    if (!chatId) {
+      set({ messageQueue: [] });
+      return;
+    }
+    set({
+      messageQueue: get().messageQueue.filter((m) => m.chatId !== chatId),
+    });
   },
 
   cancelPrompt: async () => {
     const chatId = get().activeChatId;
     if (!chatId) return;
-    await invoke("cancel_prompt", { chatId });
+    // Unlock the composer IMMEDIATELY. Waiting for the agent to ack cancel
+    // (or for prompt-finished) left Stop stuck and blocked Send while a
+    // shell tool was still winding down.
+    const active = get().activeChat;
+    if (active && active.id === chatId) {
+      set({
+        busy: false,
+        permission: null,
+        error: null,
+        activeChat: {
+          ...active,
+          turns: active.turns.map((t) =>
+            t.status === "streaming" || t.status === "cancelling"
+              ? {
+                  ...t,
+                  status: "cancelled",
+                  intermediateCollapsed: true,
+                  intermediate: t.intermediate.map((b) =>
+                    b.type === "tool" &&
+                    (b.status === "pending" ||
+                      b.status === "in_progress" ||
+                      b.status === "running")
+                      ? { ...b, status: "cancelled" }
+                      : b,
+                  ),
+                }
+              : t,
+          ),
+        },
+      });
+    } else {
+      set({ busy: false, permission: null, error: null });
+    }
+    try {
+      await invoke("cancel_prompt", { chatId });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+    // Drain any follow-ups that were queued before/during stop.
+    void get().flushMessageQueue(chatId);
   },
 
   refreshChat: async (chatId?: string) => {
     const id = chatId ?? get().activeChatId;
     if (!id) return;
-    const chat = await invoke<ChatDocument>("get_chat", { chatId: id });
-    set({ activeChat: chat, activeChatId: id });
+    try {
+      const chat = await invoke<ChatDocument>("get_chat", { chatId: id });
+      // Critical: never let a background refresh (chat-updated / prompt-finished
+      // for another chat) steal the user's current selection.
+      if (get().activeChatId !== id) return;
+      set({ activeChat: chat, activeChatId: id });
+    } catch (e) {
+      // Don't surface errors for stale refreshes after a switch.
+      if (get().activeChatId === id) {
+        console.error("refreshChat failed", e);
+      }
+    }
   },
 
   applySessionUpdate: async (sessionId: string, update: unknown) => {
-    applyQueue = applyQueue
-      .then(async () => {
-        const bySession = get().chats.find((c) => c.acpSessionId === sessionId);
-        const active = get().activeChat;
-        let targetId: string | null = null;
-        if (bySession) targetId = bySession.id;
-        else if (active?.acpSessionId === sessionId) targetId = active.id;
-        else if (active) targetId = active.id;
-        if (!targetId) return;
-
-        const updated = await invoke<ChatDocument>("apply_session_update", {
-          chatId: targetId,
-          update,
-        });
-        if (get().activeChatId === updated.id) {
-          set({ activeChat: updated });
-        }
-      })
-      .catch((err) => {
-        console.error("applySessionUpdate failed", err);
-      });
-    await applyQueue;
+    // Buffer only — never await per-token IPC. That was the "agent finished but
+    // UI still drips" bug: hundreds of serial invokes behind a drained stream.
+    enqueueSessionUpdate(sessionId, update);
+    void drainSessionApplies(set, get);
   },
 
   setTurnCollapsed: async (turnId, collapsed) => {

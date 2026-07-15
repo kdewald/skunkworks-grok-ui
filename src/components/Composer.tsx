@@ -37,11 +37,34 @@ export function Composer({ onSend }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
-  const { sendMessage, cancelPrompt, busy, activeChat, agent } = useAppStore();
+  const {
+    sendMessage,
+    cancelPrompt,
+    busy,
+    activeChat,
+    activeChatId,
+    agent,
+    messageQueue,
+    removeQueuedMessage,
+    clearMessageQueue,
+  } = useAppStore();
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  // Only a live streaming turn keeps Stop visible — cancelled/cancelling must not.
   const streaming = activeChat?.turns.some((t) => t.status === "streaming");
+  const blockedOnTool = activeChat?.turns.some(
+    (t) =>
+      t.status === "streaming" &&
+      t.intermediate.some(
+        (b) =>
+          b.type === "tool" &&
+          (b.status === "in_progress" ||
+            b.status === "pending" ||
+            b.status === "running"),
+      ),
+  );
+  const chatQueue = messageQueue.filter((m) => m.chatId === activeChatId);
 
   useEffect(() => {
     taRef.current?.focus();
@@ -183,7 +206,10 @@ export function Composer({ onSend }: Props) {
 
   async function submit() {
     const value = text.trim();
-    if ((!value && attachments.length === 0) || streaming) return;
+    if (!value && attachments.length === 0) return;
+    // Always allow while a turn is running (queue or cancel-and-send).
+    // Only block a double-dispatch when idle and an invoke is in flight.
+    if (!streaming && busy) return;
     const toSend = attachments.map((a) => ({
       kind: a.kind,
       data: a.data,
@@ -194,6 +220,15 @@ export function Composer({ onSend }: Props) {
     setText("");
     setAttachments([]);
     onSend?.();
+    if (streaming || busy) {
+      flash(
+        blockedOnTool
+          ? "Stopping current command and sending…"
+          : chatQueue.length === 0
+            ? "Queued — will send when this turn finishes"
+            : `Queued (${chatQueue.length + 1})`,
+      );
+    }
     await sendMessage(value, toSend);
   }
 
@@ -204,8 +239,10 @@ export function Composer({ onSend }: Props) {
     }
   }
 
-  const canAttach = !streaming;
-  const canSend = (!!text.trim() || attachments.length > 0) && !busy;
+  const hasContent = !!text.trim() || attachments.length > 0;
+  // Queue / cancel-and-send while working; only block empty or idle double-send.
+  const canSend = hasContent && (streaming || !busy);
+  const canAttach = true;
 
   return (
     <div
@@ -217,6 +254,40 @@ export function Composer({ onSend }: Props) {
       onDragLeave={() => setDragOver(false)}
       onDrop={(e) => void onDrop(e)}
     >
+      {chatQueue.length > 0 && (
+        <div className="queue-row">
+          <div className="queue-label">
+            Queued ({chatQueue.length})
+            <button
+              type="button"
+              className="queue-clear"
+              onClick={() => clearMessageQueue(activeChatId ?? undefined)}
+            >
+              Clear
+            </button>
+          </div>
+          {chatQueue.map((m) => (
+            <div key={m.id} className="queue-chip" title={m.text}>
+              <span className="queue-chip-text">
+                {m.text.trim()
+                  ? m.text.trim().slice(0, 80)
+                  : m.attachments.length
+                    ? `${m.attachments.length} attachment${m.attachments.length === 1 ? "" : "s"}`
+                    : "(empty)"}
+              </span>
+              <button
+                type="button"
+                className="queue-remove"
+                title="Remove from queue"
+                onClick={() => removeQueuedMessage(m.id)}
+              >
+                <X size={11} strokeWidth={2} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {attachments.length > 0 && (
         <div className="attach-row">
           {attachments.map((a) => (
@@ -321,31 +392,36 @@ export function Composer({ onSend }: Props) {
           placeholder={
             !agent.connected
               ? "Connect to agent, then type a message…"
-              : "Message Grok…"
+              : blockedOnTool
+                ? "Send to stop the command and continue…"
+                : streaming
+                  ? "Send a follow-up (queued until this turn finishes)…"
+                  : "Message Grok…"
           }
           rows={2}
         />
 
-        {streaming ? (
-          <button
-            type="button"
-            className="composer-icon-btn stop"
-            title="Stop"
-            onClick={() => cancelPrompt()}
-          >
-            <Square size={14} strokeWidth={2} fill="currentColor" />
-          </button>
-        ) : (
+        <div className="composer-actions">
+          {streaming && (
+            <button
+              type="button"
+              className="composer-icon-btn stop"
+              title="Stop"
+              onClick={() => void cancelPrompt()}
+            >
+              <Square size={14} strokeWidth={2} fill="currentColor" />
+            </button>
+          )}
           <button
             type="button"
             className="composer-send"
-            title="Send"
+            title={streaming ? "Queue follow-up" : "Send"}
             onClick={() => void submit()}
             disabled={!canSend}
           >
             <SendHorizontal size={16} strokeWidth={1.85} />
           </button>
-        )}
+        </div>
       </div>
     </div>
   );

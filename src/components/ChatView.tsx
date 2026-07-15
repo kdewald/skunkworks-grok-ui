@@ -1,8 +1,9 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { FileText } from "lucide-react";
 import { useAppStore } from "../store";
-import { AssistantMessage, IntermediateWork } from "./IntermediateWork";
+import { IntermediateWork } from "./IntermediateWork";
 import { Composer } from "./Composer";
+import { SubagentPanel } from "./SubagentPanel";
 
 export function ChatView() {
   const {
@@ -65,20 +66,17 @@ export function ChatView() {
     }
   };
 
-  // Follow the stream: re-run on every chat mutation while user hasn't scrolled away.
-  // useLayoutEffect so we pin before paint (less flicker than useEffect + smooth).
+  // Follow the stream without scrolling on every intermediate object identity
+  // change (that was thrashing layout during tool storms).
+  const streamTick =
+    (lastTurn?.assistantMessage?.length ?? 0) +
+    (lastTurn?.intermediate?.length ?? 0) +
+    (lastTurn?.status ?? "");
   useLayoutEffect(() => {
     if (userAway.current) return;
     scrollToBottom("auto");
-    // Depend on content that grows during a turn — not just array length.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    activeChat,
-    lastTurn?.assistantMessage,
-    lastTurn?.status,
-    lastTurn?.intermediate,
-    streaming,
-  ]);
+  }, [activeChat?.id, streamTick, streaming]);
 
   const isScratch = project?.isScratch || project?.id === "scratch";
 
@@ -130,6 +128,11 @@ export function ChatView() {
     );
   }
 
+  const focusTurnId =
+    lastTurn?.status === "streaming"
+      ? lastTurn.id
+      : activeChat.turns[activeChat.turns.length - 1]?.id;
+
   return (
     <main className="main">
       <header className="chat-header">
@@ -148,74 +151,86 @@ export function ChatView() {
         {userAwayHint(streaming)}
       </header>
 
-      <div className="messages" ref={scrollerRef}>
-        {activeChat.turns.length === 0 && (
-          <div className="empty-hint center">
-            Send a message to start. Grok can read and edit files in{" "}
-            <code>{project?.path}</code>.
-          </div>
-        )}
-        {activeChat.turns.map((turn) => (
-          <div key={turn.id} className="turn">
-            <div className="user-msg">
-              <div className="role">You</div>
-              {turn.attachments && turn.attachments.length > 0 && (
-                <div className="msg-attachments">
-                  {turn.attachments.map((a) =>
-                    a.kind === "image" && a.dataUrl ? (
-                      <a
-                        key={a.id}
-                        href={a.dataUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="msg-attach"
-                        title={a.name}
-                      >
-                        <img src={a.dataUrl} alt={a.name} />
-                      </a>
-                    ) : (
-                      <div key={a.id} className="msg-attach file-chip" title={a.name}>
-                        <span className="file-chip-icon">
-                          <FileText size={15} strokeWidth={1.75} />
-                        </span>
-                        <span className="file-chip-name">{a.name}</span>
-                      </div>
-                    ),
+      <div className="main-body">
+        <div className="main-center">
+          <div className="messages" ref={scrollerRef}>
+            {activeChat.turns.length === 0 && (
+              <div className="empty-hint center">
+                Send a message to start. Grok can read and edit files in{" "}
+                <code>{project?.path}</code>.
+              </div>
+            )}
+            {activeChat.turns.map((turn) => (
+              <div key={turn.id} className="turn">
+                <div className="user-msg">
+                  <div className="role">You</div>
+                  {turn.attachments && turn.attachments.length > 0 && (
+                    <div className="msg-attachments">
+                      {turn.attachments.map((a) =>
+                        a.kind === "image" && a.dataUrl ? (
+                          <a
+                            key={a.id}
+                            href={a.dataUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="msg-attach"
+                            title={a.name}
+                          >
+                            <img src={a.dataUrl} alt={a.name} />
+                          </a>
+                        ) : (
+                          <div
+                            key={a.id}
+                            className="msg-attach file-chip"
+                            title={a.name}
+                          >
+                            <span className="file-chip-icon">
+                              <FileText size={15} strokeWidth={1.75} />
+                            </span>
+                            <span className="file-chip-name">{a.name}</span>
+                          </div>
+                        ),
+                      )}
+                    </div>
+                  )}
+                  {turn.userMessage && (
+                    <div className="user-text">{turn.userMessage}</div>
                   )}
                 </div>
-              )}
-              {turn.userMessage && (
-                <div className="user-text">{turn.userMessage}</div>
-              )}
-            </div>
-            <div className="agent-col">
-              <div className="role">Grok</div>
-              <IntermediateWork turn={turn} />
-              <AssistantMessage text={turn.assistantMessage} />
-              {turn.status === "streaming" && !turn.assistantMessage && (
-                <div className="typing">
-                  <span />
-                  <span />
-                  <span />
+                <div className="agent-col">
+                  <div className="role">Grok</div>
+                  {/* Parent tools / thinking / answers only — subagents are in the rail. */}
+                  <IntermediateWork turn={turn} />
+                  {turn.status === "streaming" &&
+                    !turn.assistantMessage &&
+                    !turn.intermediate.some((b) => b.type === "message") && (
+                      <div className="typing">
+                        <span />
+                        <span />
+                        <span />
+                      </div>
+                    )}
+                  {turn.status === "error" &&
+                    !turn.assistantMessage.includes("**Turn failed:**") && (
+                      <div className="error-banner">Turn failed</div>
+                    )}
                 </div>
-              )}
-              {turn.status === "error" &&
-                !turn.assistantMessage.includes("**Turn failed:**") && (
-                  <div className="error-banner">Turn failed</div>
-                )}
-            </div>
+              </div>
+            ))}
+            <div ref={bottomRef} className="scroll-anchor" />
           </div>
-        ))}
-        <div ref={bottomRef} className="scroll-anchor" />
-      </div>
 
-      {error && <div className="error-banner bottom">{error}</div>}
-      <Composer
-        onSend={() => {
-          userAway.current = false;
-          requestAnimationFrame(() => scrollToBottom("auto"));
-        }}
-      />
+          {error && <div className="error-banner bottom">{error}</div>}
+          <Composer
+            onSend={() => {
+              userAway.current = false;
+              requestAnimationFrame(() => scrollToBottom("auto"));
+            }}
+          />
+        </div>
+
+        <SubagentPanel chat={activeChat} focusTurnId={focusTurnId} />
+      </div>
     </main>
   );
 }

@@ -154,6 +154,58 @@ pub enum IntermediateBlock {
         #[serde(default = "default_true")]
         collapsed: bool,
     },
+    /// Agent text segment. Chunks with the same `message_id` belong together;
+    /// a new id (or a tool/plan/thought in between) starts a separate message.
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        #[serde(default, rename = "messageId", alias = "message_id")]
+        message_id: Option<String>,
+        text: String,
+    },
+    /// Parallel subagent run (spawn_subagent / ACP `variant: "Task"`).
+    /// Grok surfaces these as tool_calls, not dedicated sessionUpdate kinds.
+    #[serde(rename = "subagent")]
+    Subagent {
+        id: String,
+        #[serde(rename = "subagentId", alias = "subagent_id")]
+        subagent_id: String,
+        /// Parent tool_call id for the spawn tool (links tool_call_update → card).
+        #[serde(default, rename = "toolCallId", alias = "tool_call_id")]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        status: String, // running | completed | failed | cancelled
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default, rename = "subagentType", alias = "subagent_type")]
+        subagent_type: Option<String>,
+        /// Final report from wait tool MultiResult / subagent_finished.output.
+        #[serde(default)]
+        output: String,
+        #[serde(default = "default_true")]
+        collapsed: bool,
+    },
+    /// Background shell/task (`task_backgrounded` / `task_completed`).
+    #[serde(rename = "task")]
+    Task {
+        id: String,
+        #[serde(rename = "taskId", alias = "task_id")]
+        task_id: String,
+        #[serde(default, rename = "toolCallId", alias = "tool_call_id")]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        status: String, // running | completed | failed | cancelled
+        #[serde(default)]
+        output: String,
+        #[serde(default = "default_true")]
+        collapsed: bool,
+    },
 }
 
 fn default_true() -> bool {
@@ -230,6 +282,7 @@ pub struct AppData {
     pub active_environment_id: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
 }

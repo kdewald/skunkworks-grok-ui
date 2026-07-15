@@ -69,6 +69,35 @@ export type IntermediateBlock =
       id: string;
       entries: PlanEntry[];
       collapsed: boolean;
+    }
+  | {
+      type: "message";
+      id: string;
+      messageId?: string | null;
+      text: string;
+    }
+  | {
+      type: "subagent";
+      id: string;
+      subagentId: string;
+      toolCallId?: string | null;
+      description: string;
+      status: string;
+      model?: string | null;
+      subagentType?: string | null;
+      output: string;
+      collapsed: boolean;
+    }
+  | {
+      type: "task";
+      id: string;
+      taskId: string;
+      toolCallId?: string | null;
+      description: string;
+      command: string;
+      status: string;
+      output: string;
+      collapsed: boolean;
     };
 
 export type FileAttachment = {
@@ -86,7 +115,13 @@ export type Turn = {
   userMessage: string;
   intermediate: IntermediateBlock[];
   assistantMessage: string;
-  status: "streaming" | "complete" | "error" | "cancelled" | string;
+  status:
+    | "streaming"
+    | "cancelling"
+    | "complete"
+    | "error"
+    | "cancelled"
+    | string;
   intermediateCollapsed: boolean;
   attachments?: FileAttachment[];
   createdAt: string;
@@ -135,4 +170,19 @@ export type AgentStatus = {
   message: string;
   agentInfo?: unknown;
   environmentId?: string;
+};
+
+/** Directory entry from SSH folder browser. */
+export type RemoteDirEntry = {
+  name: string;
+  path: string;
+};
+
+/** Listing returned by `list_remote_dir`. */
+export type RemoteDirListing = {
+  path: string;
+  parent?: string | null;
+  home: string;
+  entries: RemoteDirEntry[];
+  searched?: boolean;
 };
