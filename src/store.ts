@@ -5,11 +5,14 @@ import type {
   AppData,
   ChatDocument,
   ChatMeta,
+  ContextChip,
   Environment,
   PermissionRequest,
   Project,
+  WorkspaceMode,
 } from "./types";
 import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID, scratchProjectIdForEnv } from "./types";
+import { formatContextChips } from "./contextChips";
 
 /**
  * Stream apply path:
@@ -173,6 +176,7 @@ export type QueuedMessage = {
   chatId: string;
   text: string;
   attachments: QueuedAttachment[];
+  contextChips?: ContextChip[];
 };
 
 type AppStore = {
@@ -195,6 +199,10 @@ type AppStore = {
   connectionsOpen: boolean;
   /** Bottom project terminal panel open. */
   terminalOpen: boolean;
+  /** Exclusive main pane: chat transcript vs project files. */
+  workspaceMode: WorkspaceMode;
+  /** Context chips from Files view (paths / ranges) for the next send. */
+  contextChips: ContextChip[];
   /** Follow-ups typed while a turn is still running (FIFO per chat). */
   messageQueue: QueuedMessage[];
 
@@ -211,6 +219,11 @@ type AppStore = {
   refreshSshHosts: () => Promise<void>;
   setConnectionsOpen: (open: boolean) => void;
   setTerminalOpen: (open: boolean) => void;
+  setWorkspaceMode: (mode: WorkspaceMode) => void;
+  addContextChip: (chip: ContextChip) => void;
+  removeContextChip: (id: string) => void;
+  updateContextChipNote: (id: string, note: string) => void;
+  clearContextChips: () => void;
   addProject: (path: string, environmentId?: string) => Promise<void>;
   removeProject: (projectId: string) => Promise<void>;
   selectProject: (projectId: string) => Promise<void>;
@@ -338,6 +351,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   logs: [],
   connectionsOpen: false,
   terminalOpen: false,
+  workspaceMode: "chat",
+  contextChips: [],
   messageQueue: [],
 
   isEnvConnected: (environmentId: string) =>
@@ -559,6 +574,35 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setConnectionsOpen: (open) => set({ connectionsOpen: open }),
 
   setTerminalOpen: (open) => set({ terminalOpen: open }),
+
+  setWorkspaceMode: (mode) => set({ workspaceMode: mode }),
+
+  addContextChip: (chip) => {
+    const existing = get().contextChips;
+    // Dedupe identical path/range targets.
+    const key = `${chip.kind}:${chip.path}:${chip.startLine ?? ""}:${chip.endLine ?? ""}`;
+    if (
+      existing.some(
+        (c) =>
+          `${c.kind}:${c.path}:${c.startLine ?? ""}:${c.endLine ?? ""}` === key,
+      )
+    ) {
+      return;
+    }
+    set({ contextChips: [...existing, chip] });
+  },
+
+  removeContextChip: (id) =>
+    set({ contextChips: get().contextChips.filter((c) => c.id !== id) }),
+
+  updateContextChipNote: (id, note) =>
+    set({
+      contextChips: get().contextChips.map((c) =>
+        c.id === id ? { ...c, note } : c,
+      ),
+    }),
+
+  clearContextChips: () => set({ contextChips: [] }),
 
   addProject: async (path: string, environmentId?: string) => {
     const envId = environmentId ?? get().activeEnvironmentId;
@@ -834,6 +878,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
     if (!chatId) throw new Error("No active chat");
 
+    const chips = get().contextChips;
+    const ctxBlock = formatContextChips(chips);
+    const body = text.trim();
+    const fullText =
+      ctxBlock && body
+        ? `${ctxBlock}\n\n### Message\n${body}`
+        : ctxBlock || body;
+
     const active = get().activeChat;
     const streaming = active?.turns.some((t) => t.status === "streaming");
     // CLI: when blocked on a running tool/command, Enter is cancel-and-send.
@@ -853,10 +905,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const item: QueuedMessage = {
         id: queueId(),
         chatId,
-        text,
+        text: fullText,
         attachments: attachments.map((a) => ({ ...a })),
+        contextChips: chips.map((c) => ({ ...c })),
       };
-      set({ messageQueue: [...get().messageQueue, item], error: null });
+      set({
+        messageQueue: [...get().messageQueue, item],
+        contextChips: [],
+        error: null,
+      });
       // If a command/tool is actively running, interrupt so the follow-up can run.
       if (blockedOnTool) {
         void get().cancelPrompt();
@@ -864,7 +921,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return;
     }
 
-    await dispatchSend(get, set, chatId, text, attachments);
+    set({ contextChips: [] });
+    await dispatchSend(get, set, chatId, fullText, attachments);
   },
 
   flushMessageQueue: async (chatId) => {

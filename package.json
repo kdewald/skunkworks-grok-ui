@@ -1,7 +1,7 @@
 {
   "name": "skunkworks-grok-ui",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Unofficial skunkworks desktop UI for the Grok Build coding agent (ACP). Not affiliated with xAI.",
   "author": "kdewald",
   "license": "Apache-2.0",

@@ -347,7 +347,11 @@ export function Sidebar() {
                     title={scratch ? "Scratch workspace" : p.path}
                     onClick={() => {
                       setMenuProjectId(null);
-                      // Clicking the project selects it and ensures chats are visible.
+                      // Second click on the already-active, expanded project collapses it.
+                      if (isActiveProject && !isCollapsed && canExpand) {
+                        setProjectCollapsed(p.id, true);
+                        return;
+                      }
                       setProjectCollapsed(p.id, false);
                       void selectProject(p.id);
                     }}

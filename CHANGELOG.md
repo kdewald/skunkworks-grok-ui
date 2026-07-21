@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.2] — 2026-07-21
+
+### Added
+
+- **Files** workspace mode (Chat | Files): project file tree, read-only viewer
+- Context chips for files, folders, and line ranges (toolbar + right-click)
+- Sandboxed local/SSH workspace FS (`list_workspace_dir`, `read_workspace_file`)
+
+### Fixed
+
+- Project name click toggles expand/collapse when already selected
+
+### Packaging
+
+- Version bump to 0.3.2
+
 ## [0.3.1] — 2026-07-21
 
 ### Fixed
@@ -71,6 +87,7 @@
 - License: Apache-2.0
 - Unofficial; not affiliated with xAI / SpaceX / SpaceXAI / X Corp.
 
+[0.3.2]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.2
 [0.3.1]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.2.0

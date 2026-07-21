@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
+import { FilesView } from "./components/FilesView";
 import { PermissionModal } from "./components/PermissionModal";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { useAppStore, waitForApplyDrain } from "./store";
@@ -17,6 +18,7 @@ function App() {
   const pushLog = useAppStore((s) => s.pushLog);
   const refreshChat = useAppStore((s) => s.refreshChat);
   const ready = useAppStore((s) => s.ready);
+  const workspaceMode = useAppStore((s) => s.workspaceMode);
 
   // Connect once on mount. Empty deps + ignore flag avoids StrictMode double-connect races.
   useEffect(() => {
@@ -326,7 +328,7 @@ function App() {
     <div className="app-shell">
       <Sidebar />
       <div className="workspace">
-        <ChatView />
+        {workspaceMode === "files" ? <FilesView /> : <ChatView />}
         <TerminalPanel />
       </div>
       <PermissionModal />

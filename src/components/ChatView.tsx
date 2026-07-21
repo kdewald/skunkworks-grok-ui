@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDown, FileText, SquareTerminal } from "lucide-react";
+import { ChevronDown, FileText } from "lucide-react";
 import { useAppStore } from "../store";
 import { IntermediateWork } from "./IntermediateWork";
 import { Composer } from "./Composer";
 import { SubagentPanel } from "./SubagentPanel";
+import { WorkspaceHeader } from "./WorkspaceHeader";
 
 /** Distance from bottom (px) still counted as "pinned" for sticky follow. */
 const STICK_THRESHOLD = 80;
@@ -20,8 +21,6 @@ export function ChatView() {
     busy,
     error,
     createChat,
-    terminalOpen,
-    setTerminalOpen,
   } = useAppStore();
   const scrollerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -175,17 +174,9 @@ export function ChatView() {
   if (!activeChat) {
     return (
       <main className="main empty-main">
-        <header className="chat-header empty-header">
-          <div />
-          <button
-            type="button"
-            className={`icon-btn chat-header-term ${terminalOpen ? "active" : ""}`}
-            title={terminalOpen ? "Hide terminal" : "Show terminal"}
-            onClick={() => setTerminalOpen(!terminalOpen)}
-          >
-            <SquareTerminal size={16} strokeWidth={1.75} />
-          </button>
-        </header>
+        <WorkspaceHeader
+          title={isScratch ? "Scratch" : project?.name || "Chat"}
+        />
         <div className="hero">
           <h1>{isScratch ? "Scratch" : project?.name}</h1>
           <p className="mono">
@@ -217,10 +208,10 @@ export function ChatView() {
 
   return (
     <main className="main">
-      <header className="chat-header">
-        <div>
-          <div className="chat-header-title">{activeChat.title}</div>
-          <div className="chat-header-sub">
+      <WorkspaceHeader
+        title={activeChat.title}
+        subtitle={
+          <>
             <span>{project?.name}</span>
             {activeChat.acpSessionId && (
               <span className="mono muted">
@@ -228,17 +219,9 @@ export function ChatView() {
               </span>
             )}
             {streaming && <span className="muted"> · streaming</span>}
-          </div>
-        </div>
-        <button
-          type="button"
-          className={`icon-btn chat-header-term ${terminalOpen ? "active" : ""}`}
-          title={terminalOpen ? "Hide terminal" : "Show terminal"}
-          onClick={() => setTerminalOpen(!terminalOpen)}
-        >
-          <SquareTerminal size={16} strokeWidth={1.75} />
-        </button>
-      </header>
+          </>
+        }
+      />
 
       <div className="main-body">
         <div className="main-center">

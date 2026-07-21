@@ -2,6 +2,7 @@ mod acp;
 mod commands;
 mod store;
 mod terminal;
+mod workspace_fs;
 
 use commands::AppState;
 
@@ -49,6 +50,8 @@ pub fn run() {
             commands::write_terminal,
             commands::resize_terminal,
             commands::close_terminal,
+            commands::list_workspace_dir,
+            commands::read_workspace_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

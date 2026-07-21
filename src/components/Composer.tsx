@@ -11,6 +11,7 @@ import { readImage } from "@tauri-apps/plugin-clipboard-manager";
 import {
   ClipboardPaste,
   FileText,
+  Folder,
   Paperclip,
   Plus,
   SendHorizontal,
@@ -26,6 +27,7 @@ import {
   formatSize,
   uid,
 } from "../attachments";
+import { chipLabel } from "../contextChips";
 
 type Props = {
   onSend?: () => void;
@@ -47,6 +49,10 @@ export function Composer({ onSend }: Props) {
     messageQueue,
     removeQueuedMessage,
     clearMessageQueue,
+    contextChips,
+    removeContextChip,
+    updateContextChipNote,
+    clearContextChips,
   } = useAppStore();
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -216,7 +222,7 @@ export function Composer({ onSend }: Props) {
 
   async function submit() {
     const value = text.trim();
-    if (!value && attachments.length === 0) return;
+    if (!value && attachments.length === 0 && contextChips.length === 0) return;
     // Always allow while a turn is running (queue or cancel-and-send).
     // Only block a double-dispatch when idle and an invoke is in flight.
     if (!streaming && busy) return;
@@ -249,7 +255,8 @@ export function Composer({ onSend }: Props) {
     }
   }
 
-  const hasContent = !!text.trim() || attachments.length > 0;
+  const hasContent =
+    !!text.trim() || attachments.length > 0 || contextChips.length > 0;
   // Queue / cancel-and-send while working; only block empty or idle double-send.
   const canSend = hasContent && (streaming || !busy);
   const canAttach = true;
@@ -292,6 +299,53 @@ export function Composer({ onSend }: Props) {
                 onClick={() => removeQueuedMessage(m.id)}
               >
                 <X size={11} strokeWidth={2} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {contextChips.length > 0 && (
+        <div className="context-row">
+          <div className="context-row-label">
+            Context
+            <button
+              type="button"
+              className="queue-clear"
+              onClick={() => clearContextChips()}
+            >
+              Clear
+            </button>
+          </div>
+          {contextChips.map((c) => (
+            <div
+              key={c.id}
+              className={`context-chip kind-${c.kind}`}
+              title={c.path}
+            >
+              <span className="context-chip-icon">
+                {c.kind === "dir" ? (
+                  <Folder size={13} strokeWidth={1.75} />
+                ) : (
+                  <FileText size={13} strokeWidth={1.75} />
+                )}
+              </span>
+              <div className="context-chip-body">
+                <div className="context-chip-name mono">{chipLabel(c)}</div>
+                <input
+                  className="context-chip-note"
+                  placeholder="Optional note…"
+                  value={c.note ?? ""}
+                  onChange={(e) => updateContextChipNote(c.id, e.target.value)}
+                />
+              </div>
+              <button
+                type="button"
+                className="attach-remove"
+                title="Remove"
+                onClick={() => removeContextChip(c.id)}
+              >
+                <X size={12} strokeWidth={2} />
               </button>
             </div>
           ))}

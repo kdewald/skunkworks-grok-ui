@@ -186,3 +186,46 @@ export type RemoteDirListing = {
   entries: RemoteDirEntry[];
   searched?: boolean;
 };
+
+/** Exclusive main-pane mode. */
+export type WorkspaceMode = "chat" | "files";
+
+/** Entry from `list_workspace_dir`. */
+export type WorkspaceEntry = {
+  name: string;
+  /** Path relative to project root (`/` separators). */
+  path: string;
+  isDir: boolean;
+};
+
+export type WorkspaceListing = {
+  path: string;
+  entries: WorkspaceEntry[];
+  rootLabel: string;
+  remote: boolean;
+};
+
+export type WorkspaceFileContent = {
+  path: string;
+  content: string;
+  truncated: boolean;
+  size: number;
+  binary: boolean;
+  language: string;
+};
+
+/**
+ * Structured context sent with a message (from Files view).
+ * Expanded into markdown on send — not a separate attachment type.
+ */
+export type ContextChip = {
+  id: string;
+  kind: "file" | "dir" | "range";
+  /** Project-relative path. */
+  path: string;
+  note?: string;
+  startLine?: number;
+  endLine?: number;
+  /** Pinned snippet for range chips (captured at add time). */
+  content?: string;
+};

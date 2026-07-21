@@ -24,6 +24,10 @@ use crate::store::{
     LOCAL_ENV_ID, SCRATCH_PROJECT_ID,
 };
 use crate::terminal::{TerminalInfo, TerminalManager};
+use crate::workspace_fs::{
+    list_local, list_remote, read_local, read_remote, resolve_workspace_root, WorkspaceFileContent,
+    WorkspaceListing,
+};
 
 pub struct AppState {
     pub store: Store,
@@ -3129,4 +3133,63 @@ pub fn resize_terminal(
 #[tauri::command]
 pub fn close_terminal(state: State<'_, AppState>, terminal_id: String) -> Result<(), String> {
     state.terminals.close(&terminal_id)
+}
+
+// ── Workspace filesystem (Files view) ───────────────────────────────────────
+
+#[tauri::command]
+pub fn list_workspace_dir(
+    state: State<'_, AppState>,
+    project_id: String,
+    path: Option<String>,
+    chat_id: Option<String>,
+) -> Result<WorkspaceListing, String> {
+    let data = state.data.lock().clone();
+    let (project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+    let rel = path.unwrap_or_default();
+
+    if !remote {
+        return list_local(std::path::Path::new(&root), &rel);
+    }
+
+    let env = data
+        .environments
+        .iter()
+        .find(|e| e.id == project.environment_id)
+        .ok_or_else(|| "environment not found".to_string())?;
+    let host = env
+        .ssh_host
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "SSH host missing".to_string())?;
+    list_remote(host, &root, &rel)
+}
+
+#[tauri::command]
+pub fn read_workspace_file(
+    state: State<'_, AppState>,
+    project_id: String,
+    path: String,
+    chat_id: Option<String>,
+) -> Result<WorkspaceFileContent, String> {
+    let data = state.data.lock().clone();
+    let (project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+
+    if !remote {
+        return read_local(std::path::Path::new(&root), &path);
+    }
+
+    let env = data
+        .environments
+        .iter()
+        .find(|e| e.id == project.environment_id)
+        .ok_or_else(|| "environment not found".to_string())?;
+    let host = env
+        .ssh_host
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "SSH host missing".to_string())?;
+    read_remote(host, &root, &path)
 }
