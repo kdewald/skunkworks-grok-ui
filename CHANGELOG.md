@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.2] — 2026-07-21
+## [0.4.0] — 2026-07-21
 
 ### Added
 
@@ -14,7 +14,7 @@
 
 ### Packaging
 
-- Version bump to 0.3.2
+- Version bump to 0.4.0
 
 ## [0.3.1] — 2026-07-21
 
@@ -87,7 +87,7 @@
 - License: Apache-2.0
 - Unofficial; not affiliated with xAI / SpaceX / SpaceXAI / X Corp.
 
-[0.3.2]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.2
+[0.4.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.2.0
