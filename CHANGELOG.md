@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0] — 2026-07-21
+
+### Added
+
+- Project terminal panel with multi-tab interactive shells (local PTY; SSH for remote projects)
+- Codex-style project tree: chats nested under each project, collapsible groups
+- Terminal toggle in the chat header (top-right); open additional shells with **+**
+
+### Fixed
+
+- Opening or switching projects left the previous project's chat on screen
+- Terminal panel UI opened without starting a usable shell
+
+### Packaging
+
+- Version bump to 0.3.0
+
 ## [0.2.0] — 2026-07-14
 
 ### Added
@@ -44,5 +61,6 @@
 - License: Apache-2.0
 - Unofficial; not affiliated with xAI / SpaceX / SpaceXAI / X Corp.
 
+[0.3.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.1.0

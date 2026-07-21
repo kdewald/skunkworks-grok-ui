@@ -193,6 +193,8 @@ type AppStore = {
   error: string | null;
   logs: string[];
   connectionsOpen: boolean;
+  /** Bottom project terminal panel open. */
+  terminalOpen: boolean;
   /** Follow-ups typed while a turn is still running (FIFO per chat). */
   messageQueue: QueuedMessage[];
 
@@ -208,6 +210,7 @@ type AppStore = {
   removeEnvironment: (environmentId: string) => Promise<void>;
   refreshSshHosts: () => Promise<void>;
   setConnectionsOpen: (open: boolean) => void;
+  setTerminalOpen: (open: boolean) => void;
   addProject: (path: string, environmentId?: string) => Promise<void>;
   removeProject: (projectId: string) => Promise<void>;
   selectProject: (projectId: string) => Promise<void>;
@@ -334,6 +337,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   error: null,
   logs: [],
   connectionsOpen: false,
+  terminalOpen: false,
   messageQueue: [],
 
   isEnvConnected: (environmentId: string) =>
@@ -554,6 +558,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setConnectionsOpen: (open) => set({ connectionsOpen: open }),
 
+  setTerminalOpen: (open) => set({ terminalOpen: open }),
+
   addProject: async (path: string, environmentId?: string) => {
     const envId = environmentId ?? get().activeEnvironmentId;
     const project = await invoke<Project>("add_project", {
@@ -564,12 +570,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
       ...get().projects.filter((p) => p.id !== project.id),
       project,
     ];
-    set({
-      projects,
-      activeProjectId: project.id,
-      activeEnvironmentId: project.environmentId || envId,
-    });
-    await invoke("set_active_project", { projectId: project.id });
+    // Update the project list first, then go through selectProject so the
+    // previous project's chat is cleared (or replaced by this project's first chat).
+    set({ projects });
+    await get().selectProject(project.id);
   },
 
   removeProject: async (projectId: string) => {
@@ -605,7 +609,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
       await get().setActiveEnvironment(envId);
     }
     await invoke("set_active_project", { projectId });
-    set({ activeProjectId: projectId, activeEnvironmentId: envId });
+    // Drop the previous project's transcript immediately so it never sticks
+    // around while we load this project's first chat (or empty state).
+    const prevChat = get().activeChat;
+    const staysOnProject = prevChat?.projectId === projectId;
+    set({
+      activeProjectId: projectId,
+      activeEnvironmentId: envId,
+      ...(staysOnProject
+        ? {}
+        : { activeChatId: null, activeChat: null, busy: false, permission: null }),
+    });
     // Auto-connect if needed for this env
     if (!get().connectedEnvironments.includes(envId)) {
       try {
@@ -619,10 +633,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       await get().selectChat(first.id);
     } else {
       // Leaving an unused draft behind when switching projects.
-      const prevId = get().activeChatId;
+      const prevId = prevChat?.id ?? get().activeChatId;
       const prevEmpty =
-        get().activeChat?.id === prevId &&
-        (get().activeChat?.turns.length ?? 0) === 0;
+        prevChat?.id === prevId && (prevChat?.turns.length ?? 0) === 0;
       try {
         const discarded = await invoke<string | null>("set_active_chat", {
           chatId: null,
@@ -709,7 +722,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const prevWasEmpty =
       get().activeChat?.id === prevId &&
       (get().activeChat?.turns.length ?? 0) === 0;
-    set({ activeChatId: chatId, error: null });
+    // Clear the document when switching chats so the previous transcript
+    // never remains on screen during load.
+    set({
+      activeChatId: chatId,
+      activeChat: prevId === chatId ? get().activeChat : null,
+      error: null,
+    });
     try {
       const discarded = await invoke<string | null>("set_active_chat", {
         chatId,

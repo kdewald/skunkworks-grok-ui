@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { PermissionModal } from "./components/PermissionModal";
+import { TerminalPanel } from "./components/TerminalPanel";
 import { useAppStore, waitForApplyDrain } from "./store";
 import type { PermissionRequest } from "./types";
 import "./App.css";
@@ -324,7 +325,10 @@ function App() {
   return (
     <div className="app-shell">
       <Sidebar />
-      <ChatView />
+      <div className="workspace">
+        <ChatView />
+        <TerminalPanel />
+      </div>
       <PermissionModal />
     </div>
   );

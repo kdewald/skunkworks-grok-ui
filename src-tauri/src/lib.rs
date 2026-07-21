@@ -1,6 +1,7 @@
 mod acp;
 mod commands;
 mod store;
+mod terminal;
 
 use commands::AppState;
 
@@ -44,6 +45,10 @@ pub fn run() {
             commands::apply_session_updates,
             commands::set_turn_collapsed,
             commands::set_block_collapsed,
+            commands::open_terminal,
+            commands::write_terminal,
+            commands::resize_terminal,
+            commands::close_terminal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -70,6 +70,16 @@ export function Composer({ onSend }: Props) {
     taRef.current?.focus();
   }, [activeChat?.id]);
 
+  // Keep the textarea height in lockstep with content so + / text / send
+  // share one row when empty, and grow together when multi-line.
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "34px";
+    const next = Math.min(Math.max(el.scrollHeight, 34), 160);
+    el.style.height = `${next}px`;
+  }, [text]);
+
   useEffect(() => {
     if (!menuOpen) return;
     const onDoc = (e: MouseEvent) => {
@@ -398,7 +408,7 @@ export function Composer({ onSend }: Props) {
                   ? "Send a follow-up (queued until this turn finishes)…"
                   : "Message Grok…"
           }
-          rows={2}
+          rows={1}
         />
 
         <div className="composer-actions">
