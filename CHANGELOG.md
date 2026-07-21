@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.1] — 2026-07-21
+
+### Fixed
+
+- Terminal tabs are project-bound: switching projects no longer carries another project's shells
+
+### Packaging
+
+- Version bump to 0.3.1
+
 ## [0.3.0] — 2026-07-21
 
 ### Added
@@ -61,6 +71,7 @@
 - License: Apache-2.0
 - Unofficial; not affiliated with xAI / SpaceX / SpaceXAI / X Corp.
 
+[0.3.1]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.1.0

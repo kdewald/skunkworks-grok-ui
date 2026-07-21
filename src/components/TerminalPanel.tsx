@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
@@ -37,6 +37,11 @@ type TabMeta = {
   chatId: string | null;
 };
 
+type ProjectSession = {
+  tabs: TabMeta[];
+  activeTabId: string | null;
+};
+
 type LiveTerm = {
   term: Terminal;
   fit: FitAddon;
@@ -46,6 +51,10 @@ type LiveTerm = {
 
 function newClientId() {
   return `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function emptySession(): ProjectSession {
+  return { tabs: [], activeTabId: null };
 }
 
 function makeTerm(): { term: Terminal; fit: FitAddon } {
@@ -109,10 +118,36 @@ export function TerminalPanel() {
     project?.id === SCRATCH_PROJECT_ID ||
     (project?.id.startsWith("scratch:") ?? false);
 
-  const [tabs, setTabs] = useState<TabMeta[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  /** Terminals are stored per project and never shown across projects. */
+  const [byProject, setByProject] = useState<Record<string, ProjectSession>>(
+    {},
+  );
   const [height, setHeight] = useState(260);
   const dragRef = useRef<{ startY: number; startH: number } | null>(null);
+
+  const byProjectRef = useRef(byProject);
+  byProjectRef.current = byProject;
+
+  const session = useMemo(
+    () =>
+      activeProjectId
+        ? (byProject[activeProjectId] ?? emptySession())
+        : emptySession(),
+    [byProject, activeProjectId],
+  );
+  const tabs = session.tabs;
+  const activeTabId = session.activeTabId;
+
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  const activeProjectIdRef = useRef(activeProjectId);
+  activeProjectIdRef.current = activeProjectId;
+
+  /** Every tab across projects — hosts stay mounted so PTYs survive project switches. */
+  const allTabs = useMemo(
+    () => Object.values(byProject).flatMap((s) => s.tabs),
+    [byProject],
+  );
 
   /** clientId → live xterm + pty */
   const livesRef = useRef<Map<string, LiveTerm>>(new Map());
@@ -122,16 +157,37 @@ export function TerminalPanel() {
   const ptyToClientRef = useRef<Map<string, string>>(new Map());
   /** Buffer PTY output until tab adopts the id */
   const pendingOutputRef = useRef<Map<string, string>>(new Map());
-  const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
-  const activeTabIdRef = useRef(activeTabId);
-  activeTabIdRef.current = activeTabId;
+
+  const patchProject = useCallback(
+    (
+      projectId: string,
+      patch: (prev: ProjectSession) => ProjectSession,
+    ) => {
+      setByProject((prev) => {
+        const cur = prev[projectId] ?? emptySession();
+        const next = patch(cur);
+        return { ...prev, [projectId]: next };
+      });
+    },
+    [],
+  );
 
   const updateTab = useCallback(
     (clientId: string, patch: Partial<TabMeta>) => {
-      setTabs((prev) =>
-        prev.map((t) => (t.clientId === clientId ? { ...t, ...patch } : t)),
-      );
+      setByProject((prev) => {
+        let changed = false;
+        const next: Record<string, ProjectSession> = { ...prev };
+        for (const [pid, sess] of Object.entries(prev)) {
+          const idx = sess.tabs.findIndex((t) => t.clientId === clientId);
+          if (idx < 0) continue;
+          const tabs = sess.tabs.slice();
+          tabs[idx] = { ...tabs[idx], ...patch };
+          next[pid] = { ...sess, tabs };
+          changed = true;
+          break;
+        }
+        return changed ? next : prev;
+      });
     },
     [],
   );
@@ -182,6 +238,23 @@ export function TerminalPanel() {
     [closePty],
   );
 
+  const disposeProject = useCallback(
+    async (projectId: string) => {
+      const sess = byProjectRef.current[projectId];
+      if (!sess) return;
+      for (const tab of sess.tabs) {
+        await disposeTab(tab.clientId);
+      }
+      setByProject((prev) => {
+        if (!(projectId in prev)) return prev;
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
+    },
+    [disposeTab],
+  );
+
   const spawnShell = useCallback(
     async (
       clientId: string,
@@ -224,7 +297,6 @@ export function TerminalPanel() {
         return;
       }
 
-      // Kill previous PTY if restarting.
       if (live.ptyId) {
         await closePty(live.ptyId);
         live.ptyId = null;
@@ -261,12 +333,17 @@ export function TerminalPanel() {
         current.ptyId = info.id;
         ptyToClientRef.current.set(info.id, clientId);
 
-        const index = tabsRef.current.findIndex((t) => t.clientId === clientId);
+        const sess = byProjectRef.current[projectId] ?? emptySession();
+        const index = sess.tabs.findIndex((t) => t.clientId === clientId);
         updateTab(clientId, {
           ptyId: info.id,
           cwd: info.cwd,
           remote: info.remote,
-          title: tabTitle(index < 0 ? tabsRef.current.length : index, info.cwd, info.remote),
+          title: tabTitle(
+            index < 0 ? sess.tabs.length : index,
+            info.cwd,
+            info.remote,
+          ),
           exited: false,
           error: null,
         });
@@ -298,11 +375,12 @@ export function TerminalPanel() {
       if (!activeProjectId) return;
       const clientId = newClientId();
       const chatId = isScratch ? activeChatId : null;
-      const index = tabsRef.current.length;
+      const existing =
+        byProjectRef.current[activeProjectId]?.tabs.length ?? 0;
       const meta: TabMeta = {
         clientId,
         ptyId: null,
-        title: `Terminal ${index + 1}`,
+        title: `Terminal ${existing + 1}`,
         cwd: null,
         remote: false,
         exited: false,
@@ -310,11 +388,12 @@ export function TerminalPanel() {
         projectId: activeProjectId,
         chatId,
       };
-      setTabs((prev) => [...prev, meta]);
-      setActiveTabId(clientId);
+      patchProject(activeProjectId, (prev) => ({
+        tabs: [...prev.tabs, meta],
+        activeTabId: clientId,
+      }));
       if (opts?.focus !== false) setTerminalOpen(true);
 
-      // Wait for host ref to attach after render.
       await new Promise<void>((r) => requestAnimationFrame(() => r()));
       await new Promise<void>((r) => requestAnimationFrame(() => r()));
       await spawnShell(clientId, activeProjectId, chatId, true);
@@ -325,49 +404,64 @@ export function TerminalPanel() {
       isScratch,
       setTerminalOpen,
       spawnShell,
+      patchProject,
     ],
   );
 
   const closeTab = useCallback(
     async (clientId: string) => {
+      const projectId =
+        Object.entries(byProjectRef.current).find(([, s]) =>
+          s.tabs.some((t) => t.clientId === clientId),
+        )?.[0] ?? activeProjectIdRef.current;
+      if (!projectId) return;
+
       await disposeTab(clientId);
-      setTabs((prev) => {
-        const next = prev.filter((t) => t.clientId !== clientId);
-        // Renumber default titles that are still generic? keep cwd titles.
-        if (next.length === 0) {
-          setActiveTabId(null);
-          setTerminalOpen(false);
-        } else {
-          setActiveTabId((cur) => {
-            if (cur && cur !== clientId) return cur;
-            // Prefer neighbor of closed tab.
-            const idx = prev.findIndex((t) => t.clientId === clientId);
-            const neighbor =
-              next[Math.min(idx, next.length - 1)] ?? next[next.length - 1];
-            return neighbor?.clientId ?? null;
-          });
+      patchProject(projectId, (prev) => {
+        const nextTabs = prev.tabs.filter((t) => t.clientId !== clientId);
+        if (nextTabs.length === 0) {
+          if (projectId === activeProjectIdRef.current) {
+            setTerminalOpen(false);
+          }
+          return { tabs: [], activeTabId: null };
         }
-        return next;
+        let nextActive = prev.activeTabId;
+        if (nextActive === clientId || !nextTabs.some((t) => t.clientId === nextActive)) {
+          const idx = prev.tabs.findIndex((t) => t.clientId === clientId);
+          nextActive =
+            nextTabs[Math.min(Math.max(idx, 0), nextTabs.length - 1)]
+              ?.clientId ?? nextTabs[0].clientId;
+        }
+        return { tabs: nextTabs, activeTabId: nextActive };
       });
     },
-    [disposeTab, setTerminalOpen],
+    [disposeTab, patchProject, setTerminalOpen],
   );
 
   const closePanel = useCallback(() => {
     setTerminalOpen(false);
   }, [setTerminalOpen]);
 
-  const closeAllAndHide = useCallback(async () => {
-    const ids = tabsRef.current.map((t) => t.clientId);
-    for (const id of ids) {
-      await disposeTab(id);
+  const closeAllForActiveAndHide = useCallback(async () => {
+    const pid = activeProjectIdRef.current;
+    if (!pid) {
+      setTerminalOpen(false);
+      return;
     }
-    setTabs([]);
-    setActiveTabId(null);
+    await disposeProject(pid);
     setTerminalOpen(false);
-  }, [disposeTab, setTerminalOpen]);
+  }, [disposeProject, setTerminalOpen]);
 
-  // Backend PTY → correct xterm tab.
+  const setActiveTabId = useCallback(
+    (clientId: string) => {
+      const pid = activeProjectIdRef.current;
+      if (!pid) return;
+      patchProject(pid, (prev) => ({ ...prev, activeTabId: clientId }));
+    },
+    [patchProject],
+  );
+
+  // Backend PTY → correct xterm tab (any project).
   useEffect(() => {
     let cancelled = false;
     const unsubs: UnlistenFn[] = [];
@@ -426,12 +520,13 @@ export function TerminalPanel() {
     };
   }, [updateTab]);
 
-  // Opening the panel with no tabs → create the first terminal.
+  // Opening the panel for a project with no tabs → create first terminal.
+  // Switching projects only shows that project's parked tabs (does not carry others).
   useEffect(() => {
     if (!terminalOpen || !activeProjectId) return;
-    if (tabsRef.current.length > 0) {
-      // Refit / focus active tab after show.
-      const id = activeTabIdRef.current ?? tabsRef.current[0]?.clientId;
+    const sess = byProjectRef.current[activeProjectId] ?? emptySession();
+    if (sess.tabs.length > 0) {
+      const id = sess.activeTabId ?? sess.tabs[0]?.clientId;
       if (id) {
         const t = window.setTimeout(() => {
           fitTab(id);
@@ -445,24 +540,27 @@ export function TerminalPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalOpen, activeProjectId]);
 
-  // Cleanup all on unmount / no project.
+  // Drop sessions for projects that were removed from the sidebar.
   useEffect(() => {
-    if (!activeProjectId) {
-      void (async () => {
-        const ids = [...livesRef.current.keys()];
-        for (const id of ids) await disposeTab(id);
-        setTabs([]);
-        setActiveTabId(null);
-      })();
+    const alive = new Set(projects.map((p) => p.id));
+    const orphaned = Object.keys(byProjectRef.current).filter(
+      (id) => !alive.has(id),
+    );
+    for (const id of orphaned) {
+      void disposeProject(id);
     }
+  }, [projects, disposeProject]);
+
+  // Full cleanup only on unmount (not on project switch).
+  useEffect(() => {
     return () => {
       const ids = [...livesRef.current.keys()];
       for (const id of ids) void disposeTab(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProjectId]);
+  }, []);
 
-  // Fit active tab on height / open / tab switch.
+  // Fit active tab on height / open / tab / project switch.
   useEffect(() => {
     if (!terminalOpen || !activeTabId) return;
     const host = hostsRef.current.get(activeTabId);
@@ -477,7 +575,7 @@ export function TerminalPanel() {
       ro.disconnect();
       window.clearTimeout(t);
     };
-  }, [terminalOpen, height, activeTabId, fitTab]);
+  }, [terminalOpen, height, activeTabId, activeProjectId, fitTab]);
 
   // Drag resize.
   useEffect(() => {
@@ -506,11 +604,13 @@ export function TerminalPanel() {
     };
   }, [fitTab]);
 
-  // No project → nothing. When closed, stay mounted (hidden) so tabs/PTYs survive.
   if (!activeProjectId) return null;
-  if (!terminalOpen && tabs.length === 0) return null;
+  const hasAnyTabs = allTabs.length > 0;
+  if (!terminalOpen && !hasAnyTabs) return null;
 
   const activeTab = tabs.find((t) => t.clientId === activeTabId) ?? tabs[0];
+  // Only show the dock chrome when open, or keep hosts alive while hidden.
+  const showChrome = terminalOpen;
 
   return (
     <div
@@ -518,7 +618,7 @@ export function TerminalPanel() {
       style={terminalOpen ? { height } : undefined}
       aria-hidden={!terminalOpen}
     >
-      {terminalOpen && (
+      {showChrome && (
         <div
           className="terminal-resize-handle"
           onMouseDown={(e) => {
@@ -531,121 +631,129 @@ export function TerminalPanel() {
         />
       )}
 
-      <div className="terminal-toolbar">
-        <div className="terminal-tabs" role="tablist" aria-label="Terminals">
-          {tabs.map((tab) => {
-            const active =
-              tab.clientId === (activeTab?.clientId ?? activeTabId);
-            return (
-              <div
-                key={tab.clientId}
-                className={`terminal-tab ${active ? "active" : ""} ${tab.exited ? "exited" : ""}`}
-                role="tab"
-                aria-selected={active}
-                onClick={() => {
-                  setActiveTabId(tab.clientId);
-                  requestAnimationFrame(() => {
-                    fitTab(tab.clientId);
-                    livesRef.current.get(tab.clientId)?.term.focus();
-                  });
-                }}
-              >
-                <SquareTerminal size={12} strokeWidth={1.75} />
-                <span
-                  className="terminal-tab-title"
-                  title={tab.cwd ?? tab.title}
-                >
-                  {tab.title}
-                </span>
-                {tab.error && <span className="terminal-tab-error">!</span>}
-                <button
-                  type="button"
-                  className="terminal-tab-close"
-                  title="Close terminal"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void closeTab(tab.clientId);
+      {showChrome && (
+        <div className="terminal-toolbar">
+          <div className="terminal-tabs" role="tablist" aria-label="Terminals">
+            {tabs.map((tab) => {
+              const active =
+                tab.clientId === (activeTab?.clientId ?? activeTabId);
+              return (
+                <div
+                  key={tab.clientId}
+                  className={`terminal-tab ${active ? "active" : ""} ${tab.exited ? "exited" : ""}`}
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => {
+                    setActiveTabId(tab.clientId);
+                    requestAnimationFrame(() => {
+                      fitTab(tab.clientId);
+                      livesRef.current.get(tab.clientId)?.term.focus();
+                    });
                   }}
                 >
-                  <X size={11} strokeWidth={2} />
-                </button>
-              </div>
-            );
-          })}
-          <button
-            type="button"
-            className="terminal-tab-add"
-            title="New terminal"
-            onClick={() => void addTerminal()}
-          >
-            <Plus size={14} strokeWidth={2} />
-          </button>
-        </div>
-
-        <div className="terminal-toolbar-actions">
-          {activeTab?.cwd && (
-            <span className="terminal-cwd mono" title={activeTab.cwd}>
-              {activeTab.remote
-                ? activeTab.cwd
-                : displayPath(activeTab.cwd)}
-            </span>
-          )}
-          {activeTab?.remote && <span className="terminal-badge">SSH</span>}
-          {activeTab?.exited && (
-            <span className="terminal-badge muted">exited</span>
-          )}
-          <button
-            type="button"
-            className="icon-btn"
-            title="Restart shell"
-            disabled={!activeTab}
-            onClick={() => {
-              if (!activeTab) return;
-              void spawnShell(
-                activeTab.clientId,
-                activeTab.projectId,
-                activeTab.chatId,
-                true,
+                  <SquareTerminal size={12} strokeWidth={1.75} />
+                  <span
+                    className="terminal-tab-title"
+                    title={tab.cwd ?? tab.title}
+                  >
+                    {tab.title}
+                  </span>
+                  {tab.error && <span className="terminal-tab-error">!</span>}
+                  <button
+                    type="button"
+                    className="terminal-tab-close"
+                    title="Close terminal"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void closeTab(tab.clientId);
+                    }}
+                  >
+                    <X size={11} strokeWidth={2} />
+                  </button>
+                </div>
               );
-            }}
-          >
-            <RefreshCw size={13} strokeWidth={1.75} />
-          </button>
-          <button
-            type="button"
-            className="icon-btn"
-            title="Hide terminal panel"
-            onClick={closePanel}
-          >
-            <ChevronDown size={14} strokeWidth={1.75} />
-          </button>
-          <button
-            type="button"
-            className="icon-btn"
-            title="Close all terminals"
-            onClick={() => void closeAllAndHide()}
-          >
-            <X size={14} strokeWidth={1.75} />
-          </button>
+            })}
+            <button
+              type="button"
+              className="terminal-tab-add"
+              title="New terminal"
+              onClick={() => void addTerminal()}
+            >
+              <Plus size={14} strokeWidth={2} />
+            </button>
+          </div>
+
+          <div className="terminal-toolbar-actions">
+            {activeTab?.cwd && (
+              <span className="terminal-cwd mono" title={activeTab.cwd}>
+                {activeTab.remote
+                  ? activeTab.cwd
+                  : displayPath(activeTab.cwd)}
+              </span>
+            )}
+            {activeTab?.remote && <span className="terminal-badge">SSH</span>}
+            {activeTab?.exited && (
+              <span className="terminal-badge muted">exited</span>
+            )}
+            <button
+              type="button"
+              className="icon-btn"
+              title="Restart shell"
+              disabled={!activeTab}
+              onClick={() => {
+                if (!activeTab) return;
+                void spawnShell(
+                  activeTab.clientId,
+                  activeTab.projectId,
+                  activeTab.chatId,
+                  true,
+                );
+              }}
+            >
+              <RefreshCw size={13} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              title="Hide terminal panel"
+              onClick={closePanel}
+            >
+              <ChevronDown size={14} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              title="Close all terminals for this project"
+              onClick={() => void closeAllForActiveAndHide()}
+            >
+              <X size={14} strokeWidth={1.75} />
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="terminal-hosts">
-        {tabs.map((tab) => (
-          <div
-            key={tab.clientId}
-            className={`terminal-host ${
-              tab.clientId === (activeTab?.clientId ?? activeTabId)
-                ? "is-active"
-                : "is-hidden"
-            }`}
-            ref={(el) => {
-              if (el) hostsRef.current.set(tab.clientId, el);
-              else hostsRef.current.delete(tab.clientId);
-            }}
-            onClick={() => livesRef.current.get(tab.clientId)?.term.focus()}
-          />
-        ))}
+        {/* Hosts for every project stay mounted so shells survive project switches. */}
+        {allTabs.map((tab) => {
+          const isCurrentProject = tab.projectId === activeProjectId;
+          const isActiveTab =
+            isCurrentProject &&
+            tab.clientId === (activeTab?.clientId ?? activeTabId);
+          return (
+            <div
+              key={tab.clientId}
+              className={`terminal-host ${
+                isActiveTab && terminalOpen ? "is-active" : "is-hidden"
+              }`}
+              data-project={tab.projectId}
+              ref={(el) => {
+                if (el) hostsRef.current.set(tab.clientId, el);
+                else hostsRef.current.delete(tab.clientId);
+              }}
+              onClick={() => livesRef.current.get(tab.clientId)?.term.focus()}
+            />
+          );
+        })}
       </div>
     </div>
   );
