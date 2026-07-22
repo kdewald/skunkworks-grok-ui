@@ -214,6 +214,27 @@ export type WorkspaceFileContent = {
   language: string;
 };
 
+/** Git change kind for Files tree coloring. */
+export type GitChangeKind =
+  | "untracked"
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "conflicted"
+  | "ignored";
+
+export type GitFileStatus = {
+  path: string;
+  kind: GitChangeKind;
+  staged: boolean;
+};
+
+export type WorkspaceGitStatus = {
+  isRepo: boolean;
+  files: GitFileStatus[];
+};
+
 /**
  * Structured context sent with a message (from Files view).
  * Expanded into markdown on send — not a separate attachment type.

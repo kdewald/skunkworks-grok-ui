@@ -5,6 +5,25 @@ mod terminal;
 mod workspace_fs;
 
 use commands::AppState;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
+
+/// Allow only app-local origins so external links cannot hijack the webview.
+fn navigation_guard_plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("navigation-guard")
+        .on_navigation(|_webview, url| match url.scheme() {
+            "tauri" | "asset" | "ipc" | "data" | "blob" | "about" => true,
+            "http" | "https" => {
+                let host = url.host_str().unwrap_or("");
+                host == "localhost"
+                    || host == "127.0.0.1"
+                    || host == "::1"
+                    || host.ends_with(".localhost")
+            }
+            _ => false,
+        })
+        .build()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -15,6 +34,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Belt-and-suspenders: never let the main webview navigate to an
+        // external site (markdown/terminal links open via plugin-opener).
+        .plugin(navigation_guard_plugin())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap,
@@ -52,6 +74,7 @@ pub fn run() {
             commands::close_terminal,
             commands::list_workspace_dir,
             commands::read_workspace_file,
+            commands::git_workspace_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

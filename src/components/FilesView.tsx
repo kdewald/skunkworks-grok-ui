@@ -21,14 +21,18 @@ import {
 import { useAppStore } from "../store";
 import { chipId } from "../contextChips";
 import type {
+  GitChangeKind,
   WorkspaceEntry,
   WorkspaceFileContent,
+  WorkspaceGitStatus,
   WorkspaceListing,
 } from "../types";
 import { SCRATCH_PROJECT_ID } from "../types";
 import { WorkspaceHeader } from "./WorkspaceHeader";
 import { Composer } from "./Composer";
+import { CodeViewer } from "./CodeViewer";
 import { displayPath } from "../pathDisplay";
+import { buildGitStatusMap, entryGitKind, gitStatusClass } from "../gitStatus";
 
 type TreeState = {
   expanded: Record<string, boolean>;
@@ -104,8 +108,10 @@ export function FilesView() {
   const [treeWidth, setTreeWidth] = useState(260);
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
+  const [gitStatus, setGitStatus] = useState<WorkspaceGitStatus | null>(null);
 
   const chatIdForFs = isScratch ? activeChatId : null;
+  const gitMap = useMemo(() => buildGitStatusMap(gitStatus), [gitStatus]);
 
   useEffect(() => {
     if (!ctxMenu) return;
@@ -162,6 +168,22 @@ export function FilesView() {
     [activeProjectId, chatIdForFs],
   );
 
+  const loadGitStatus = useCallback(async () => {
+    if (!activeProjectId) {
+      setGitStatus(null);
+      return;
+    }
+    try {
+      const st = await invoke<WorkspaceGitStatus>("git_workspace_status", {
+        projectId: activeProjectId,
+        chatId: chatIdForFs,
+      });
+      setGitStatus(st);
+    } catch {
+      setGitStatus(null);
+    }
+  }, [activeProjectId, chatIdForFs]);
+
   // Reset tree when project / scratch chat changes.
   useEffect(() => {
     setTree(emptyTree());
@@ -169,11 +191,25 @@ export function FilesView() {
     setFile(null);
     setFileError(null);
     setSelection(null);
+    setGitStatus(null);
     if (activeProjectId) {
       void loadDir("");
+      void loadGitStatus();
       setTree((t) => ({ ...t, expanded: { ...t.expanded, "": true } }));
     }
-  }, [activeProjectId, chatIdForFs, loadDir]);
+  }, [activeProjectId, chatIdForFs, loadDir, loadGitStatus]);
+
+  // Refresh git status when Files is focused / periodically while open.
+  useEffect(() => {
+    if (!activeProjectId) return;
+    const onFocus = () => void loadGitStatus();
+    window.addEventListener("focus", onFocus);
+    const t = window.setInterval(() => void loadGitStatus(), 12_000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(t);
+    };
+  }, [activeProjectId, loadGitStatus]);
 
   const openFile = useCallback(
     async (path: string) => {
@@ -260,24 +296,14 @@ export function FilesView() {
     setCtxMenu({ kind, x, y, path });
   }
 
-  function openViewerCtx(e: ReactMouseEvent) {
+  function openViewerCtx(
+    e: MouseEvent | ReactMouseEvent,
+    rangeOverride?: { start: number; end: number } | null,
+  ) {
     e.preventDefault();
     if (!activePath || !file) return;
-    // Prefer live DOM selection so right-click without prior mouseup still works.
-    let range = selection;
-    const sel = window.getSelection();
-    if (sel && !sel.isCollapsed && sel.rangeCount) {
-      const aEl = lineElFromNode(sel.anchorNode);
-      const fEl = lineElFromNode(sel.focusNode);
-      if (aEl && fEl) {
-        const s = Number(aEl.dataset.line);
-        const en = Number(fEl.dataset.line);
-        if (s && en) {
-          range = { start: Math.min(s, en), end: Math.max(s, en) };
-          setSelection(range);
-        }
-      }
-    }
+    const range = rangeOverride ?? selection;
+    if (rangeOverride) setSelection(rangeOverride);
     const { x, y } = clampMenuPos(e.clientX, e.clientY, 220, 140);
     setCtxMenu({
       kind: "viewer",
@@ -288,11 +314,6 @@ export function FilesView() {
       binary: file.binary,
     });
   }
-
-  const lines = useMemo(
-    () => (file && !file.binary ? file.content.split("\n") : []),
-    [file],
-  );
 
   if (!activeProjectId || !project) {
     return (
@@ -331,16 +352,26 @@ export function FilesView() {
             <button
               type="button"
               className="icon-btn"
-              title="Refresh"
+              title="Refresh tree & git status"
               onClick={() => {
                 setTree(emptyTree());
                 void loadDir("");
+                void loadGitStatus();
                 setTree((t) => ({ ...t, expanded: { "": true } }));
               }}
             >
               <RefreshCw size={13} strokeWidth={1.75} />
             </button>
           </div>
+          {gitStatus?.isRepo && (
+            <div className="file-tree-git-legend" title="Git status colors">
+              <span className="git-untracked">new</span>
+              <span className="git-modified">mod</span>
+              <span className="git-added">add</span>
+              <span className="git-deleted">del</span>
+              <span className="git-ignored">ign</span>
+            </div>
+          )}
           {tree.error && (
             <div className="file-tree-error">{tree.error}</div>
           )}
@@ -350,6 +381,7 @@ export function FilesView() {
               depth={0}
               tree={tree}
               activePath={activePath}
+              gitMap={gitMap}
               onToggle={toggleDir}
               onOpenFile={(p) => void openFile(p)}
               onAddFile={addFileChip}
@@ -404,6 +436,9 @@ export function FilesView() {
               <div className="file-viewer-bar">
                 <div className="file-viewer-path mono" title={activePath}>
                   {activePath}
+                  {!file.binary && file.language && file.language !== "text" && (
+                    <span className="file-badge lang">{file.language}</span>
+                  )}
                   {file.truncated && (
                     <span className="file-badge">truncated</span>
                   )}
@@ -447,58 +482,13 @@ export function FilesView() {
                   tree, or open it in an external editor.
                 </div>
               ) : (
-                <pre
-                  className="file-code"
-                  onContextMenu={openViewerCtx}
-                  onMouseUp={() => {
-                    const sel = window.getSelection();
-                    if (!sel || sel.isCollapsed || !sel.rangeCount) {
-                      setSelection(null);
-                      return;
-                    }
-                    // Map selection to line numbers via data-line attributes.
-                    const anchor = sel.anchorNode;
-                    const focus = sel.focusNode;
-                    const aEl = lineElFromNode(anchor);
-                    const fEl = lineElFromNode(focus);
-                    if (!aEl || !fEl) {
-                      setSelection(null);
-                      return;
-                    }
-                    const s = Number(aEl.dataset.line);
-                    const e = Number(fEl.dataset.line);
-                    if (!s || !e) {
-                      setSelection(null);
-                      return;
-                    }
-                    setSelection({
-                      start: Math.min(s, e),
-                      end: Math.max(s, e),
-                    });
-                  }}
-                >
-                  <code>
-                    {lines.map((line, i) => {
-                      const n = i + 1;
-                      const inSel =
-                        selection &&
-                        n >= Math.min(selection.start, selection.end) &&
-                        n <= Math.max(selection.start, selection.end);
-                      return (
-                        <div
-                          key={n}
-                          className={`file-line ${inSel ? "is-selected" : ""}`}
-                          data-line={n}
-                        >
-                          <span className="file-line-no">{n}</span>
-                          <span className="file-line-text">
-                            {line || " "}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </code>
-                </pre>
+                <CodeViewer
+                  content={file.content}
+                  language={file.language}
+                  path={activePath}
+                  onSelectionChange={setSelection}
+                  onContextMenu={(e, range) => openViewerCtx(e, range)}
+                />
               )}
             </>
           )}
@@ -612,15 +602,6 @@ export function FilesView() {
   );
 }
 
-function lineElFromNode(node: Node | null): HTMLElement | null {
-  let el: Node | null = node;
-  while (el) {
-    if (el instanceof HTMLElement && el.dataset.line) return el;
-    el = el.parentNode;
-  }
-  return null;
-}
-
 function formatBytes(n: number) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -632,6 +613,7 @@ function TreeLevel({
   depth,
   tree,
   activePath,
+  gitMap,
   onToggle,
   onOpenFile,
   onAddFile,
@@ -643,6 +625,7 @@ function TreeLevel({
   depth: number;
   tree: TreeState;
   activePath: string | null;
+  gitMap: Map<string, { path: string; kind: GitChangeKind; staged: boolean }>;
   onToggle: (path: string) => void;
   onOpenFile: (path: string) => void;
   onAddFile: (path: string) => void;
@@ -663,12 +646,15 @@ function TreeLevel({
       {entries.map((ent) => {
         if (ent.isDir) {
           const open = !!tree.expanded[ent.path];
+          const kind = entryGitKind(ent.path, true, gitMap);
+          const gClass = gitStatusClass(kind);
           return (
             <div key={ent.path} className="tree-node">
               <div
-                className="tree-row is-dir"
+                className={`tree-row is-dir ${gClass}`}
                 style={{ paddingLeft: 8 + depth * 12 }}
                 onContextMenu={(e) => onContextDir(e, ent.path)}
+                title={kind ? `Git: ${kind}` : undefined}
               >
                 <button
                   type="button"
@@ -703,6 +689,7 @@ function TreeLevel({
                   depth={depth + 1}
                   tree={tree}
                   activePath={activePath}
+                  gitMap={gitMap}
                   onToggle={onToggle}
                   onOpenFile={onOpenFile}
                   onAddFile={onAddFile}
@@ -714,12 +701,15 @@ function TreeLevel({
             </div>
           );
         }
+        const kind = entryGitKind(ent.path, false, gitMap);
+        const gClass = gitStatusClass(kind);
         return (
           <div
             key={ent.path}
-            className={`tree-row is-file ${activePath === ent.path ? "active" : ""}`}
+            className={`tree-row is-file ${activePath === ent.path ? "active" : ""} ${gClass}`}
             style={{ paddingLeft: 8 + depth * 12 }}
             onContextMenu={(e) => onContextFile(e, ent.path)}
+            title={kind ? `Git: ${kind}` : undefined}
           >
             <button
               type="button"

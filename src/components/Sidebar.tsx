@@ -117,6 +117,27 @@ export function Sidebar() {
     });
   }, [activeProjectId]);
 
+  // On startup / chat switch: reveal the active chat in the tree (expand
+  // project + "show more" when it sits past the default visible window).
+  useEffect(() => {
+    if (!activeChatId || !activeProjectId) return;
+    const projectChats = chatsForProject(chats, activeProjectId);
+    const idx = projectChats.findIndex((c) => c.id === activeChatId);
+    if (idx < 0) return;
+    setCollapsedIds((prev) => {
+      if (!prev[activeProjectId]) return prev;
+      const next = { ...prev };
+      delete next[activeProjectId];
+      persistCollapsedIds(next);
+      return next;
+    });
+    if (idx >= CHATS_VISIBLE_DEFAULT) {
+      setExpandedChatIds((prev) =>
+        prev[activeProjectId] ? prev : { ...prev, [activeProjectId]: true },
+      );
+    }
+  }, [activeChatId, activeProjectId, chats]);
+
   const envProjects = projectsForEnv(projects, activeEnvironmentId);
   const activeEnv = environments.find((e) => e.id === activeEnvironmentId);
   const isRemote = activeEnvironmentId !== LOCAL_ENV_ID;

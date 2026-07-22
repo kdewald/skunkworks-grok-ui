@@ -124,14 +124,14 @@ fn language_from_name(name: &str) -> String {
         "ts" | "tsx" => "typescript",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
         "json" => "json",
-        "md" | "mdx" => "markdown",
-        "py" => "python",
+        "md" | "mdx" | "markdown" | "mkd" => "markdown",
+        "py" | "pyi" | "pyw" | "pyx" => "python",
         "go" => "go",
         "java" => "java",
         "kt" => "kotlin",
         "swift" => "swift",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "cppm" | "ixx" => "cpp",
         "cs" => "csharp",
         "rb" => "ruby",
         "php" => "php",
@@ -515,4 +515,188 @@ pub fn is_safe_rel(path: &str) -> bool {
         && !Path::new(path)
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+}
+
+// ── Git status ──────────────────────────────────────────────────────────────
+
+/// Normalized file change kind for the tree UI.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GitChangeKind {
+    Untracked,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Conflicted,
+    /// Matched by .gitignore / exclude (from `git status --ignored`).
+    Ignored,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileStatus {
+    pub path: String,
+    pub kind: GitChangeKind,
+    /// True if index (staged) side has a change.
+    pub staged: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitStatus {
+    /// False when not a git work tree / git missing / command failed softly.
+    pub is_repo: bool,
+    pub files: Vec<GitFileStatus>,
+}
+
+fn classify_xy(x: char, y: char) -> Option<(GitChangeKind, bool)> {
+    // Unmerged
+    if matches!(x, 'U') || matches!(y, 'U') || (x == 'A' && y == 'A') || (x == 'D' && y == 'D') {
+        return Some((GitChangeKind::Conflicted, true));
+    }
+    // Untracked
+    if x == '?' && y == '?' {
+        return Some((GitChangeKind::Untracked, false));
+    }
+    // Ignored (requires `git status --ignored`)
+    if x == '!' && y == '!' {
+        return Some((GitChangeKind::Ignored, false));
+    }
+
+    let staged = !matches!(x, ' ' | '?');
+    let worktree = !matches!(y, ' ' | '?');
+
+    // Prefer more "attention-grabbing" for display when both staged + unstaged.
+    let kind_from = |c: char| -> Option<GitChangeKind> {
+        match c {
+            'M' => Some(GitChangeKind::Modified),
+            'A' => Some(GitChangeKind::Added),
+            'D' => Some(GitChangeKind::Deleted),
+            'R' | 'C' => Some(GitChangeKind::Renamed),
+            'T' => Some(GitChangeKind::Modified),
+            _ => None,
+        }
+    };
+
+    // Worktree changes often what users mean by "changed"; still mark staged.
+    if let Some(k) = kind_from(y) {
+        return Some((k, staged));
+    }
+    if let Some(k) = kind_from(x) {
+        return Some((k, true));
+    }
+    if staged || worktree {
+        return Some((GitChangeKind::Modified, staged));
+    }
+    None
+}
+
+fn parse_porcelain(stdout: &str) -> Vec<GitFileStatus> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        // path starts at index 3 (after "XY ")
+        let rest = line[3..].trim();
+        if rest.is_empty() {
+            continue;
+        }
+        // rename: "old -> new"
+        let path = if let Some((_, new)) = rest.split_once(" -> ") {
+            new.trim()
+        } else {
+            rest
+        };
+        // quote-wrapped paths from git; strip trailing slash on dirs
+        let path = path.trim_matches('"').replace("\\n", "\n");
+        let path = path.replace('\\', "/").trim_end_matches('/').to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let Some((kind, staged)) = classify_xy(x, y) else {
+            continue;
+        };
+        out.push(GitFileStatus {
+            path,
+            kind,
+            staged,
+        });
+    }
+    out
+}
+
+pub fn git_status_local(root: &Path) -> WorkspaceGitStatus {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-uall",
+            "--ignored=matching",
+            "--ignore-submodules=dirty",
+        ])
+        .output();
+
+    let Ok(output) = output else {
+        return WorkspaceGitStatus {
+            is_repo: false,
+            files: vec![],
+        };
+    };
+
+    // Not a git repo → exit 128 typically
+    if !output.status.success() {
+        return WorkspaceGitStatus {
+            is_repo: false,
+            files: vec![],
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    WorkspaceGitStatus {
+        is_repo: true,
+        files: parse_porcelain(&stdout),
+    }
+}
+
+pub fn git_status_remote(host: &str, root: &str) -> WorkspaceGitStatus {
+    let script = format!(
+        r#"set -e
+target={}
+target=$(eval echo "$target")
+cd "$target" 2>/dev/null || exit 128
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 128
+git status --porcelain=v1 -uall --ignored=matching --ignore-submodules=dirty
+"#,
+        shell_single_quote(root)
+    );
+
+    let output = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host])
+        .arg(format!("bash -lc {}", shell_single_quote(&script)))
+        .output();
+
+    let Ok(output) = output else {
+        return WorkspaceGitStatus {
+            is_repo: false,
+            files: vec![],
+        };
+    };
+    if !output.status.success() {
+        return WorkspaceGitStatus {
+            is_repo: false,
+            files: vec![],
+        };
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    WorkspaceGitStatus {
+        is_repo: true,
+        files: parse_porcelain(&stdout),
+    }
 }

@@ -241,16 +241,13 @@ export function ChatView() {
                       <div className="msg-attachments">
                         {turn.attachments.map((a) =>
                           a.kind === "image" && a.dataUrl ? (
-                            <a
+                            <div
                               key={a.id}
-                              href={a.dataUrl}
-                              target="_blank"
-                              rel="noreferrer"
                               className="msg-attach"
                               title={a.name}
                             >
                               <img src={a.dataUrl} alt={a.name} />
-                            </a>
+                            </div>
                           ) : (
                             <div
                               key={a.id}

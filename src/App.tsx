@@ -324,11 +324,16 @@ function App() {
     );
   }
 
+  const filesMode = workspaceMode === "files";
+
   return (
-    <div className="app-shell">
-      <Sidebar />
+    <div className={`app-shell ${filesMode ? "is-files-mode" : ""}`}>
+      {/* Stay mounted so width/opacity can animate closed in Files mode. */}
+      <div className="sidebar-slot" aria-hidden={filesMode}>
+        <Sidebar />
+      </div>
       <div className="workspace">
-        {workspaceMode === "files" ? <FilesView /> : <ChatView />}
+        {filesMode ? <FilesView /> : <ChatView />}
         <TerminalPanel />
       </div>
       <PermissionModal />

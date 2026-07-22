@@ -74,17 +74,49 @@ button {
 }
 
 .app-shell {
-  display: grid;
-  grid-template-columns: 280px 1fr;
+  display: flex;
+  flex-direction: row;
   height: 100%;
   min-height: 0;
   overflow: hidden;
   background: var(--bg);
 }
 
+/*
+ * Animated projects sidebar: collapse to 0 width in Files mode.
+ * Fixed inner width so content clips rather than reflowing mid-transition.
+ */
+.sidebar-slot {
+  --sidebar-width: 280px;
+  flex: 0 0 var(--sidebar-width);
+  width: var(--sidebar-width);
+  max-width: var(--sidebar-width);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  opacity: 1;
+  border-right: 1px solid var(--border-subtle);
+  transition:
+    flex-basis 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+    width 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+    max-width 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.2s ease,
+    border-color 0.22s ease;
+}
+
+.app-shell.is-files-mode .sidebar-slot {
+  flex-basis: 0;
+  width: 0;
+  max-width: 0;
+  opacity: 0;
+  border-right-color: transparent;
+  pointer-events: none;
+}
+
 .workspace {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -95,11 +127,13 @@ button {
 .sidebar {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border-subtle);
+  width: var(--sidebar-width, 280px);
+  height: 100%;
   background: var(--surface-sidebar);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  border-right: none; /* border lives on .sidebar-slot for clean collapse */
 }
 
 .sidebar-header {
@@ -1020,6 +1054,83 @@ button {
   color: var(--text-faint);
   font-size: 11px;
   padding: 6px 12px;
+}
+
+.file-tree-git-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 10px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid var(--border-subtle);
+  opacity: 0.9;
+}
+
+.tree-row.git-untracked .tree-name,
+.tree-row.git-untracked .tree-icon,
+.git-untracked {
+  color: #b5bd68 !important;
+}
+
+.tree-row.git-modified .tree-name,
+.tree-row.git-modified .tree-icon,
+.git-modified {
+  color: #f0c674 !important;
+}
+
+.tree-row.git-added .tree-name,
+.tree-row.git-added .tree-icon,
+.git-added {
+  color: #8abeb7 !important;
+}
+
+.tree-row.git-deleted .tree-name,
+.tree-row.git-deleted .tree-icon,
+.git-deleted {
+  color: #cc6666 !important;
+  text-decoration: line-through;
+  text-decoration-color: rgba(204, 102, 102, 0.5);
+}
+
+.tree-row.git-renamed .tree-name,
+.tree-row.git-renamed .tree-icon,
+.git-renamed {
+  color: #81a2be !important;
+}
+
+.tree-row.git-conflicted .tree-name,
+.tree-row.git-conflicted .tree-icon,
+.git-conflicted {
+  color: #b294bb !important;
+  font-weight: 700;
+}
+
+/* Gitignored — dimmer than normal, quieter than untracked green */
+.tree-row.git-ignored .tree-name,
+.tree-row.git-ignored .tree-icon,
+.git-ignored {
+  color: #5c6370 !important;
+  opacity: 0.85;
+}
+
+.tree-row.git-ignored .tree-name {
+  font-style: italic;
+}
+
+.code-viewer-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.code-viewer-host .cm-editor {
+  flex: 1 1 auto;
+  height: 100%;
+  outline: none;
 }
 
 .file-tree-resizer {
@@ -2614,8 +2725,8 @@ pre.code {
 }
 
 @media (max-width: 900px) {
-  .app-shell {
-    grid-template-columns: 250px 1fr;
+  .sidebar-slot {
+    --sidebar-width: 250px;
   }
 }
 

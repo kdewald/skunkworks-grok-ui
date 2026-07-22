@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import { markdownComponents } from "../markdownComponents";
 import remarkGfm from "remark-gfm";
 import {
   Bot,
@@ -105,7 +106,10 @@ function SubagentCard({
         <div className="subagent-card-body">
           {block.output ? (
             <div className="markdown subagent-card-md">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={markdownComponents}
+              >
                 {block.output}
               </ReactMarkdown>
             </div>

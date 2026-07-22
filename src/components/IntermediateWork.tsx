@@ -18,6 +18,7 @@ import {
 import type { IntermediateBlock, Turn } from "../types";
 import { useAppStore } from "../store";
 import { formatToolInput, formatToolPayload } from "../contentFormat";
+import { markdownComponents } from "../markdownComponents";
 
 function ToolIcon({ kind }: { kind?: string | null }) {
   const props = { size: 12, strokeWidth: 1.75 as const };
@@ -518,7 +519,9 @@ export const AssistantMessage = React.memo(function AssistantMessage({
   if (!text) return null;
   return (
     <div className="assistant-msg markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+        {text}
+      </ReactMarkdown>
     </div>
   );
 });

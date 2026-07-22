@@ -25,8 +25,8 @@ use crate::store::{
 };
 use crate::terminal::{TerminalInfo, TerminalManager};
 use crate::workspace_fs::{
-    list_local, list_remote, read_local, read_remote, resolve_workspace_root, WorkspaceFileContent,
-    WorkspaceListing,
+    git_status_local, git_status_remote, list_local, list_remote, read_local, read_remote,
+    resolve_workspace_root, WorkspaceFileContent, WorkspaceGitStatus, WorkspaceListing,
 };
 
 pub struct AppState {
@@ -1138,6 +1138,8 @@ pub fn delete_chat(state: State<'_, AppState>, chat_id: String) -> Result<(), St
 
 /// Switch active chat. If the previous chat had no messages, it is discarded
 /// (not kept as a permanent "New chat" entry). Returns the discarded id, if any.
+/// Also keeps `active_project_id` (and env when known) aligned with the chat so
+/// cold start / bootstrap restore the correct sidebar + files tree.
 #[tauri::command]
 pub fn set_active_chat(
     state: State<'_, AppState>,
@@ -1147,6 +1149,25 @@ pub fn set_active_chat(
         let mut data = state.data.lock();
         let prev = data.active_chat_id.clone();
         data.active_chat_id = chat_id.clone();
+        if let Some(ref id) = chat_id {
+            let project_id = data
+                .chats
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| c.project_id.clone());
+            if let Some(project_id) = project_id {
+                data.active_project_id = Some(project_id.clone());
+                let env_id = data
+                    .projects
+                    .iter()
+                    .find(|p| p.id == project_id)
+                    .map(|p| p.environment_id.clone())
+                    .filter(|e| !e.is_empty());
+                if let Some(env_id) = env_id {
+                    data.active_environment_id = Some(env_id);
+                }
+            }
+        }
         state.store.save_index(&data).map_err(|e| e.to_string())?;
         prev
     };
@@ -3192,4 +3213,31 @@ pub fn read_workspace_file(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "SSH host missing".to_string())?;
     read_remote(host, &root, &path)
+}
+
+#[tauri::command]
+pub fn git_workspace_status(
+    state: State<'_, AppState>,
+    project_id: String,
+    chat_id: Option<String>,
+) -> Result<WorkspaceGitStatus, String> {
+    let data = state.data.lock().clone();
+    let (project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+
+    if !remote {
+        return Ok(git_status_local(std::path::Path::new(&root)));
+    }
+
+    let env = data
+        .environments
+        .iter()
+        .find(|e| e.id == project.environment_id)
+        .ok_or_else(|| "environment not found".to_string())?;
+    let host = env
+        .ssh_host
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "SSH host missing".to_string())?;
+    Ok(git_status_remote(host, &root))
 }

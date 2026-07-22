@@ -259,6 +259,32 @@ function queueId() {
   return `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** True if the active chat has a turn still streaming. */
+function isActivelyStreaming(get: () => Pick<AppStore, "activeChat">): boolean {
+  return !!get().activeChat?.turns.some((t) => t.status === "streaming");
+}
+
+/**
+ * Clear a stuck composer lock: `busy` without a streaming turn means we missed
+ * prompt-finished (webview navigation, HMR, dropped event). Without this, Send
+ * and Enter silently no-op forever.
+ *
+ * Only call with force from explicit user send / a delayed watchdog — not on
+ * every busy transition, or you race the real pre-stream invoke window.
+ */
+export function healStuckBusy(
+  set: (partial: Partial<AppStore>) => void,
+  get: () => Pick<AppStore, "busy" | "activeChat">,
+  opts: { force?: boolean } = {},
+): boolean {
+  if (!opts.force) return false;
+  if (get().busy && !isActivelyStreaming(get)) {
+    set({ busy: false });
+    return true;
+  }
+  return false;
+}
+
 type Get = () => AppStore;
 type Set = (
   partial:
@@ -296,8 +322,12 @@ async function dispatchSend(
         images: [],
       },
     });
+    // If the turn already finished (or never started streaming), don't leave
+    // the composer locked waiting for a prompt-finished that won't come.
+    const stillStreaming = chat.turns.some((t) => t.status === "streaming");
     set({
       activeChat: chat,
+      busy: stillStreaming ? true : false,
       chats: get().chats.map((c) =>
         c.id === chat.id
           ? {
@@ -373,27 +403,49 @@ export const useAppStore = create<AppStore>((set, get) => ({
         res.data.activeEnvironmentId ||
         LOCAL_ENV_ID;
       const connected = res.connectedEnvironments ?? [];
+      const projects = res.data.projects ?? [];
+      const chats = res.data.chats ?? [];
+      const savedChatId = res.data.activeChatId ?? null;
+      const savedProjectId = res.data.activeProjectId ?? null;
+
+      // If we have a saved chat, derive project/env from it so sidebar + files
+      // match the transcript (index can be stale if only chat id was saved).
+      const savedChatMeta = savedChatId
+        ? chats.find((c) => c.id === savedChatId)
+        : undefined;
+      const projectId =
+        savedChatMeta?.projectId ??
+        savedProjectId ??
+        null;
+      const project = projectId
+        ? projects.find((p) => p.id === projectId)
+        : undefined;
+      const envFromProject = project?.environmentId || activeEnv;
+
       set({
         ready: true,
         dataDir: res.dataDir,
         environments: res.data.environments ?? [],
-        activeEnvironmentId: activeEnv,
+        activeEnvironmentId: envFromProject,
         connectedEnvironments: connected,
         sshHosts: res.sshHosts ?? [],
-        projects: res.data.projects ?? [],
-        chats: res.data.chats ?? [],
-        activeProjectId: res.data.activeProjectId ?? null,
-        activeChatId: res.data.activeChatId ?? null,
+        projects,
+        chats,
+        activeProjectId: projectId,
+        activeChatId: savedChatId,
         agent: {
-          connected: connected.includes(activeEnv),
-          message: connected.includes(activeEnv)
+          connected: connected.includes(envFromProject),
+          message: connected.includes(envFromProject)
             ? "Connected"
             : "Not connected",
-          environmentId: activeEnv,
+          environmentId: envFromProject,
         },
       });
-      if (res.data.activeChatId) {
-        await get().refreshChat(res.data.activeChatId);
+
+      // Full selectChat path: load document, sync project/env, ensure session.
+      // refreshChat alone left sidebar/files on a stale project.
+      if (savedChatId) {
+        await get().selectChat(savedChatId);
       }
     } catch (e) {
       set({ error: String(e), ready: true });
@@ -785,11 +837,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
       if (dropId) {
         chats = chats.filter((c) => c.id !== dropId);
       }
+      const project = get().projects.find((p) => p.id === chat.projectId);
+      const envId = project?.environmentId || get().activeEnvironmentId;
       set({
         chats,
         activeChat: chat,
         activeChatId: chatId,
         activeProjectId: chat.projectId,
+        activeEnvironmentId: envId,
       });
     } catch (e) {
       if (get().activeChatId === chatId) {
@@ -878,6 +933,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
     if (!chatId) throw new Error("No active chat");
 
+    // Lost prompt-finished (e.g. after webview navigated away) leaves busy=true
+    // with no stream — unlock so this send is not silently queued forever.
+    healStuckBusy(set, get, { force: true });
+
     const chips = get().contextChips;
     const ctxBlock = formatContextChips(chips);
     const body = text.trim();
@@ -928,6 +987,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   flushMessageQueue: async (chatId) => {
     const id = chatId ?? get().activeChatId;
     if (!id) return;
+    healStuckBusy(set, get, { force: true });
     if (get().busy) return;
     // Only drain when this chat is active and idle.
     if (get().activeChatId !== id) return;
@@ -1019,7 +1079,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
       // Critical: never let a background refresh (chat-updated / prompt-finished
       // for another chat) steal the user's current selection.
       if (get().activeChatId !== id) return;
-      set({ activeChat: chat, activeChatId: id });
+      const project = get().projects.find((p) => p.id === chat.projectId);
+      const envId = project?.environmentId || get().activeEnvironmentId;
+      set({
+        activeChat: chat,
+        activeChatId: id,
+        // Keep project / env aligned with the document (sidebar + files).
+        activeProjectId: chat.projectId,
+        activeEnvironmentId: envId,
+      });
     } catch (e) {
       // Don't surface errors for stale refreshes after a switch.
       if (get().activeChatId === id) {

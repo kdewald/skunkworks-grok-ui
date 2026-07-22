@@ -18,7 +18,7 @@ import {
   Square,
   X,
 } from "lucide-react";
-import { useAppStore } from "../store";
+import { healStuckBusy, useAppStore } from "../store";
 import {
   FILE_ACCEPT,
   MAX_ATTACHMENTS,
@@ -57,6 +57,8 @@ export function Composer({ onSend }: Props) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  /** Prevent double Enter while send_message invoke is in flight. */
+  const sendingRef = useRef(false);
   // Only a live streaming turn keeps Stop visible — cancelled/cancelling must not.
   const streaming = activeChat?.turns.some((t) => t.status === "streaming");
   const blockedOnTool = activeChat?.turns.some(
@@ -223,9 +225,18 @@ export function Composer({ onSend }: Props) {
   async function submit() {
     const value = text.trim();
     if (!value && attachments.length === 0 && contextChips.length === 0) return;
-    // Always allow while a turn is running (queue or cancel-and-send).
-    // Only block a double-dispatch when idle and an invoke is in flight.
-    if (!streaming && busy) return;
+    if (sendingRef.current) return;
+
+    // Lost prompt-finished leaves busy=true with no stream → Send was a no-op.
+    // Force-heal here: sendingRef already blocks true double-dispatch.
+    healStuckBusy(useAppStore.setState, useAppStore.getState, { force: true });
+    const state = useAppStore.getState();
+    const nowStreaming = !!state.activeChat?.turns.some(
+      (t) => t.status === "streaming",
+    );
+    const nowBusy = state.busy;
+
+    const prevAttachments = attachments;
     const toSend = attachments.map((a) => ({
       kind: a.kind,
       data: a.data,
@@ -233,10 +244,11 @@ export function Composer({ onSend }: Props) {
       name: a.name,
       dataUrl: a.dataUrl,
     }));
+    const chipsSnapshot = contextChips;
     setText("");
     setAttachments([]);
     onSend?.();
-    if (streaming || busy) {
+    if (nowStreaming || nowBusy) {
       flash(
         blockedOnTool
           ? "Stopping current command and sending…"
@@ -245,7 +257,25 @@ export function Composer({ onSend }: Props) {
             : `Queued (${chatQueue.length + 1})`,
       );
     }
-    await sendMessage(value, toSend);
+    sendingRef.current = true;
+    try {
+      await sendMessage(value, toSend);
+    } catch (e) {
+      // Restore draft so a failed send is not silent data-loss.
+      setText(value);
+      setAttachments(prevAttachments);
+      flash(String(e));
+      if (
+        chipsSnapshot.length &&
+        useAppStore.getState().contextChips.length === 0
+      ) {
+        for (const c of chipsSnapshot) {
+          useAppStore.getState().addContextChip(c);
+        }
+      }
+    } finally {
+      sendingRef.current = false;
+    }
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -255,10 +285,23 @@ export function Composer({ onSend }: Props) {
     }
   }
 
+  // Grace period: real sends set busy before streaming starts. Only treat
+  // busy&&!streaming as stuck after a few seconds (missed prompt-finished).
+  useEffect(() => {
+    if (!busy || streaming) return;
+    const t = window.setTimeout(() => {
+      healStuckBusy(useAppStore.setState, useAppStore.getState, {
+        force: true,
+      });
+    }, 5000);
+    return () => window.clearTimeout(t);
+  }, [busy, streaming]);
+
   const hasContent =
     !!text.trim() || attachments.length > 0 || contextChips.length > 0;
-  // Queue / cancel-and-send while working; only block empty or idle double-send.
-  const canSend = hasContent && (streaming || !busy);
+  // Enable whenever there is content. submit() heals a stuck busy lock, queues
+  // while streaming, and sendingRef blocks a true double-dispatch.
+  const canSend = hasContent;
   const canAttach = true;
 
   return (

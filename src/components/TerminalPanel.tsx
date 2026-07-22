@@ -14,6 +14,7 @@ import {
 import { useAppStore } from "../store";
 import { displayPath } from "../pathDisplay";
 import { SCRATCH_PROJECT_ID } from "../types";
+import { openExternalUrl } from "../openExternal";
 import "@xterm/xterm/css/xterm.css";
 
 type TerminalInfo = {
@@ -93,7 +94,12 @@ function makeTerm(): { term: Terminal; fit: FitAddon } {
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon());
+  // Open terminal URLs in the system browser — never the app webview.
+  term.loadAddon(
+    new WebLinksAddon((_event, uri) => {
+      void openExternalUrl(uri);
+    }),
+  );
   return { term, fit };
 }
 

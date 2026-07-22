@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+## [0.5.0] — 2026-07-22
+
+### Added
+
+- Git status colors in the Files tree (`new` / `mod` / `add` / `del` / `ign`)
+- CodeMirror 6 syntax highlighting with extensible language registry
+- Open external links in the system browser (markdown, terminal, global click safety net)
+- Webview navigation guard so external sites cannot replace the app UI
+
+### Fixed
+
+- Clicking agent links no longer navigates the entire Tauri window (no back button)
+- Composer Send/Enter stuck after a lost `prompt-finished` (e.g. after webview hijack)
+- Draft text restored when send fails
+- Startup auto-selected chat now syncs sidebar project, environment, and Files tree
+- Active chat revealed in the sidebar (expand project / show more when needed)
+- `set_active_chat` persists matching `active_project_id` and environment
+
+### Packaging
+
+- Version bump to 0.5.0
+
 ## [0.4.0] — 2026-07-21
 
 ### Added
