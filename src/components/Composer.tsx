@@ -41,6 +41,7 @@ export function Composer({ onSend }: Props) {
   const [hint, setHint] = useState<string | null>(null);
   const {
     sendMessage,
+    resubmitFromTurn,
     cancelPrompt,
     busy,
     activeChat,
@@ -53,6 +54,8 @@ export function Composer({ onSend }: Props) {
     removeContextChip,
     updateContextChipNote,
     clearContextChips,
+    composerEdit,
+    clearComposerEdit,
   } = useAppStore();
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -61,22 +64,28 @@ export function Composer({ onSend }: Props) {
   const sendingRef = useRef(false);
   // Only a live streaming turn keeps Stop visible — cancelled/cancelling must not.
   const streaming = activeChat?.turns.some((t) => t.status === "streaming");
-  const blockedOnTool = activeChat?.turns.some(
-    (t) =>
-      t.status === "streaming" &&
-      t.intermediate.some(
-        (b) =>
-          b.type === "tool" &&
-          (b.status === "in_progress" ||
-            b.status === "pending" ||
-            b.status === "running"),
-      ),
-  );
   const chatQueue = messageQueue.filter((m) => m.chatId === activeChatId);
+  const editing =
+    composerEdit?.chatId === activeChatId ? composerEdit : null;
 
   useEffect(() => {
     taRef.current?.focus();
   }, [activeChat?.id]);
+
+  // Seed the bottom textarea when the user picks Edit on a prior message.
+  useEffect(() => {
+    if (!composerEdit || composerEdit.chatId !== activeChatId) return;
+    setText(composerEdit.text);
+    setAttachments([]);
+    setMenuOpen(false);
+    requestAnimationFrame(() => {
+      const el = taRef.current;
+      if (!el) return;
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    });
+  }, [composerEdit?.seed, composerEdit?.chatId, activeChatId]);
 
   // Keep the textarea height in lockstep with content so + / text / send
   // share one row when empty, and grow together when multi-line.
@@ -224,7 +233,16 @@ export function Composer({ onSend }: Props) {
 
   async function submit() {
     const value = text.trim();
-    if (!value && attachments.length === 0 && contextChips.length === 0) return;
+    const editingNow =
+      composerEdit?.chatId === activeChatId ? composerEdit : null;
+    if (
+      !value &&
+      attachments.length === 0 &&
+      contextChips.length === 0 &&
+      !editingNow?.hasAttachments
+    ) {
+      return;
+    }
     if (sendingRef.current) return;
 
     // Lost prompt-finished leaves busy=true with no stream → Send was a no-op.
@@ -236,6 +254,23 @@ export function Composer({ onSend }: Props) {
     );
     const nowBusy = state.busy;
 
+    if (editingNow) {
+      if (editingNow.laterCount > 0) {
+        const n = editingNow.laterCount;
+        const ok = window.confirm(
+          n === 1
+            ? "Resending will remove this reply. Continue?"
+            : `Resending will remove this reply and ${n} later messages. Continue?`,
+        );
+        if (!ok) return;
+      } else if (nowStreaming) {
+        const ok = window.confirm(
+          "This will stop the current response and resend your message. Continue?",
+        );
+        if (!ok) return;
+      }
+    }
+
     const prevAttachments = attachments;
     const toSend = attachments.map((a) => ({
       kind: a.kind,
@@ -245,21 +280,27 @@ export function Composer({ onSend }: Props) {
       dataUrl: a.dataUrl,
     }));
     const chipsSnapshot = contextChips;
+    const editSnapshot = editingNow;
     setText("");
     setAttachments([]);
     onSend?.();
-    if (nowStreaming || nowBusy) {
+    if (!editSnapshot && (nowStreaming || nowBusy)) {
       flash(
-        blockedOnTool
-          ? "Stopping current command and sending…"
-          : chatQueue.length === 0
-            ? "Queued — will send when this turn finishes"
-            : `Queued (${chatQueue.length + 1})`,
+        chatQueue.length === 0
+          ? "Queued — will send when this turn finishes (Stop to interrupt)"
+          : `Queued (${chatQueue.length + 1})`,
       );
     }
     sendingRef.current = true;
     try {
-      await sendMessage(value, toSend);
+      if (editSnapshot) {
+        await resubmitFromTurn(editSnapshot.turnId, value, {
+          keepOriginalAttachments: editSnapshot.hasAttachments,
+          extraAttachments: toSend,
+        });
+      } else {
+        await sendMessage(value, toSend);
+      }
     } catch (e) {
       // Restore draft so a failed send is not silent data-loss.
       setText(value);
@@ -279,6 +320,13 @@ export function Composer({ onSend }: Props) {
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Escape" && editing) {
+      e.preventDefault();
+      clearComposerEdit();
+      setText("");
+      setAttachments([]);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void submit();
@@ -298,7 +346,10 @@ export function Composer({ onSend }: Props) {
   }, [busy, streaming]);
 
   const hasContent =
-    !!text.trim() || attachments.length > 0 || contextChips.length > 0;
+    !!text.trim() ||
+    attachments.length > 0 ||
+    contextChips.length > 0 ||
+    !!editing?.hasAttachments;
   // Enable whenever there is content. submit() heals a stuck busy lock, queues
   // while streaming, and sendingRef blocks a true double-dispatch.
   const canSend = hasContent;
@@ -306,7 +357,7 @@ export function Composer({ onSend }: Props) {
 
   return (
     <div
-      className={`composer ${dragOver ? "drag-over" : ""}`}
+      className={`composer ${dragOver ? "drag-over" : ""} ${editing ? "is-editing" : ""}`}
       onDragOver={(e) => {
         e.preventDefault();
         setDragOver(true);
@@ -314,6 +365,37 @@ export function Composer({ onSend }: Props) {
       onDragLeave={() => setDragOver(false)}
       onDrop={(e) => void onDrop(e)}
     >
+      {editing && (
+        <div className="edit-banner">
+          <div className="edit-banner-text">
+            <span className="edit-banner-label">Editing message</span>
+            <span className="edit-banner-detail">
+              {editing.laterCount > 0
+                ? `Send will replace it and remove ${editing.laterCount} later message${editing.laterCount === 1 ? "" : "s"}.`
+                : "Send will replace this message and its reply."}
+              {editing.hasAttachments
+                ? " Original attachments are kept."
+                : ""}{" "}
+              Esc to cancel.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="edit-banner-cancel"
+            title="Cancel edit"
+            onClick={() => {
+              clearComposerEdit();
+              setText("");
+              setAttachments([]);
+              taRef.current?.focus();
+            }}
+          >
+            <X size={13} strokeWidth={2} />
+            Cancel
+          </button>
+        </div>
+      )}
+
       {chatQueue.length > 0 && (
         <div className="queue-row">
           <div className="queue-label">
@@ -497,12 +579,12 @@ export function Composer({ onSend }: Props) {
           onKeyDown={onKeyDown}
           onPaste={(e) => void onPaste(e)}
           placeholder={
-            !agent.connected
-              ? "Connect to agent, then type a message…"
-              : blockedOnTool
-                ? "Send to stop the command and continue…"
-                : streaming
-                  ? "Send a follow-up (queued until this turn finishes)…"
+            editing
+              ? "Edit your message and press Enter to resend…"
+              : !agent.connected
+                ? "Connect to agent, then type a message…"
+                : streaming || busy
+                  ? "Queue a follow-up… (Stop to interrupt the current turn)"
                   : "Message Grok…"
           }
           rows={1}
@@ -513,7 +595,11 @@ export function Composer({ onSend }: Props) {
             <button
               type="button"
               className="composer-icon-btn stop"
-              title="Stop"
+              title={
+                editing
+                  ? "Stop current turn (keeps your edit draft)"
+                  : "Stop"
+              }
               onClick={() => void cancelPrompt()}
             >
               <Square size={14} strokeWidth={2} fill="currentColor" />
@@ -522,7 +608,13 @@ export function Composer({ onSend }: Props) {
           <button
             type="button"
             className="composer-send"
-            title={streaming ? "Queue follow-up" : "Send"}
+            title={
+              editing
+                ? "Save & resend"
+                : streaming
+                  ? "Queue follow-up"
+                  : "Send"
+            }
             onClick={() => void submit()}
             disabled={!canSend}
           >

@@ -89,6 +89,7 @@ function App() {
             if (active?.turns.some((t) => t.status === "streaming")) {
               useAppStore.setState({
                 busy: false,
+                inflightChatId: null,
                 permission: null,
                 activeChat: {
                   ...active,
@@ -107,7 +108,11 @@ function App() {
                 },
               });
             } else {
-              useAppStore.setState({ busy: false, permission: null });
+              useAppStore.setState({
+                busy: false,
+                inflightChatId: null,
+                permission: null,
+              });
             }
           }
         }),
@@ -126,24 +131,35 @@ function App() {
           void (async () => {
             const state = useAppStore.getState();
             const isActiveChat = state.activeChatId === event.payload.chatId;
+            const isInflightChat =
+              state.inflightChatId === event.payload.chatId;
             const active = isActiveChat ? state.activeChat : null;
             const finishedTurnId = event.payload.turnId ?? null;
             const last = active?.turns[active.turns.length - 1];
-            // Only clear busy if this finish is for the chat/turn the user is on.
+            // Clear busy when this chat's inflight turn ends (even if user switched away).
             const shouldClearBusy =
-              isActiveChat &&
-              (!last ||
-                !finishedTurnId ||
-                last.id === finishedTurnId ||
-                last.status !== "streaming");
+              isInflightChat ||
+              (isActiveChat &&
+                (!last ||
+                  !finishedTurnId ||
+                  last.id === finishedTurnId ||
+                  last.status !== "streaming"));
 
             if (shouldClearBusy) {
               useAppStore.setState({
                 busy: false,
+                inflightChatId:
+                  state.inflightChatId === event.payload.chatId
+                    ? null
+                    : state.inflightChatId,
                 error:
-                  event.payload.ok === false && event.payload.error
+                  isActiveChat &&
+                  event.payload.ok === false &&
+                  event.payload.error
                     ? String(event.payload.error)
-                    : null,
+                    : isActiveChat
+                      ? null
+                      : state.error,
                 permission:
                   event.payload.stopReason === "cancelled"
                     ? null
@@ -227,10 +243,30 @@ function App() {
             }
           })();
         }),
-        listen<{ chatId: string }>("chat-updated", (event) => {
-          // Ignore updates for chats the user is not viewing (was also stealing
-          // focus via refreshChat before that guard existed).
+        listen<{
+          chatId: string;
+          sessionId?: string;
+          sessionRecreated?: boolean;
+        }>("chat-updated", (event) => {
           const state = useAppStore.getState();
+          // Always patch session meta when recreated (routing depends on it).
+          if (event.payload.sessionId) {
+            useAppStore.setState({
+              chats: state.chats.map((c) =>
+                c.id === event.payload.chatId
+                  ? { ...c, acpSessionId: event.payload.sessionId }
+                  : c,
+              ),
+              activeChat:
+                state.activeChat?.id === event.payload.chatId
+                  ? {
+                      ...state.activeChat,
+                      acpSessionId: event.payload.sessionId ?? null,
+                    }
+                  : state.activeChat,
+            });
+          }
+          // Ignore transcript refresh for chats the user is not viewing.
           if (state.activeChatId !== event.payload.chatId) return;
           const cancelledIds = new Set(
             state.activeChat?.turns
@@ -266,12 +302,28 @@ function App() {
           "cancel-started",
           (event) => {
             const state = useAppStore.getState();
-            if (state.activeChat?.id !== event.payload.chatId) return;
-            const active = state.activeChat;
-            if (!active) return;
             const turnId = event.payload.turnId;
+            // Clear inflight even if this chat is not focused.
+            const clearInflight =
+              state.inflightChatId === event.payload.chatId
+                ? { busy: false as const, inflightChatId: null as string | null }
+                : {};
+            if (state.activeChat?.id !== event.payload.chatId) {
+              useAppStore.setState(clearInflight);
+              return;
+            }
+            const active = state.activeChat;
+            if (!active) {
+              useAppStore.setState(clearInflight);
+              return;
+            }
             useAppStore.setState({
+              ...clearInflight,
               busy: false,
+              inflightChatId:
+                state.inflightChatId === event.payload.chatId
+                  ? null
+                  : state.inflightChatId,
               permission: null,
               activeChat: {
                 ...active,

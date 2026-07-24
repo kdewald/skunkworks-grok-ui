@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## [0.5.1] — 2026-07-24
+
+### Added
+
+- Edit & resend a previous user message (rolls back that turn and everything after; fresh ACP session with rehydrated history)
+- Subagents panel toggle in the workspace header (badge with count; button only when subagents exist)
+- Codex-style message queue while a turn is running (Stop to interrupt; queue drains after)
+
+### Fixed
+
+- Subagent tool calls and fanned-in child responses no longer leak into the main chat transcript
+- Shell MultiResult rows (e.g. `cd … && scripts/…`) no longer appear as subagent cards
+- Auto-recover from stale ACP sessions (`unknown session id`) by recreating the session, re-seeding history, and retrying once
+- User messages no longer vanish after send (session ensure no longer overwrites the live chat with a stale disk snapshot)
+- Stop overwriting the open chat when a background send finishes; stop applying stream updates to the wrong chat
+- Queue drains correctly across chat switches; inflight/busy claimed before connect
+- Mid-turn session recreate marks session loaded and updates frontend meta
+- Cancel updates the live chat document immediately
+- Parent tools remain visible while subagents are running
+- Stop truncating model replies (accept parent message chunks while subagents run; accept late chunks after turn complete)
+- Stop stays visible while editing a prior message
+
+### Packaging
+
+- Version bump to 0.5.1
+
 ## [0.5.0] — 2026-07-22
 
 ### Added

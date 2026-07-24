@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDown, FileText } from "lucide-react";
+import { ChevronDown, FileText, Pencil } from "lucide-react";
 import { useAppStore } from "../store";
 import { IntermediateWork } from "./IntermediateWork";
 import { Composer } from "./Composer";
@@ -21,6 +21,8 @@ export function ChatView() {
     busy,
     error,
     createChat,
+    startEditTurn,
+    composerEdit,
   } = useAppStore();
   const scrollerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -233,60 +235,92 @@ export function ChatView() {
                   <code>{project?.path}</code>.
                 </div>
               )}
-              {activeChat.turns.map((turn) => (
-                <div key={turn.id} className="turn">
-                  <div className="user-msg">
-                    <div className="role">You</div>
-                    {turn.attachments && turn.attachments.length > 0 && (
-                      <div className="msg-attachments">
-                        {turn.attachments.map((a) =>
-                          a.kind === "image" && a.dataUrl ? (
-                            <div
-                              key={a.id}
-                              className="msg-attach"
-                              title={a.name}
-                            >
-                              <img src={a.dataUrl} alt={a.name} />
-                            </div>
-                          ) : (
-                            <div
-                              key={a.id}
-                              className="msg-attach file-chip"
-                              title={a.name}
-                            >
-                              <span className="file-chip-icon">
-                                <FileText size={15} strokeWidth={1.75} />
-                              </span>
-                              <span className="file-chip-name">{a.name}</span>
-                            </div>
-                          ),
+              {activeChat.turns.map((turn) => {
+                const canEdit =
+                  turn.userMessage.trim().length > 0 ||
+                  (turn.attachments?.length ?? 0) > 0;
+                const isSource =
+                  composerEdit?.chatId === activeChat.id &&
+                  composerEdit?.turnId === turn.id;
+
+                return (
+                  <div key={turn.id} className="turn">
+                    <div
+                      className={`user-msg ${isSource ? "is-edit-source" : ""}`}
+                    >
+                      <div className="user-msg-header">
+                        <div className="role">You</div>
+                        {canEdit && (
+                          <button
+                            type="button"
+                            className="user-msg-edit-btn"
+                            title="Edit in composer (resend rolls back later messages)"
+                            onClick={() => {
+                              startEditTurn(turn.id);
+                              setStick(true);
+                              requestAnimationFrame(() =>
+                                scrollToBottom("smooth"),
+                              );
+                            }}
+                          >
+                            <Pencil size={12} strokeWidth={1.85} />
+                            {isSource ? "Editing…" : "Edit"}
+                          </button>
                         )}
                       </div>
-                    )}
-                    {turn.userMessage && (
-                      <div className="user-text">{turn.userMessage}</div>
-                    )}
-                  </div>
-                  <div className="agent-col">
-                    <div className="role">Grok</div>
-                    {/* Parent tools / thinking / answers only — subagents are in the rail. */}
-                    <IntermediateWork turn={turn} />
-                    {turn.status === "streaming" &&
-                      !turn.assistantMessage &&
-                      !turn.intermediate.some((b) => b.type === "message") && (
-                        <div className="typing">
-                          <span />
-                          <span />
-                          <span />
+                      {turn.attachments && turn.attachments.length > 0 && (
+                        <div className="msg-attachments">
+                          {turn.attachments.map((a) =>
+                            a.kind === "image" && a.dataUrl ? (
+                              <div
+                                key={a.id}
+                                className="msg-attach"
+                                title={a.name}
+                              >
+                                <img src={a.dataUrl} alt={a.name} />
+                              </div>
+                            ) : (
+                              <div
+                                key={a.id}
+                                className="msg-attach file-chip"
+                                title={a.name}
+                              >
+                                <span className="file-chip-icon">
+                                  <FileText size={15} strokeWidth={1.75} />
+                                </span>
+                                <span className="file-chip-name">{a.name}</span>
+                              </div>
+                            ),
+                          )}
                         </div>
                       )}
-                    {turn.status === "error" &&
-                      !turn.assistantMessage.includes("**Turn failed:**") && (
-                        <div className="error-banner">Turn failed</div>
+                      {turn.userMessage && (
+                        <div className="user-text">{turn.userMessage}</div>
                       )}
+                    </div>
+                    <div className="agent-col">
+                      <div className="role">Grok</div>
+                      {/* Parent tools / thinking / answers only — subagents are in the rail. */}
+                      <IntermediateWork turn={turn} />
+                      {turn.status === "streaming" &&
+                        !turn.assistantMessage &&
+                        !turn.intermediate.some(
+                          (b) => b.type === "message",
+                        ) && (
+                          <div className="typing">
+                            <span />
+                            <span />
+                            <span />
+                          </div>
+                        )}
+                      {turn.status === "error" &&
+                        !turn.assistantMessage.includes("**Turn failed:**") && (
+                          <div className="error-banner">Turn failed</div>
+                        )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               <div ref={bottomRef} className="scroll-anchor" />
             </div>
 

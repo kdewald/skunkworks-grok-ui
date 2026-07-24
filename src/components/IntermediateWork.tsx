@@ -285,7 +285,23 @@ function isSubagentRailTool(b: IntermediateBlock): boolean {
   const ri = (b.rawInput ?? null) as Record<string, unknown> | null;
   const variant = String(ri?.variant ?? "").toLowerCase();
   const title = (b.title ?? "").toLowerCase();
-  if (variant === "task") {
+  if (
+    title === "spawn_subagent" ||
+    title.includes("spawn_subagent") ||
+    title.includes("spawn subagent")
+  ) {
+    // Don't treat a Grep for the string "spawn_subagent" as a spawn.
+    if (
+      variant === "grep" ||
+      variant === "readfile" ||
+      variant === "read" ||
+      variant === "shell"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (variant === "task" || variant === "spawn_subagent" || variant === "subagent") {
     return !!(
       ri?.prompt ||
       ri?.subagent_type ||
@@ -296,15 +312,22 @@ function isSubagentRailTool(b: IntermediateBlock): boolean {
   if (
     variant === "taskoutput" ||
     variant === "task_output" ||
+    variant === "await_task" ||
     title.includes("get_command_or_subagent_output") ||
-    title.includes("wait_commands_or_subagents")
+    title.includes("wait_commands_or_subagents") ||
+    title === "taskoutput" ||
+    title.includes("task_output")
   ) {
     return true;
   }
   if (ri && typeof ri === "object") {
     if (
       (ri.prompt || ri.description) &&
-      (ri.subagent_type || ri.subagentType || ri.capability_mode || ri.capabilityMode)
+      (ri.subagent_type ||
+        ri.subagentType ||
+        ri.capability_mode ||
+        ri.capabilityMode ||
+        ri.isolation)
     ) {
       return true;
     }

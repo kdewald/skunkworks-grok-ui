@@ -2,15 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { markdownComponents } from "../markdownComponents";
 import remarkGfm from "remark-gfm";
-import {
-  Bot,
-  ChevronDown,
-  ChevronRight,
-  Loader2,
-  PanelRightClose,
-  PanelRightOpen,
-} from "lucide-react";
+import { Bot, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type { ChatDocument, IntermediateBlock } from "../types";
+import { useAppStore } from "../store";
 
 type SubagentBlock = Extract<IntermediateBlock, { type: "subagent" }>;
 
@@ -131,31 +125,17 @@ type Props = {
   focusTurnId?: string | null;
 };
 
+/**
+ * Right-hand subagent rail. Visibility is controlled by the header toggle
+ * (`subagentsOpen`) — same pattern as the terminal dock.
+ */
 export function SubagentPanel({ chat, focusTurnId }: Props) {
+  const subagentsOpen = useAppStore((s) => s.subagentsOpen);
   const items = useMemo(() => collectSubagents(chat), [chat]);
   const anyRunning = items.some((i) => isRunning(i.block.status));
-  // Open aggressively whenever there is anything to show (not only while running).
-  const [open, setOpen] = useState(items.length > 0);
-  const [userClosed, setUserClosed] = useState(false);
 
-  useEffect(() => {
-    if (items.length === 0) {
-      setOpen(false);
-      setUserClosed(false);
-      return;
-    }
-    // Auto-open on first subagent or when a child starts running, unless the
-    // user explicitly collapsed the rail this turn.
-    if (!userClosed) {
-      setOpen(true);
-    } else if (anyRunning) {
-      // Running always wins — show the rail.
-      setOpen(true);
-      setUserClosed(false);
-    }
-  }, [items.length, anyRunning, userClosed]);
-
-  if (items.length === 0) return null;
+  // Nothing to show — header button is also hidden.
+  if (items.length === 0 || !subagentsOpen) return null;
 
   const ordered = [...items].sort((a, b) => {
     if (focusTurnId) {
@@ -165,7 +145,6 @@ export function SubagentPanel({ chat, focusTurnId }: Props) {
     const ar = isRunning(a.block.status) ? 0 : 1;
     const br = isRunning(b.block.status) ? 0 : 1;
     if (ar !== br) return ar - br;
-    // Prefer cards with output next.
     const ao = a.block.output ? 0 : 1;
     const bo = b.block.output ? 0 : 1;
     return ao - bo;
@@ -173,55 +152,34 @@ export function SubagentPanel({ chat, focusTurnId }: Props) {
 
   return (
     <aside
-      className={`subagent-panel ${open ? "is-open" : "is-closed"}${
-        anyRunning ? " has-running" : ""
-      }`}
+      className={`subagent-panel is-open${anyRunning ? " has-running" : ""}`}
       aria-label="Subagents"
     >
       <div className="subagent-panel-bar">
-        <button
-          type="button"
-          className="subagent-panel-toggle"
-          onClick={() => {
-            setOpen((o) => {
-              const next = !o;
-              setUserClosed(!next);
-              return next;
-            });
-          }}
-          title={open ? "Hide subagents" : "Show subagents"}
-        >
-          {open ? (
-            <PanelRightClose size={15} strokeWidth={1.75} />
-          ) : (
-            <PanelRightOpen size={15} strokeWidth={1.75} />
-          )}
-          <span className="subagent-panel-toggle-label">
-            Subagents
-            <span className="subagent-panel-count">{items.length}</span>
-            {anyRunning && <Loader2 size={11} className="spin" />}
-          </span>
-        </button>
-      </div>
-      {open && (
-        <div className="subagent-panel-list">
-          <p className="subagent-panel-hint">
-            Parallel workers — reports land here, not in the main transcript.
-          </p>
-          {ordered.map(({ block, turnLabel, turnId }) => (
-            <SubagentCard
-              key={block.id}
-              block={block}
-              turnLabel={turnLabel}
-              defaultOpen={
-                turnId === focusTurnId ||
-                isRunning(block.status) ||
-                !!block.output
-              }
-            />
-          ))}
+        <div className="subagent-panel-title-row">
+          <Bot size={14} strokeWidth={1.75} />
+          <span className="subagent-panel-title">Subagents</span>
+          <span className="subagent-panel-count">{items.length}</span>
+          {anyRunning && <Loader2 size={12} className="spin" />}
         </div>
-      )}
+      </div>
+      <div className="subagent-panel-list">
+        <p className="subagent-panel-hint">
+          Parallel workers — reports land here, not in the main transcript.
+        </p>
+        {ordered.map(({ block, turnLabel, turnId }) => (
+          <SubagentCard
+            key={block.id}
+            block={block}
+            turnLabel={turnLabel}
+            defaultOpen={
+              turnId === focusTurnId ||
+              isRunning(block.status) ||
+              !!block.output
+            }
+          />
+        ))}
+      </div>
     </aside>
   );
 }

@@ -62,6 +62,7 @@ pub fn run() {
             commands::set_active_chat,
             commands::ensure_chat_session,
             commands::send_message,
+            commands::rollback_to_turn,
             commands::cancel_prompt,
             commands::respond_permission,
             commands::apply_session_update,

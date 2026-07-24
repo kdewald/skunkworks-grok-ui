@@ -71,7 +71,17 @@ function resolveChatIdForSession(
   if (bySession) return bySession.id;
   const active = get().activeChat;
   if (active?.acpSessionId === sessionId) return active.id;
-  if (active) return active.id;
+  // After a mid-turn session recreate, meta may lag briefly. Only bind to
+  // inflight when that chat's known session is missing or already matches.
+  const inflight = get().inflightChatId;
+  if (inflight) {
+    const meta = get().chats.find((c) => c.id === inflight);
+    const live = get().activeChat?.id === inflight ? get().activeChat : null;
+    const known =
+      live?.acpSessionId ?? meta?.acpSessionId ?? null;
+    if (!known || known === sessionId) return inflight;
+  }
+  // Drop unmatched updates rather than applying them to the open chat.
   return null;
 }
 
@@ -179,6 +189,19 @@ export type QueuedMessage = {
   contextChips?: ContextChip[];
 };
 
+/** Draft loaded into the bottom composer for edit & resend. */
+export type ComposerEdit = {
+  turnId: string;
+  chatId: string;
+  /** Seed text for the textarea. */
+  text: string;
+  hasAttachments: boolean;
+  /** How many turns after this one will be removed on resend. */
+  laterCount: number;
+  /** Bumps so Composer re-seeds when editing the same turn again. */
+  seed: number;
+};
+
 type AppStore = {
   ready: boolean;
   dataDir: string;
@@ -194,17 +217,23 @@ type AppStore = {
   activeChat: ChatDocument | null;
   permission: PermissionRequest | null;
   busy: boolean;
+  /** Chat currently running a send/stream (for queue + cross-chat safety). */
+  inflightChatId: string | null;
   error: string | null;
   logs: string[];
   connectionsOpen: boolean;
   /** Bottom project terminal panel open. */
   terminalOpen: boolean;
+  /** Right-hand subagent rail open (header toggle; only when subagents exist). */
+  subagentsOpen: boolean;
   /** Exclusive main pane: chat transcript vs project files. */
   workspaceMode: WorkspaceMode;
   /** Context chips from Files view (paths / ranges) for the next send. */
   contextChips: ContextChip[];
   /** Follow-ups typed while a turn is still running (FIFO per chat). */
   messageQueue: QueuedMessage[];
+  /** When set, the composer is editing/resubmitting this turn. */
+  composerEdit: ComposerEdit | null;
 
   bootstrap: () => Promise<void>;
   connectAgent: (environmentId?: string) => Promise<void>;
@@ -219,6 +248,7 @@ type AppStore = {
   refreshSshHosts: () => Promise<void>;
   setConnectionsOpen: (open: boolean) => void;
   setTerminalOpen: (open: boolean) => void;
+  setSubagentsOpen: (open: boolean) => void;
   setWorkspaceMode: (mode: WorkspaceMode) => void;
   addContextChip: (chip: ContextChip) => void;
   removeContextChip: (id: string) => void;
@@ -235,6 +265,22 @@ type AppStore = {
     text: string,
     attachments?: QueuedAttachment[],
   ) => Promise<void>;
+  /**
+   * Roll back to a prior user turn (drop it and everything after), then send
+   * the edited text as a new turn. Invalidates the ACP session so history
+   * matches the truncated transcript.
+   */
+  resubmitFromTurn: (
+    turnId: string,
+    text: string,
+    options?: {
+      keepOriginalAttachments?: boolean;
+      extraAttachments?: QueuedAttachment[];
+    },
+  ) => Promise<void>;
+  /** Load a prior user turn into the bottom composer for edit & resend. */
+  startEditTurn: (turnId: string) => void;
+  clearComposerEdit: () => void;
   /** Drain next queued follow-up for a chat after a turn ends. */
   flushMessageQueue: (chatId?: string) => Promise<void>;
   removeQueuedMessage: (id: string) => void;
@@ -274,15 +320,20 @@ function isActivelyStreaming(get: () => Pick<AppStore, "activeChat">): boolean {
  */
 export function healStuckBusy(
   set: (partial: Partial<AppStore>) => void,
-  get: () => Pick<AppStore, "busy" | "activeChat">,
+  get: () => Pick<
+    AppStore,
+    "busy" | "activeChat" | "activeChatId" | "inflightChatId"
+  >,
   opts: { force?: boolean } = {},
 ): boolean {
   if (!opts.force) return false;
-  if (get().busy && !isActivelyStreaming(get)) {
-    set({ busy: false });
-    return true;
-  }
-  return false;
+  if (!get().busy) return false;
+  // Never clear busy for another chat's in-flight turn (viewing B while A runs).
+  const inflight = get().inflightChatId;
+  if (inflight && inflight !== get().activeChatId) return false;
+  if (isActivelyStreaming(get)) return false;
+  set({ busy: false, inflightChatId: null });
+  return true;
 }
 
 type Get = () => AppStore;
@@ -299,15 +350,23 @@ async function dispatchSend(
   text: string,
   attachments: QueuedAttachment[] = [],
 ) {
+  // Claim the send slot BEFORE any await so a second Enter cannot race connect.
+  set({ busy: true, inflightChatId: chatId, error: null });
+
+  // Resolve project from the target chat when possible (not always the active view).
+  const targetMeta = get().chats.find((c) => c.id === chatId);
   const project = get().projects.find(
-    (p) => p.id === (get().activeChat?.projectId || get().activeProjectId),
+    (p) =>
+      p.id ===
+      (targetMeta?.projectId ||
+        get().activeChat?.projectId ||
+        get().activeProjectId),
   );
   const envId = project?.environmentId || get().activeEnvironmentId;
-  if (!get().connectedEnvironments.includes(envId)) {
-    await get().connectAgent(envId);
-  }
-  set({ busy: true, error: null });
   try {
+    if (!get().connectedEnvironments.includes(envId)) {
+      await get().connectAgent(envId);
+    }
     const chat = await invoke<ChatDocument>("send_message", {
       args: {
         chatId,
@@ -325,9 +384,12 @@ async function dispatchSend(
     // If the turn already finished (or never started streaming), don't leave
     // the composer locked waiting for a prompt-finished that won't come.
     const stillStreaming = chat.turns.some((t) => t.status === "streaming");
+    const stillViewing = get().activeChatId === chatId;
     set({
-      activeChat: chat,
-      busy: stillStreaming ? true : false,
+      // Never overwrite another chat the user switched to while this sent.
+      activeChat: stillViewing ? chat : get().activeChat,
+      busy: stillStreaming,
+      inflightChatId: stillStreaming ? chatId : null,
       chats: get().chats.map((c) =>
         c.id === chat.id
           ? {
@@ -341,7 +403,12 @@ async function dispatchSend(
       ),
     });
   } catch (e) {
-    set({ error: String(e), busy: false });
+    set({
+      error: String(e),
+      busy: false,
+      inflightChatId:
+        get().inflightChatId === chatId ? null : get().inflightChatId,
+    });
     throw e;
   }
 }
@@ -377,13 +444,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
   activeChat: null,
   permission: null,
   busy: false,
+  inflightChatId: null,
   error: null,
   logs: [],
   connectionsOpen: false,
   terminalOpen: false,
+  subagentsOpen: false,
   workspaceMode: "chat",
   contextChips: [],
   messageQueue: [],
+  composerEdit: null,
 
   isEnvConnected: (environmentId: string) =>
     get().connectedEnvironments.includes(environmentId),
@@ -454,7 +524,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   connectAgent: async (environmentId?: string) => {
     const envId = environmentId ?? get().activeEnvironmentId;
-    set({ busy: true, error: null });
+    // Don't stomp an in-flight send's busy claim (dispatchSend sets inflight first).
+    const keepBusy = get().inflightChatId != null;
+    if (!keepBusy) set({ busy: true, error: null });
+    else set({ error: null });
     try {
       const res = await invoke<{
         environmentId: string;
@@ -472,7 +545,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
           message: res.message || "Connected to Grok agent",
           environmentId: connectedEnv,
         },
-        busy: false,
+        // Preserve busy if a send is in flight for some chat.
+        busy: get().inflightChatId != null ? true : false,
       });
     } catch (e) {
       set({
@@ -482,7 +556,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           environmentId: envId,
         },
         error: String(e),
-        busy: false,
+        busy: get().inflightChatId != null ? true : false,
         connectedEnvironments: get().connectedEnvironments.filter(
           (id) => id !== envId,
         ),
@@ -626,6 +700,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setConnectionsOpen: (open) => set({ connectionsOpen: open }),
 
   setTerminalOpen: (open) => set({ terminalOpen: open }),
+
+  setSubagentsOpen: (open) => set({ subagentsOpen: open }),
 
   setWorkspaceMode: (mode) => set({ workspaceMode: mode }),
 
@@ -824,6 +900,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeChatId: chatId,
       activeChat: prevId === chatId ? get().activeChat : null,
       error: null,
+      composerEdit: prevId === chatId ? get().composerEdit : null,
     });
     try {
       const discarded = await invoke<string | null>("set_active_chat", {
@@ -846,6 +923,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeProjectId: chat.projectId,
         activeEnvironmentId: envId,
       });
+      // Drain follow-ups queued for this chat while another was inflight.
+      const idle =
+        !chat.turns.some((t) => t.status === "streaming") &&
+        get().inflightChatId !== chatId;
+      if (idle) {
+        void get().flushMessageQueue(chatId);
+      }
     } catch (e) {
       if (get().activeChatId === chatId) {
         set({ error: String(e) });
@@ -925,6 +1009,98 @@ export const useAppStore = create<AppStore>((set, get) => ({
     });
   },
 
+  startEditTurn: (turnId) => {
+    const chat = get().activeChat;
+    const chatId = get().activeChatId;
+    if (!chat || !chatId) return;
+    const idx = chat.turns.findIndex((t) => t.id === turnId);
+    if (idx < 0) return;
+    const turn = chat.turns[idx];
+    set({
+      composerEdit: {
+        turnId,
+        chatId,
+        text: turn.userMessage,
+        hasAttachments: (turn.attachments?.length ?? 0) > 0,
+        laterCount: Math.max(0, chat.turns.length - idx - 1),
+        seed: Date.now(),
+      },
+      // Context chips apply to a new message, not a resubmit of an old turn.
+      contextChips: [],
+    });
+  },
+
+  clearComposerEdit: () => set({ composerEdit: null }),
+
+  resubmitFromTurn: async (turnId, text, options = {}) => {
+    const chatId = get().activeChatId;
+    if (!chatId) throw new Error("No active chat");
+    const keepAttachments = options.keepOriginalAttachments !== false;
+
+    // Drop any queued follow-ups — they referred to the pre-rollback timeline.
+    set({
+      messageQueue: get().messageQueue.filter((m) => m.chatId !== chatId),
+      busy: false,
+      permission: null,
+      error: null,
+      contextChips: [],
+      composerEdit: null,
+    });
+
+    const result = await invoke<{
+      chat: ChatDocument;
+      draftText: string;
+      attachments: Array<{
+        kind: string;
+        data: string;
+        mimeType: string;
+        name?: string | null;
+        dataUrl?: string | null;
+      }>;
+      removedCount: number;
+    }>("rollback_to_turn", { chatId, turnId });
+
+    set({
+      activeChat: result.chat,
+      activeChatId: chatId,
+      chats: get().chats.map((c) =>
+        c.id === result.chat.id
+          ? {
+              ...c,
+              title: result.chat.title,
+              updatedAt: result.chat.updatedAt,
+              acpSessionId: result.chat.acpSessionId,
+              preview:
+                result.chat.turns.length > 0
+                  ? result.chat.turns[
+                      result.chat.turns.length - 1
+                    ].userMessage.slice(0, 120)
+                  : c.preview,
+            }
+          : c,
+      ),
+      busy: false,
+    });
+
+    const original: QueuedAttachment[] = keepAttachments
+      ? result.attachments.map((a) => ({
+          kind: a.kind,
+          data: a.data,
+          mimeType: a.mimeType,
+          name: a.name ?? undefined,
+          dataUrl: a.dataUrl ?? undefined,
+        }))
+      : [];
+    const attachments = [
+      ...original,
+      ...(options.extraAttachments ?? []).map((a) => ({ ...a })),
+    ];
+
+    // Force a fresh dispatch even if something left busy stuck.
+    healStuckBusy(set, get, { force: true });
+    await dispatchSend(get, set, chatId, text.trim(), attachments);
+  },
+
   sendMessage: async (text: string, attachments = []) => {
     let chatId = get().activeChatId;
     if (!chatId) {
@@ -933,8 +1109,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
     if (!chatId) throw new Error("No active chat");
 
-    // Lost prompt-finished (e.g. after webview navigated away) leaves busy=true
-    // with no stream — unlock so this send is not silently queued forever.
+    // Only heal a stuck lock for *this* chat (never clear another chat's inflight).
     healStuckBusy(set, get, { force: true });
 
     const chips = get().contextChips;
@@ -947,20 +1122,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
     const active = get().activeChat;
     const streaming = active?.turns.some((t) => t.status === "streaming");
-    // CLI: when blocked on a running tool/command, Enter is cancel-and-send.
-    const blockedOnTool = active?.turns.some(
-      (t) =>
-        t.status === "streaming" &&
-        t.intermediate.some(
-          (b) =>
-            b.type === "tool" &&
-            (b.status === "in_progress" ||
-              b.status === "pending" ||
-              b.status === "running"),
-        ),
-    );
+    // Codex-style: while the agent is working (this chat streaming, or any
+    // send in flight), queue the follow-up. Do NOT cancel — user steers with Stop.
+    const shouldQueue =
+      streaming ||
+      get().busy ||
+      (get().inflightChatId != null && get().inflightChatId !== "");
 
-    if (streaming || get().busy) {
+    if (shouldQueue) {
       const item: QueuedMessage = {
         id: queueId(),
         chatId,
@@ -973,10 +1142,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         contextChips: [],
         error: null,
       });
-      // If a command/tool is actively running, interrupt so the follow-up can run.
-      if (blockedOnTool) {
-        void get().cancelPrompt();
-      }
       return;
     }
 
@@ -987,11 +1152,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
   flushMessageQueue: async (chatId) => {
     const id = chatId ?? get().activeChatId;
     if (!id) return;
-    healStuckBusy(set, get, { force: true });
-    if (get().busy) return;
-    // Only drain when this chat is active and idle.
-    if (get().activeChatId !== id) return;
-    if (get().activeChat?.turns.some((t) => t.status === "streaming")) {
+
+    // Drain this chat even if the user is viewing another chat. Global busy only
+    // blocks when some OTHER chat is inflight.
+    const inflight = get().inflightChatId;
+    if (inflight && inflight !== id) return;
+    if (get().busy && inflight === id) {
+      // This chat is mid-send — wait for prompt-finished to call us again.
+      return;
+    }
+    // Stuck busy for this chat with no inflight marker.
+    if (get().busy && !inflight) {
+      healStuckBusy(set, get, { force: true });
+    }
+
+    // If we're viewing this chat and it is still streaming, wait.
+    if (
+      get().activeChatId === id &&
+      get().activeChat?.turns.some((t) => t.status === "streaming")
+    ) {
       return;
     }
 
@@ -1036,6 +1215,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (active && active.id === chatId) {
       set({
         busy: false,
+        inflightChatId:
+          get().inflightChatId === chatId ? null : get().inflightChatId,
         permission: null,
         error: null,
         activeChat: {
@@ -1060,7 +1241,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
         },
       });
     } else {
-      set({ busy: false, permission: null, error: null });
+      set({
+        busy: false,
+        inflightChatId:
+          get().inflightChatId === chatId ? null : get().inflightChatId,
+        permission: null,
+        error: null,
+      });
     }
     try {
       await invoke("cancel_prompt", { chatId });
@@ -1076,6 +1263,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!id) return;
     try {
       const chat = await invoke<ChatDocument>("get_chat", { chatId: id });
+      // Always keep sidebar meta session ids in sync (even if not viewing).
+      set({
+        chats: get().chats.map((c) =>
+          c.id === chat.id
+            ? {
+                ...c,
+                title: chat.title,
+                updatedAt: chat.updatedAt,
+                acpSessionId: chat.acpSessionId,
+              }
+            : c,
+        ),
+      });
       // Critical: never let a background refresh (chat-updated / prompt-finished
       // for another chat) steal the user's current selection.
       if (get().activeChatId !== id) return;
