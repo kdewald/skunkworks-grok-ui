@@ -20,13 +20,21 @@ import { formatContextChips } from "./contextChips";
  * - Drain with one `apply_session_updates` invoke per batch.
  * - Paint React only on rAF / after drain so UI doesn't drip after the agent is done.
  */
-type PendingBatch = { sessionId: string; updates: unknown[] };
+type PendingBatch = {
+  sessionId: string;
+  environmentId?: string;
+  updates: unknown[];
+};
 const pendingBatches: PendingBatch[] = [];
 let applyDrainRunning = false;
 let applyDrainPromise: Promise<void> = Promise.resolve();
 /** Latest chat doc waiting to paint. */
 let pendingUiChat: ChatDocument | null = null;
 let uiRaf: number | null = null;
+/** Single-flight connect promises keyed by environment id. */
+const connectPromises = new Map<string, Promise<void>>();
+/** Monotonic client generation for send slot ownership (turn-scoped finish). */
+let sendGeneration = 0;
 
 function flushPendingUiChat(
   set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
@@ -63,18 +71,45 @@ function scheduleUiChat(
   });
 }
 
+function chatEnvId(
+  get: () => AppStore,
+  chatId: string,
+): string | null {
+  const meta = get().chats.find((c) => c.id === chatId);
+  const projectId =
+    meta?.projectId ??
+    (get().activeChat?.id === chatId ? get().activeChat?.projectId : null);
+  if (!projectId) return null;
+  const project = get().projects.find((p) => p.id === projectId);
+  return project?.environmentId || LOCAL_ENV_ID;
+}
+
 function resolveChatIdForSession(
   get: () => AppStore,
   sessionId: string,
+  environmentId?: string | null,
 ): string | null {
-  const bySession = get().chats.find((c) => c.acpSessionId === sessionId);
+  const envMatches = (chatId: string) => {
+    if (!environmentId) return true;
+    const chatEnv = chatEnvId(get, chatId);
+    return !chatEnv || chatEnv === environmentId;
+  };
+
+  const bySession = get().chats.find(
+    (c) => c.acpSessionId === sessionId && envMatches(c.id),
+  );
   if (bySession) return bySession.id;
   const active = get().activeChat;
-  if (active?.acpSessionId === sessionId) return active.id;
+  if (
+    active?.acpSessionId === sessionId &&
+    envMatches(active.id)
+  ) {
+    return active.id;
+  }
   // After a mid-turn session recreate, meta may lag briefly. Only bind to
   // inflight when that chat's known session is missing or already matches.
   const inflight = get().inflightChatId;
-  if (inflight) {
+  if (inflight && envMatches(inflight)) {
     const meta = get().chats.find((c) => c.id === inflight);
     const live = get().activeChat?.id === inflight ? get().activeChat : null;
     const known =
@@ -102,13 +137,21 @@ const URGENT_KINDS = new Set([
   "plan",
 ]);
 
-function enqueueSessionUpdate(sessionId: string, update: unknown) {
+function enqueueSessionUpdate(
+  sessionId: string,
+  update: unknown,
+  environmentId?: string,
+) {
   const last = pendingBatches[pendingBatches.length - 1];
-  if (last && last.sessionId === sessionId) {
+  if (
+    last &&
+    last.sessionId === sessionId &&
+    (last.environmentId ?? "") === (environmentId ?? "")
+  ) {
     last.updates.push(update);
     return;
   }
-  pendingBatches.push({ sessionId, updates: [update] });
+  pendingBatches.push({ sessionId, environmentId, updates: [update] });
 }
 
 function drainSessionApplies(
@@ -125,19 +168,26 @@ function drainSessionApplies(
         const batch = pendingBatches.shift()!;
         while (
           pendingBatches.length > 0 &&
-          pendingBatches[0].sessionId === batch.sessionId
+          pendingBatches[0].sessionId === batch.sessionId &&
+          (pendingBatches[0].environmentId ?? "") === (batch.environmentId ?? "")
         ) {
           batch.updates.push(...pendingBatches.shift()!.updates);
         }
         if (batch.updates.length === 0) continue;
 
-        const targetId = resolveChatIdForSession(get, batch.sessionId);
+        const targetId = resolveChatIdForSession(
+          get,
+          batch.sessionId,
+          batch.environmentId,
+        );
         if (!targetId) continue;
 
         try {
           const updated = await invoke<ChatDocument>("apply_session_updates", {
             chatId: targetId,
             updates: batch.updates,
+            // Reject late batches from a rolled-back / recreated session.
+            sessionId: batch.sessionId,
           });
           if (get().activeChatId !== updated.id) continue;
 
@@ -219,6 +269,10 @@ type AppStore = {
   busy: boolean;
   /** Chat currently running a send/stream (for queue + cross-chat safety). */
   inflightChatId: string | null;
+  /** Turn id for the current inflight prompt (turn-scoped cancel/finish). */
+  inflightTurnId: string | null;
+  /** Client-side generation for the current send slot (stale finish guard). */
+  inflightGeneration: number | null;
   error: string | null;
   logs: string[];
   connectionsOpen: boolean;
@@ -281,13 +335,20 @@ type AppStore = {
   /** Load a prior user turn into the bottom composer for edit & resend. */
   startEditTurn: (turnId: string) => void;
   clearComposerEdit: () => void;
-  /** Drain next queued follow-up for a chat after a turn ends. */
-  flushMessageQueue: (chatId?: string) => Promise<void>;
+  /**
+   * Drain the global message queue when the send slot is free.
+   * Optional preferredChatId is a hint only — any chat's head may run (FIFO).
+   */
+  flushMessageQueue: (preferredChatId?: string) => Promise<void>;
   removeQueuedMessage: (id: string) => void;
   clearMessageQueue: (chatId?: string) => void;
   cancelPrompt: () => Promise<void>;
   refreshChat: (chatId?: string) => Promise<void>;
-  applySessionUpdate: (sessionId: string, update: unknown) => Promise<void>;
+  applySessionUpdate: (
+    sessionId: string,
+    update: unknown,
+    environmentId?: string,
+  ) => Promise<void>;
   setTurnCollapsed: (turnId: string, collapsed: boolean) => Promise<void>;
   setBlockCollapsed: (
     turnId: string,
@@ -322,17 +383,23 @@ export function healStuckBusy(
   set: (partial: Partial<AppStore>) => void,
   get: () => Pick<
     AppStore,
-    "busy" | "activeChat" | "activeChatId" | "inflightChatId"
+    "busy" | "activeChat" | "activeChatId" | "inflightChatId" | "inflightTurnId"
   >,
   opts: { force?: boolean } = {},
 ): boolean {
   if (!opts.force) return false;
   if (!get().busy) return false;
-  // Never clear busy for another chat's in-flight turn (viewing B while A runs).
-  const inflight = get().inflightChatId;
-  if (inflight && inflight !== get().activeChatId) return false;
+  // Never clear while any chat owns the send slot — optimistic cancel paints
+  // turns as cancelled while the backend prompt may still be settling.
+  // Only prompt-finished / confirmed agent death may clear inflight.
+  if (get().inflightChatId != null) return false;
   if (isActivelyStreaming(get)) return false;
-  set({ busy: false, inflightChatId: null });
+  set({
+    busy: false,
+    inflightChatId: null,
+    inflightTurnId: null,
+    inflightGeneration: null,
+  });
   return true;
 }
 
@@ -351,7 +418,16 @@ async function dispatchSend(
   attachments: QueuedAttachment[] = [],
 ) {
   // Claim the send slot BEFORE any await so a second Enter cannot race connect.
-  set({ busy: true, inflightChatId: chatId, error: null });
+  // Client generation guards against a stale prompt-finished from a prior turn
+  // unlocking this slot during the pre-response window.
+  const generation = ++sendGeneration;
+  set({
+    busy: true,
+    inflightChatId: chatId,
+    inflightTurnId: null,
+    inflightGeneration: generation,
+    error: null,
+  });
 
   // Resolve project from the target chat when possible (not always the active view).
   const targetMeta = get().chats.find((c) => c.id === chatId);
@@ -383,13 +459,22 @@ async function dispatchSend(
     });
     // If the turn already finished (or never started streaming), don't leave
     // the composer locked waiting for a prompt-finished that won't come.
-    const stillStreaming = chat.turns.some((t) => t.status === "streaming");
+    const streamingTurn = [...chat.turns]
+      .reverse()
+      .find((t) => t.status === "streaming");
+    const stillStreaming = !!streamingTurn;
     const stillViewing = get().activeChatId === chatId;
+    // Only adopt if this generation still owns the slot.
+    if (get().inflightGeneration !== generation) {
+      return;
+    }
     set({
       // Never overwrite another chat the user switched to while this sent.
       activeChat: stillViewing ? chat : get().activeChat,
       busy: stillStreaming,
       inflightChatId: stillStreaming ? chatId : null,
+      inflightTurnId: stillStreaming ? streamingTurn?.id ?? null : null,
+      inflightGeneration: stillStreaming ? generation : null,
       chats: get().chats.map((c) =>
         c.id === chat.id
           ? {
@@ -403,12 +488,15 @@ async function dispatchSend(
       ),
     });
   } catch (e) {
-    set({
-      error: String(e),
-      busy: false,
-      inflightChatId:
-        get().inflightChatId === chatId ? null : get().inflightChatId,
-    });
+    if (get().inflightGeneration === generation) {
+      set({
+        error: String(e),
+        busy: false,
+        inflightChatId: null,
+        inflightTurnId: null,
+        inflightGeneration: null,
+      });
+    }
     throw e;
   }
 }
@@ -445,6 +533,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   permission: null,
   busy: false,
   inflightChatId: null,
+  inflightTurnId: null,
+  inflightGeneration: null,
   error: null,
   logs: [],
   connectionsOpen: false,
@@ -524,44 +614,58 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   connectAgent: async (environmentId?: string) => {
     const envId = environmentId ?? get().activeEnvironmentId;
-    // Don't stomp an in-flight send's busy claim (dispatchSend sets inflight first).
-    const keepBusy = get().inflightChatId != null;
-    if (!keepBusy) set({ busy: true, error: null });
-    else set({ error: null });
+    // Single-flight: bootstrap + selectChat must not spawn two agent processes.
+    const existing = connectPromises.get(envId);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const work = (async () => {
+      // Don't stomp an in-flight send's busy claim (dispatchSend sets inflight first).
+      const keepBusy = get().inflightChatId != null;
+      if (!keepBusy) set({ busy: true, error: null });
+      else set({ error: null });
+      try {
+        const res = await invoke<{
+          environmentId: string;
+          message: string;
+        }>("connect_agent", { environmentId: envId });
+        const connectedEnv = res.environmentId || envId;
+        const connected = Array.from(
+          new Set([...get().connectedEnvironments, connectedEnv]),
+        );
+        set({
+          connectedEnvironments: connected,
+          activeEnvironmentId: connectedEnv,
+          agent: {
+            connected: true,
+            message: res.message || "Connected to Grok agent",
+            environmentId: connectedEnv,
+          },
+          // Preserve busy if a send is in flight for some chat.
+          busy: get().inflightChatId != null ? true : false,
+        });
+      } catch (e) {
+        set({
+          agent: {
+            connected: false,
+            message: String(e),
+            environmentId: envId,
+          },
+          error: String(e),
+          busy: get().inflightChatId != null ? true : false,
+          connectedEnvironments: get().connectedEnvironments.filter(
+            (id) => id !== envId,
+          ),
+        });
+        throw e;
+      }
+    })();
+    connectPromises.set(envId, work);
     try {
-      const res = await invoke<{
-        environmentId: string;
-        message: string;
-      }>("connect_agent", { environmentId: envId });
-      const connectedEnv = res.environmentId || envId;
-      const connected = Array.from(
-        new Set([...get().connectedEnvironments, connectedEnv]),
-      );
-      set({
-        connectedEnvironments: connected,
-        activeEnvironmentId: connectedEnv,
-        agent: {
-          connected: true,
-          message: res.message || "Connected to Grok agent",
-          environmentId: connectedEnv,
-        },
-        // Preserve busy if a send is in flight for some chat.
-        busy: get().inflightChatId != null ? true : false,
-      });
-    } catch (e) {
-      set({
-        agent: {
-          connected: false,
-          message: String(e),
-          environmentId: envId,
-        },
-        error: String(e),
-        busy: get().inflightChatId != null ? true : false,
-        connectedEnvironments: get().connectedEnvironments.filter(
-          (id) => id !== envId,
-        ),
-      });
-      throw e;
+      await work;
+    } finally {
+      connectPromises.delete(envId);
     }
   },
 
@@ -644,17 +748,22 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (environmentId === LOCAL_ENV_ID) {
       throw new Error("Cannot remove the local environment");
     }
-    await invoke("remove_environment", { environmentId });
-    const environments = get().environments.filter((e) => e.id !== environmentId);
-    const projects = get().projects.filter(
-      (p) => (p.environmentId || LOCAL_ENV_ID) !== environmentId,
-    );
     const projectIds = new Set(
       get()
         .projects.filter(
           (p) => (p.environmentId || LOCAL_ENV_ID) === environmentId,
         )
         .map((p) => p.id),
+    );
+    const removedChatIds = new Set(
+      get()
+        .chats.filter((c) => projectIds.has(c.projectId))
+        .map((c) => c.id),
+    );
+    await invoke("remove_environment", { environmentId });
+    const environments = get().environments.filter((e) => e.id !== environmentId);
+    const projects = get().projects.filter(
+      (p) => (p.environmentId || LOCAL_ENV_ID) !== environmentId,
     );
     const chats = get().chats.filter((c) => !projectIds.has(c.projectId));
     const connectedEnvironments = get().connectedEnvironments.filter(
@@ -682,6 +791,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
         get().activeChat && projectIds.has(get().activeChat!.projectId)
           ? null
           : get().activeChat,
+      messageQueue: get().messageQueue.filter(
+        (m) => !removedChatIds.has(m.chatId),
+      ),
       agent: {
         connected: connectedEnvironments.includes(activeEnvironmentId),
         message: connectedEnvironments.includes(activeEnvironmentId)
@@ -755,6 +867,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     ) {
       throw new Error("Scratch workspace can't be removed");
     }
+    const removedChatIds = new Set(
+      get().chats.filter((c) => c.projectId === projectId).map((c) => c.id),
+    );
     await invoke("remove_project", { projectId });
     const projects = get().projects.filter((p) => p.id !== projectId);
     const chats = get().chats.filter((c) => c.projectId !== projectId);
@@ -771,6 +886,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
         get().activeChat?.projectId === projectId ? null : get().activeChatId,
       activeChat:
         get().activeChat?.projectId === projectId ? null : get().activeChat,
+      // Drop queue items targeting deleted chats so they cannot poison FIFO.
+      messageQueue: get().messageQueue.filter(
+        (m) => !removedChatIds.has(m.chatId),
+      ),
     });
   },
 
@@ -963,17 +1082,26 @@ export const useAppStore = create<AppStore>((set, get) => ({
           message: string;
         }>("ensure_chat_session", { chatId });
         if (get().activeChatId !== chatId) return;
+        // Patch session meta only — never replace the full transcript with an
+        // ensure response (it can be a pre-send clone and vanish user messages).
+        const sid = res.chat.acpSessionId ?? null;
         set({
-          activeChat: res.chat,
           chats: get().chats.map((c) =>
-            c.id === res.chat.id
+            c.id === chatId
               ? {
                   ...c,
-                  acpSessionId: res.chat.acpSessionId,
-                  updatedAt: res.chat.updatedAt,
+                  acpSessionId: sid,
+                  updatedAt: res.chat.updatedAt ?? c.updatedAt,
                 }
               : c,
           ),
+          activeChat:
+            get().activeChat?.id === chatId
+              ? {
+                  ...get().activeChat!,
+                  acpSessionId: sid,
+                }
+              : get().activeChat,
         });
         if (res.status === "recreated") {
           get().pushLog(`[session] ${res.message}`);
@@ -985,10 +1113,20 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   deleteChat: async (chatId: string) => {
+    // Refuse while a prompt is settling — purge would race and queues must not
+    // be cleared until deletion succeeds.
+    if (get().inflightChatId === chatId) {
+      throw new Error(
+        "Cancel the running turn and wait for it to settle before deleting this chat",
+      );
+    }
     await invoke("delete_chat", { chatId });
     const chats = get().chats.filter((c) => c.id !== chatId);
     const wasActive = get().activeChatId === chatId;
-    set({ chats });
+    set({
+      chats,
+      messageQueue: get().messageQueue.filter((m) => m.chatId !== chatId),
+    });
     if (wasActive) {
       const next = chatsForProject(chats, get().activeProjectId)[0];
       if (next) await get().selectChat(next.id);
@@ -1037,15 +1175,82 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!chatId) throw new Error("No active chat");
     const keepAttachments = options.keepOriginalAttachments !== false;
 
-    // Drop any queued follow-ups — they referred to the pre-rollback timeline.
+    // Drop queued follow-ups for this chat only. Do not clear another chat's
+    // send slot (viewing X edit while Y streams would strand Y's queue).
+    const ownsSlot = get().inflightChatId === chatId;
     set({
       messageQueue: get().messageQueue.filter((m) => m.chatId !== chatId),
-      busy: false,
+      ...(ownsSlot
+        ? {
+            busy: false,
+            inflightChatId: null as string | null,
+            inflightTurnId: null as string | null,
+            inflightGeneration: null as number | null,
+          }
+        : {}),
       permission: null,
       error: null,
       contextChips: [],
       composerEdit: null,
     });
+
+    // Another chat owns the global slot — queue the resubmit instead of racing.
+    if (get().inflightChatId != null && get().inflightChatId !== chatId) {
+      const item: QueuedMessage = {
+        id: queueId(),
+        chatId,
+        text: text.trim(),
+        attachments: (options.extraAttachments ?? []).map((a) => ({ ...a })),
+      };
+      // Still roll back the transcript; send will follow when the slot frees.
+      const result = await invoke<{
+        chat: ChatDocument;
+        draftText: string;
+        attachments: Array<{
+          kind: string;
+          data: string;
+          mimeType: string;
+          name?: string | null;
+          dataUrl?: string | null;
+        }>;
+        removedCount: number;
+      }>("rollback_to_turn", { chatId, turnId });
+      const original: QueuedAttachment[] = keepAttachments
+        ? result.attachments.map((a) => ({
+            kind: a.kind,
+            data: a.data,
+            mimeType: a.mimeType,
+            name: a.name ?? undefined,
+            dataUrl: a.dataUrl ?? undefined,
+          }))
+        : [];
+      item.attachments = [
+        ...original,
+        ...(options.extraAttachments ?? []).map((a) => ({ ...a })),
+      ];
+      set({
+        activeChat: result.chat,
+        activeChatId: chatId,
+        chats: get().chats.map((c) =>
+          c.id === result.chat.id
+            ? {
+                ...c,
+                title: result.chat.title,
+                updatedAt: result.chat.updatedAt,
+                acpSessionId: result.chat.acpSessionId,
+                preview:
+                  result.chat.turns.length > 0
+                    ? result.chat.turns[
+                        result.chat.turns.length - 1
+                      ].userMessage.slice(0, 120)
+                    : c.preview,
+              }
+            : c,
+        ),
+        messageQueue: [...get().messageQueue, item],
+      });
+      return;
+    }
 
     const result = await invoke<{
       chat: ChatDocument;
@@ -1080,6 +1285,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
           : c,
       ),
       busy: false,
+      inflightChatId:
+        get().inflightChatId === chatId ? null : get().inflightChatId,
+      inflightTurnId:
+        get().inflightChatId === chatId ? null : get().inflightTurnId,
+      inflightGeneration:
+        get().inflightChatId === chatId ? null : get().inflightGeneration,
     });
 
     const original: QueuedAttachment[] = keepAttachments
@@ -1096,8 +1307,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
       ...(options.extraAttachments ?? []).map((a) => ({ ...a })),
     ];
 
-    // Force a fresh dispatch even if something left busy stuck.
-    healStuckBusy(set, get, { force: true });
+    // Backend rollback waits for inflight release; only heal this chat's slot.
+    if (get().inflightChatId == null || get().inflightChatId === chatId) {
+      healStuckBusy(set, get, { force: true });
+    }
     await dispatchSend(get, set, chatId, text.trim(), attachments);
   },
 
@@ -1122,12 +1335,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
     const active = get().activeChat;
     const streaming = active?.turns.some((t) => t.status === "streaming");
-    // Codex-style: while the agent is working (this chat streaming, or any
-    // send in flight), queue the follow-up. Do NOT cancel — user steers with Stop.
+    // Codex-style: while the agent is working, or anything is already queued
+    // for this chat, enqueue behind it (preserve FIFO). Never cancel on send.
+    // Global FIFO: any non-empty queue means enqueue (do not leapfrog).
     const shouldQueue =
       streaming ||
       get().busy ||
-      (get().inflightChatId != null && get().inflightChatId !== "");
+      get().inflightChatId != null ||
+      get().messageQueue.length > 0;
 
     if (shouldQueue) {
       const item: QueuedMessage = {
@@ -1142,6 +1357,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
         contextChips: [],
         error: null,
       });
+      // If the slot is free (e.g. a prior queue head failed and parked), kick
+      // the flusher so one transient error cannot brick the composer forever.
+      if (!get().busy && get().inflightChatId == null) {
+        void get().flushMessageQueue();
+      }
       return;
     }
 
@@ -1149,32 +1369,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await dispatchSend(get, set, chatId, fullText, attachments);
   },
 
-  flushMessageQueue: async (chatId) => {
-    const id = chatId ?? get().activeChatId;
-    if (!id) return;
-
-    // Drain this chat even if the user is viewing another chat. Global busy only
-    // blocks when some OTHER chat is inflight.
+  flushMessageQueue: async (_preferredChatId) => {
+    // Global FIFO: always take queue[0]. Preferred-chat hint would starve
+    // other chats that enqueued earlier.
     const inflight = get().inflightChatId;
-    if (inflight && inflight !== id) return;
-    if (get().busy && inflight === id) {
-      // This chat is mid-send — wait for prompt-finished to call us again.
-      return;
-    }
-    // Stuck busy for this chat with no inflight marker.
-    if (get().busy && !inflight) {
+    if (inflight) return;
+    if (get().busy) {
       healStuckBusy(set, get, { force: true });
+      if (get().busy || get().inflightChatId) return;
     }
 
-    // If we're viewing this chat and it is still streaming, wait.
-    if (
-      get().activeChatId === id &&
-      get().activeChat?.turns.some((t) => t.status === "streaming")
-    ) {
-      return;
-    }
-
-    const next = get().messageQueue.find((m) => m.chatId === id);
+    const next = get().messageQueue[0];
     if (!next) return;
 
     set({
@@ -1183,11 +1388,30 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       await dispatchSend(get, set, next.chatId, next.text, next.attachments);
     } catch (e) {
-      // Put it back at the front so the user can retry / edit.
+      const err = String(e);
+      // Transient settle errors: requeue and schedule a short retry so a
+      // cancel-window reject does not permanently poison the FIFO head.
+      const retriable =
+        /settling after cancel|in-flight prompt|try again/i.test(err);
       set({
-        messageQueue: [next, ...get().messageQueue.filter((m) => m.id !== next.id)],
-        error: String(e),
+        messageQueue: [
+          next,
+          ...get().messageQueue.filter((m) => m.id !== next.id),
+        ],
+        error: err,
       });
+      if (retriable) {
+        window.setTimeout(() => {
+          const s = get();
+          if (
+            !s.busy &&
+            s.inflightChatId == null &&
+            s.messageQueue[0]?.id === next.id
+          ) {
+            void s.flushMessageQueue();
+          }
+        }, 750);
+      }
     }
   },
 
@@ -1208,15 +1432,30 @@ export const useAppStore = create<AppStore>((set, get) => ({
   cancelPrompt: async () => {
     const chatId = get().activeChatId;
     if (!chatId) return;
-    // Unlock the composer IMMEDIATELY. Waiting for the agent to ack cancel
-    // (or for prompt-finished) left Stop stuck and blocked Send while a
-    // shell tool was still winding down.
+    // Keep the send slot until prompt-finished for this turn so a queued
+    // follow-up cannot start while the session is still in cancelling_sessions
+    // (which would drop its early stream chunks). Optimistically paint cancelled
+    // UI so Stop feels instant; do NOT flush the queue here.
     const active = get().activeChat;
+    const cancelledTurnId =
+      get().inflightTurnId ??
+      active?.turns
+        .slice()
+        .reverse()
+        .find((t) => t.status === "streaming" || t.status === "cancelling")
+        ?.id ??
+      null;
+
     if (active && active.id === chatId) {
       set({
-        busy: false,
+        // Stay busy while the cancelled prompt settles.
+        busy: get().inflightChatId === chatId ? true : get().busy,
         inflightChatId:
-          get().inflightChatId === chatId ? null : get().inflightChatId,
+          get().inflightChatId === chatId ? chatId : get().inflightChatId,
+        inflightTurnId:
+          get().inflightChatId === chatId
+            ? cancelledTurnId
+            : get().inflightTurnId,
         permission: null,
         error: null,
         activeChat: {
@@ -1242,9 +1481,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       });
     } else {
       set({
-        busy: false,
-        inflightChatId:
-          get().inflightChatId === chatId ? null : get().inflightChatId,
+        busy: get().inflightChatId === chatId ? true : get().busy,
         permission: null,
         error: null,
       });
@@ -1253,9 +1490,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
       await invoke("cancel_prompt", { chatId });
     } catch (e) {
       set({ error: String(e) });
+      // If cancel IPC failed, unlock so the user is not stuck.
+      if (get().inflightChatId === chatId) {
+        set({
+          busy: false,
+          inflightChatId: null,
+          inflightTurnId: null,
+          inflightGeneration: null,
+        });
+        void get().flushMessageQueue(chatId);
+      }
     }
-    // Drain any follow-ups that were queued before/during stop.
-    void get().flushMessageQueue(chatId);
+    // Queue flush happens on prompt-finished once the turn has settled.
   },
 
   refreshChat: async (chatId?: string) => {
@@ -1296,10 +1542,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  applySessionUpdate: async (sessionId: string, update: unknown) => {
+  applySessionUpdate: async (
+    sessionId: string,
+    update: unknown,
+    environmentId?: string,
+  ) => {
     // Buffer only — never await per-token IPC. That was the "agent finished but
     // UI still drips" bug: hundreds of serial invokes behind a drained stream.
-    enqueueSessionUpdate(sessionId, update);
+    enqueueSessionUpdate(sessionId, update, environmentId);
     void drainSessionApplies(set, get);
   },
 
@@ -1311,6 +1561,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       turnId,
       collapsed,
     });
+    // Guard: user may have switched chats while IPC was in flight.
+    if (get().activeChatId !== chatId) return;
     set({ activeChat: chat });
   },
 
@@ -1323,6 +1575,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       blockId,
       collapsed,
     });
+    if (get().activeChatId !== chatId) return;
     set({ activeChat: chat });
   },
 

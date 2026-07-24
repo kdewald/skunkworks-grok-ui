@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import { markdownComponents } from "../markdownComponents";
-import remarkGfm from "remark-gfm";
 import { Bot, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type { ChatDocument, IntermediateBlock } from "../types";
 import { useAppStore } from "../store";
+import { Markdown } from "../Markdown";
 
 type SubagentBlock = Extract<IntermediateBlock, { type: "subagent" }>;
 
@@ -99,14 +97,9 @@ function SubagentCard({
       {open && (
         <div className="subagent-card-body">
           {block.output ? (
-            <div className="markdown subagent-card-md">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={markdownComponents}
-              >
-                {block.output}
-              </ReactMarkdown>
-            </div>
+            <Markdown className="markdown subagent-card-md">
+              {block.output}
+            </Markdown>
           ) : (
             <div className="subagent-card-empty">
               {running

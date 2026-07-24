@@ -1,6 +1,4 @@
 import React, { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   Brain,
   ChevronDown,
@@ -18,7 +16,7 @@ import {
 import type { IntermediateBlock, Turn } from "../types";
 import { useAppStore } from "../store";
 import { formatToolInput, formatToolPayload } from "../contentFormat";
-import { markdownComponents } from "../markdownComponents";
+import { Markdown } from "../Markdown";
 
 function ToolIcon({ kind }: { kind?: string | null }) {
   const props = { size: 12, strokeWidth: 1.75 as const };
@@ -77,6 +75,7 @@ function PayloadView({ value, label }: { value: unknown; label: string }) {
 
 /** Visible thinking stream — distinct from assistant replies, content always readable. */
 function ThoughtStream({ text }: { text: string }) {
+  // Stay open while short; longer thoughts default open so nothing looks truncated.
   const [open, setOpen] = useState(true);
   if (!text.trim()) return null;
   return (
@@ -198,7 +197,7 @@ function BlockView({
     );
   }
 
-  // Tool — dense single line; expand for I/O
+  // Tool — ultra-dense single line; expand only for I/O detail
   const running = isRunningStatus(block.status);
   const inputText =
     block.rawInput != null ? formatToolInput(block.rawInput) : "";
@@ -219,6 +218,11 @@ function BlockView({
     output.text.trim() &&
     output.text !== content.text;
   const hasDetail = !!(inputText || primary || showRawOut);
+  // One-line hint of path/command when collapsed (keeps rows scannable).
+  const hint =
+    inputText.trim().length > 0
+      ? inputText.replace(/\s+/g, " ").trim().slice(0, 72)
+      : "";
 
   return (
     <div className={`block compact tool ${statusClass(block.status)}`}>
@@ -228,39 +232,44 @@ function BlockView({
           hasDetail && setBlockCollapsed(turnId, block.id, !block.collapsed)
         }
         disabled={!hasDetail}
-        title={block.title}
+        title={block.title + (hint ? `\n${hint}` : "")}
       >
         <span className="block-type-icon">
           <ToolIcon kind={block.kind} />
         </span>
         <span className="block-label">{block.title}</span>
+        {hint && block.collapsed && (
+          <span className="block-hint mono" title={hint}>
+            {hint}
+          </span>
+        )}
         <span
           className={`status-dot ${statusClass(block.status)}`}
           title={block.status}
         >
           {running ? (
-            <Loader2 size={10} className="spin" />
+            <Loader2 size={9} className="spin" />
           ) : (
             <span className="status-dot-core" />
           )}
         </span>
         {hasDetail &&
           (block.collapsed ? (
-            <ChevronRight size={11} className="chev-icon tool-chev" />
+            <ChevronRight size={10} className="chev-icon tool-chev" />
           ) : (
-            <ChevronDown size={11} className="chev-icon tool-chev" />
+            <ChevronDown size={10} className="chev-icon tool-chev" />
           ))}
       </button>
       {!block.collapsed && hasDetail && (
         <div className="block-body compact">
           {inputText && (
-            <details>
+            <details open={inputText.length < 400}>
               <summary>Input</summary>
               <pre className="code">{inputText}</pre>
             </details>
           )}
           {primary && (
-            <details>
+            <details open={primary.text.length < 600}>
               <summary>Result</summary>
               <pre className="code">{primary.text}</pre>
             </details>
@@ -414,11 +423,12 @@ function WorkGroup({
   streaming: boolean;
   forceCollapsed?: boolean;
 }) {
-  const [collapsed, setCollapsed] = useStateAwareCollapse(
-    forceCollapsed ?? !streaming,
-  );
+  // Always use the collapsible shell — bare expanded lists ate too much vertical
+  // space. While streaming, start expanded so live tools are visible; otherwise
+  // collapse to a single "Work N tools" row.
+  const preferCollapsed = forceCollapsed || !streaming;
+  const [collapsed, setCollapsed] = useStateAwareCollapse(preferCollapsed);
 
-  // Tools-only groups auto-expand while streaming so rows are visible; stay compact.
   // Filter out subagents / Task spawns (side panel only) and empty leftovers.
   const visible = blocks.filter(
     (b) => b.type !== "subagent" && !isSubagentRailTool(b),
@@ -434,22 +444,6 @@ function WorkGroup({
   ]
     .filter(Boolean)
     .join(" · ");
-
-  // When only a few tools, skip the outer shell and show compact rows directly.
-  const bare =
-    visible.length <= 6 && !visible.some((b) => b.type === "plan");
-
-  if (bare && !forceCollapsed) {
-    return (
-      <div className={`work-strip ${streaming ? "is-streaming" : ""}`}>
-        <div className="work-strip-rows">
-          {visible.map((b) => (
-            <BlockView key={b.id} turnId={turnId} block={b} />
-          ))}
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div
@@ -540,11 +534,5 @@ export const AssistantMessage = React.memo(function AssistantMessage({
   text: string;
 }) {
   if (!text) return null;
-  return (
-    <div className="assistant-msg markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-        {text}
-      </ReactMarkdown>
-    </div>
-  );
+  return <Markdown className="assistant-msg markdown">{text}</Markdown>;
 });

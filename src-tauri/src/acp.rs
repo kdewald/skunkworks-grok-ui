@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -106,9 +106,12 @@ pub struct AcpConnection {
     /// Used to force-complete a hung cancel.
     active_prompts: Arc<Mutex<HashMap<String, RpcId>>>,
     app: AppHandle,
-    _child: Child,
-    /// Channel kept so the write side can be closed cleanly later.
-    _shutdown_tx: mpsc::Sender<()>,
+    /// Child process — taken on shutdown so we can kill it explicitly.
+    child: Mutex<Option<Child>>,
+    /// Closes the stdout reader loop on shutdown/replace.
+    shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
+    /// False after stdout EOF, stdout error, or explicit shutdown.
+    alive: AtomicBool,
 }
 
 impl AcpConnection {
@@ -184,8 +187,9 @@ impl AcpConnection {
             pending_permissions: Mutex::new(HashMap::new()),
             active_prompts: Arc::new(Mutex::new(HashMap::new())),
             app: app.clone(),
-            _child: child,
-            _shutdown_tx: shutdown_tx,
+            child: Mutex::new(Some(child)),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            alive: AtomicBool::new(true),
         });
 
         // stderr logger
@@ -236,6 +240,7 @@ impl AcpConnection {
                                 // Critical: resolve every in-flight RPC (esp. session/prompt)
                                 // or the UI stays "streaming" forever after agent death /
                                 // tauri-dev rebuild / crash.
+                                reader_conn.alive.store(false, Ordering::SeqCst);
                                 reader_conn.fail_all_pending(
                                     "Agent process exited while a request was in flight",
                                 );
@@ -251,6 +256,7 @@ impl AcpConnection {
                                 break;
                             }
                             Err(err) => {
+                                reader_conn.alive.store(false, Ordering::SeqCst);
                                 reader_conn.fail_all_pending(&format!(
                                     "Agent stdout error while a request was in flight: {err}"
                                 ));
@@ -315,6 +321,26 @@ impl AcpConnection {
                     "environmentId": self.environment_id,
                 }),
             );
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Stop the reader loop and kill the child process. Safe to call more than once.
+    pub async fn shutdown(&self, reason: &str) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.fail_all_pending(reason);
+        // Take handles under the sync lock, then await without holding it (Send).
+        let tx = self.shutdown_tx.lock().take();
+        let child = self.child.lock().take();
+        if let Some(tx) = tx {
+            let _ = tx.send(()).await;
+        }
+        if let Some(mut child) = child {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 
@@ -653,52 +679,66 @@ impl AcpConnection {
         .await
     }
 
-    pub async fn session_cancel(&self, session_id: &str) -> Result<()> {
-        // ACP: pending permission requests MUST be answered with cancelled
-        // before/when the client cancels the turn — otherwise the agent stalls.
-        self.cancel_pending_permissions_for_session(session_id)
-            .await?;
-        self.notify("session/cancel", json!({ "sessionId": session_id }))
-            .await?;
-
-        // Safety net: if the agent never resolves session/prompt after cancel,
-        // force-complete so the UI does not stay stuck forever.
-        let session_id = session_id.to_string();
-        let pending = Arc::clone(&self.pending);
+    pub async fn session_cancel(self: &Arc<Self>, session_id: &str) -> Result<()> {
+        // Arm the hard-kill watchdog *before* any cancel I/O so a wedged stdin
+        // pipe cannot prevent recovery indefinitely.
+        let session_id_owned = session_id.to_string();
         let active_prompts = Arc::clone(&self.active_prompts);
-        let prompt_id = active_prompts.lock().get(&session_id).cloned();
+        let prompt_id = active_prompts.lock().get(&session_id_owned).cloned();
         if let Some(id) = prompt_id {
-            let app = self.app.clone();
-            let env_id = self.environment_id.clone();
+            let this = Arc::clone(self);
+            let sid = session_id_owned.clone();
             tokio::spawn(async move {
-                // Long-running shell tools often ignore cancel until the process exits.
-                // Unstick the pending session/prompt quickly so the next turn can start.
-                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                // Only force-complete if this prompt is still the active one.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let still_active = active_prompts
                     .lock()
-                    .get(&session_id)
+                    .get(&sid)
                     .map(|cur| cur == &id)
                     .unwrap_or(false);
-                if !still_active {
+                if !still_active || !this.is_alive() {
                     return;
                 }
-                if let Some(tx) = pending.lock().remove(&id) {
-                    active_prompts.lock().remove(&session_id);
-                    let _ = app.emit(
-                        "agent-log",
-                        json!({
-                            "level": "warn",
-                            "message": format!(
-                                "Force-completing cancelled prompt for session {session_id} (agent did not respond in time)"
-                            ),
-                            "environmentId": env_id,
-                        }),
-                    );
-                    let _ = tx.send(Ok(json!({ "stopReason": "cancelled" })));
-                }
+                let _ = this.app.emit(
+                    "agent-log",
+                    json!({
+                        "level": "warn",
+                        "message": format!(
+                            "Cancel timeout for session {sid}; killing agent process \
+                             so a queued follow-up cannot share a still-running session"
+                        ),
+                        "environmentId": this.environment_id,
+                    }),
+                );
+                this.shutdown(&format!(
+                    "Agent killed after cancel timeout (session {sid})"
+                ))
+                .await;
+                let _ = this.app.emit(
+                    "agent-status",
+                    AgentStatusEvent {
+                        connected: false,
+                        message: "Agent killed after cancel timeout".into(),
+                        agent_info: None,
+                        environment_id: this.environment_id.clone(),
+                    },
+                );
             });
         }
+
+        // ACP: pending permission requests MUST be answered with cancelled
+        // before/when the client cancels the turn — otherwise the agent stalls.
+        // Bound I/O so a dead pipe cannot hang cancel forever (watchdog above
+        // is the real recovery path).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.cancel_pending_permissions_for_session(session_id),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.notify("session/cancel", json!({ "sessionId": session_id })),
+        )
+        .await;
         Ok(())
     }
 

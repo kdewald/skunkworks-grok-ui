@@ -51,6 +51,13 @@ pub struct AppState {
     pub live_chats: Arc<Mutex<HashMap<String, ChatDocument>>>,
     /// Last time each chat was flushed to disk (for debounced persistence).
     pub last_disk_save: Mutex<HashMap<String, Instant>>,
+    /// Backend authority for in-flight prompts: chat_id → turn_id.
+    /// Rejects concurrent send_message for the same chat until the prompt future settles.
+    pub inflight_prompts: Arc<Mutex<HashMap<String, String>>>,
+    /// Environments currently mid-connect (single-flight).
+    pub connecting_envs: Mutex<HashSet<String>>,
+    /// Chats currently mid ensure_session (single-flight).
+    pub ensuring_chats: Mutex<HashSet<String>>,
     /// Interactive project terminals (local PTY / SSH).
     pub terminals: TerminalManager,
 }
@@ -75,6 +82,9 @@ impl AppState {
             cancelling_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_chats: Arc::new(Mutex::new(HashMap::new())),
             last_disk_save: Mutex::new(HashMap::new()),
+            inflight_prompts: Arc::new(Mutex::new(HashMap::new())),
+            connecting_envs: Mutex::new(HashSet::new()),
+            ensuring_chats: Mutex::new(HashSet::new()),
             terminals: TerminalManager::default(),
         })
     }
@@ -378,22 +388,34 @@ fn chat_has_no_turns(doc: &ChatDocument) -> bool {
 /// Remove a chat from the index + disk (and local scratch dir if applicable).
 fn purge_chat(state: &AppState, chat_id: &str) -> Result<(), String> {
     let project_id = {
-        let data = state.data.lock();
-        data.chats
+        // Inflight check + cache eviction + index mutation under one write lock
+        // so a late apply cannot resurrect a ghost between steps.
+        let _guard = state.chat_write.lock();
+        if state.inflight_prompts.lock().contains_key(chat_id) {
+            return Err(
+                "chat has an in-flight prompt; cancel it before deleting".into(),
+            );
+        }
+
+        state.live_chats.lock().remove(chat_id);
+        state.last_disk_save.lock().remove(chat_id);
+        state.needs_history_seed.lock().remove(chat_id);
+        state.inflight_prompts.lock().remove(chat_id);
+
+        let mut data = state.data.lock();
+        let project_id = data
+            .chats
             .iter()
             .find(|c| c.id == chat_id)
-            .map(|c| c.project_id.clone())
-    };
-
-    {
-        let mut data = state.data.lock();
+            .map(|c| c.project_id.clone());
         data.chats.retain(|c| c.id != chat_id);
         if data.active_chat_id.as_deref() == Some(chat_id) {
             data.active_chat_id = None;
         }
         state.store.save_index(&data).map_err(|e| e.to_string())?;
-    }
-    let _ = state.store.delete_chat_file(chat_id);
+        let _ = state.store.delete_chat_file(chat_id);
+        project_id
+    };
 
     // Local scratch only — remote dirs left for the user / agent.
     if project_id.as_deref() == Some(SCRATCH_PROJECT_ID)
@@ -544,7 +566,7 @@ pub async fn add_ssh_environment(
 }
 
 #[tauri::command]
-pub fn remove_environment(
+pub async fn remove_environment(
     state: State<'_, AppState>,
     environment_id: String,
 ) -> Result<(), String> {
@@ -552,31 +574,48 @@ pub fn remove_environment(
         return Err("Cannot remove the local environment".into());
     }
 
-    // Drop live agent
-    {
-        let mut agents = state.agents.lock();
-        agents.remove(&environment_id);
+    let (project_ids, chat_ids) = {
+        let data = state.data.lock();
+        if !data.environments.iter().any(|e| e.id == environment_id) {
+            return Err("environment not found".into());
+        }
+        let project_ids: Vec<String> = data
+            .projects
+            .iter()
+            .filter(|p| p.environment_id == environment_id)
+            .map(|p| p.id.clone())
+            .collect();
+        let chat_ids: Vec<String> = data
+            .chats
+            .iter()
+            .filter(|c| project_ids.iter().any(|pid| pid == &c.project_id))
+            .map(|c| c.id.clone())
+            .collect();
+        (project_ids, chat_ids)
+    };
+
+    // Refuse *before* killing the agent so a failed remove leaves the connection.
+    for id in &chat_ids {
+        if state.inflight_prompts.lock().contains_key(id) {
+            return Err(format!(
+                "environment has an in-flight prompt in chat {id}; cancel first"
+            ));
+        }
+    }
+
+    // Drop live agent with explicit shutdown (kill child + fail pending).
+    let old = { state.agents.lock().remove(&environment_id) };
+    if let Some(conn) = old {
+        conn.shutdown(&format!("Environment {environment_id} removed"))
+            .await;
     }
     clear_loaded_for_env(&state, &environment_id);
 
-    let mut data = state.data.lock();
-    if !data.environments.iter().any(|e| e.id == environment_id) {
-        return Err("environment not found".into());
+    for id in &chat_ids {
+        purge_chat(&state, id)?;
     }
 
-    let project_ids: Vec<String> = data
-        .projects
-        .iter()
-        .filter(|p| p.environment_id == environment_id)
-        .map(|p| p.id.clone())
-        .collect();
-    let chat_ids: Vec<String> = data
-        .chats
-        .iter()
-        .filter(|c| project_ids.iter().any(|pid| pid == &c.project_id))
-        .map(|c| c.id.clone())
-        .collect();
-
+    let mut data = state.data.lock();
     data.environments.retain(|e| e.id != environment_id);
     data.projects
         .retain(|p| p.environment_id != environment_id);
@@ -602,9 +641,6 @@ pub fn remove_environment(
     }
 
     state.store.save_index(&data).map_err(|e| e.to_string())?;
-    for id in chat_ids {
-        let _ = state.store.delete_chat_file(&id);
-    }
     Ok(())
 }
 
@@ -653,24 +689,80 @@ pub async fn connect_agent(
                 .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
         });
 
+    // Single-flight: concurrent connectAgent calls (bootstrap + selectChat) share one spawn.
+    let claimed = {
+        let mut connecting = state.connecting_envs.lock();
+        if connecting.contains(&env_id) {
+            false
+        } else {
+            connecting.insert(env_id.clone());
+            true
+        }
+    };
+
+    if !claimed {
+        // Wait briefly for the in-progress connect to finish, then return current state.
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !state.connecting_envs.lock().contains(&env_id) {
+                break;
+            }
+        }
+        if state.agents.lock().contains_key(&env_id) {
+            return Ok(json!({
+                "environmentId": env_id,
+                "message": "Already connecting/connected",
+                "alreadyConnected": true,
+            }));
+        }
+        // Other attempt failed — claim and try ourselves.
+        let mut connecting = state.connecting_envs.lock();
+        if connecting.contains(&env_id) {
+            return Err("connect already in progress".into());
+        }
+        connecting.insert(env_id.clone());
+    }
+
+    let connect_result = connect_agent_inner(&app, &state, &env_id).await;
+    state.connecting_envs.lock().remove(&env_id);
+    connect_result
+}
+
+async fn connect_agent_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    env_id: &str,
+) -> Result<Value, String> {
+    // Already connected and alive — no second process. Stale (dead) entries
+    // are replaced below so EOF disconnects can recover.
+    {
+        let agents = state.agents.lock();
+        if let Some(conn) = agents.get(env_id) {
+            if conn.is_alive() {
+                return Ok(json!({
+                    "environmentId": env_id,
+                    "message": "Already connected",
+                    "alreadyConnected": true,
+                }));
+            }
+        }
+    }
+
     let env = {
         let mut data = state.data.lock();
         migrate_app_data(&mut data);
-        ensure_scratch_in_index(&state.store, &mut data, &env_id)?;
-        env_from_data(&data, &env_id)?
+        ensure_scratch_in_index(&state.store, &mut data, env_id)?;
+        env_from_data(&data, env_id)?
     };
 
-    // Drop existing connection for this environment — fail any in-flight
-    // session/prompt first so turns don't stay "streaming" after reconnect.
-    {
-        let mut agents = state.agents.lock();
-        if let Some(old) = agents.remove(&env_id) {
-            old.fail_all_pending(&format!(
-                "Agent for {env_id} was replaced (reconnect)"
-            ));
-        }
+    // Drop existing connection for this environment — fail + kill so the child
+    // and reader task do not leak across reconnect.
+    let old = { state.agents.lock().remove(env_id) };
+    if let Some(old) = old {
+        old.shutdown(&format!("Agent for {env_id} was replaced (reconnect)"))
+            .await;
     }
-    clear_loaded_for_env(&state, &env_id);
+    clear_loaded_for_env(state, env_id);
 
     let target = if env.is_local() {
         AgentSpawnTarget::Local {
@@ -693,25 +785,31 @@ pub async fn connect_agent(
         env.name.clone()
     };
 
-    let conn = AcpConnection::spawn(app.clone(), env_id.clone(), target)
+    let conn = AcpConnection::spawn(app.clone(), env_id.to_string(), target)
         .await
         .map_err(|e| e.to_string())?;
 
-    let init = conn.initialize().await.map_err(|e| {
-        format!("initialize on {label} failed: {e}")
-    })?;
-    let auth = conn.authenticate_from_init(&init).await.map_err(|e| {
-        format!(
-            "authenticate on {label} failed: {e}"
-        )
-    })?;
+    let init = match conn.initialize().await {
+        Ok(v) => v,
+        Err(e) => {
+            conn.shutdown(&format!("initialize failed: {e}")).await;
+            return Err(format!("initialize on {label} failed: {e}"));
+        }
+    };
+    let auth = match conn.authenticate_from_init(&init).await {
+        Ok(v) => v,
+        Err(e) => {
+            conn.shutdown(&format!("authenticate failed: {e}")).await;
+            return Err(format!("authenticate on {label} failed: {e}"));
+        }
+    };
 
-    state.agents.lock().insert(env_id.clone(), conn);
+    state.agents.lock().insert(env_id.to_string(), conn);
 
     // Remember active environment
     {
         let mut data = state.data.lock();
-        data.active_environment_id = Some(env_id.clone());
+        data.active_environment_id = Some(env_id.to_string());
         let _ = state.store.save_index(&data);
     }
 
@@ -741,7 +839,7 @@ pub async fn connect_agent(
 }
 
 #[tauri::command]
-pub fn disconnect_agent(
+pub async fn disconnect_agent(
     app: AppHandle,
     state: State<'_, AppState>,
     environment_id: Option<String>,
@@ -757,9 +855,12 @@ pub fn disconnect_agent(
                 .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
         });
 
-    // Fail in-flight prompts before dropping the connection.
-    if let Some(conn) = state.agents.lock().remove(&env_id) {
-        conn.fail_all_pending(&format!("Disconnected agent ({env_id})"));
+    // Fail in-flight prompts and kill the child before dropping the connection.
+    // Take Arc out of the map before awaiting so we never hold a parking_lot guard.
+    let old = { state.agents.lock().remove(&env_id) };
+    if let Some(conn) = old {
+        conn.shutdown(&format!("Disconnected agent ({env_id})"))
+            .await;
     }
     clear_loaded_for_env(&state, &env_id);
 
@@ -895,15 +996,39 @@ pub fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<
         return Err("Scratch workspace can't be removed".into());
     }
 
-    let mut data = state.data.lock();
-    if data
-        .projects
-        .iter()
-        .any(|p| p.id == project_id && p.is_scratch)
+    let chat_ids: Vec<String> = {
+        let data = state.data.lock();
+        if data
+            .projects
+            .iter()
+            .any(|p| p.id == project_id && p.is_scratch)
+        {
+            return Err("Scratch workspace can't be removed".into());
+        }
+        data.chats
+            .iter()
+            .filter(|c| c.project_id == project_id)
+            .map(|c| c.id.clone())
+            .collect()
+    };
+
+    // Refuse if any chat in the project still has an in-flight prompt.
     {
-        return Err("Scratch workspace can't be removed".into());
+        let inflight = state.inflight_prompts.lock();
+        for id in &chat_ids {
+            if inflight.contains_key(id) {
+                return Err(format!(
+                    "project has an in-flight prompt in chat {id}; cancel first"
+                ));
+            }
+        }
     }
 
+    for id in &chat_ids {
+        purge_chat(&state, id)?;
+    }
+
+    let mut data = state.data.lock();
     let env_id = data
         .projects
         .iter()
@@ -911,14 +1036,8 @@ pub fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<
         .map(|p| p.environment_id.clone())
         .unwrap_or_else(|| LOCAL_ENV_ID.to_string());
 
-    let chat_ids: Vec<String> = data
-        .chats
-        .iter()
-        .filter(|c| c.project_id == project_id)
-        .map(|c| c.id.clone())
-        .collect();
-
     data.projects.retain(|p| p.id != project_id);
+    // purge_chat already removed chats; belt-and-suspenders.
     data.chats.retain(|c| c.project_id != project_id);
     if data.active_project_id.as_deref() == Some(&project_id) {
         data.active_project_id = Some(scratch_project_id_for_env(&env_id));
@@ -933,9 +1052,6 @@ pub fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<
         }
     }
     state.store.save_index(&data).map_err(|e| e.to_string())?;
-    for id in chat_ids {
-        let _ = state.store.delete_chat_file(&id);
-    }
     Ok(())
 }
 
@@ -1117,10 +1233,12 @@ pub fn rename_chat(
     chat_id: String,
     title: String,
 ) -> Result<(), String> {
-    let mut doc = state.store.load_chat(&chat_id).map_err(|e| e.to_string())?;
+    let _guard = state.chat_write.lock();
+    let mut doc = load_chat_doc(&state, &chat_id)?;
     doc.title = title.clone();
     doc.updated_at = now();
-    state.store.save_chat(&doc).map_err(|e| e.to_string())?;
+    put_chat_doc(&state, doc.clone(), true)?;
+    drop(_guard);
 
     let mut data = state.data.lock();
     if let Some(meta) = data.chats.iter_mut().find(|c| c.id == chat_id) {
@@ -1202,6 +1320,43 @@ async fn ensure_session_inner(
     state: &State<'_, AppState>,
     chat_id: &str,
 ) -> Result<EnsureSessionResult, String> {
+    // Single-flight per chat: selectChat background ensure + send_message must
+    // not both session/new and race-patch different ACP ids.
+    let claimed = {
+        let mut set = state.ensuring_chats.lock();
+        if set.contains(chat_id) {
+            false
+        } else {
+            set.insert(chat_id.to_string());
+            true
+        }
+    };
+    if !claimed {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !state.ensuring_chats.lock().contains(chat_id) {
+                break;
+            }
+        }
+        // Peer finished — return current live state.
+        let doc = load_chat_doc(state, chat_id)?;
+        return Ok(EnsureSessionResult {
+            chat: doc,
+            status: "already_active".into(),
+            message: "Session ensure already in progress; using current document".into(),
+        });
+    }
+
+    let result = ensure_session_work(app, state, chat_id).await;
+    state.ensuring_chats.lock().remove(chat_id);
+    result
+}
+
+async fn ensure_session_work(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    chat_id: &str,
+) -> Result<EnsureSessionResult, String> {
     // Prefer the live document so we never clobber an in-flight turn/stream
     // with a lagging on-disk snapshot (that caused user messages to vanish).
     let doc = load_chat_doc(state, chat_id)?;
@@ -1223,11 +1378,13 @@ async fn ensure_session_inner(
     let session_cwd = resolve_session_cwd(state, &project, chat_id).await?;
     let agent = agent_for_env(state, &env_id)?;
 
-    // Already live in this agent process
+    // Already live in this agent process — re-read live so we never return a
+    // pre-await clone that would clobber a concurrent send's turn.
     if let Some(sid) = doc.acp_session_id.clone() {
         if is_session_loaded(state, &env_id, &sid) {
+            let live = load_chat_doc(state, chat_id).unwrap_or(doc);
             return Ok(EnsureSessionResult {
-                chat: doc,
+                chat: live,
                 status: "already_active".into(),
                 message: "Session already loaded in this agent process".into(),
             });
@@ -1259,8 +1416,10 @@ async fn ensure_session_inner(
                     "session-ready",
                     json!({ "chatId": chat_id, "status": "loaded", "cwd": session_cwd, "environmentId": env_id }),
                 );
+                // Always return the *current* live doc, not the pre-await clone.
+                let live = load_chat_doc(state, chat_id).unwrap_or(doc);
                 return Ok(EnsureSessionResult {
-                    chat: doc,
+                    chat: live,
                     status: "loaded".into(),
                     message: "Restored ACP session from disk".into(),
                 });
@@ -1332,6 +1491,8 @@ async fn ensure_session_inner(
 }
 
 /// Patch only `acp_session_id` on the current live (or disk) doc under lock.
+/// Compare-and-swap on `old_sid`: if another ensure/send already moved the
+/// session, leave the document alone (caller may discard the orphaned new sid).
 fn patch_chat_session_id(
     state: &AppState,
     chat_id: &str,
@@ -1347,6 +1508,17 @@ fn patch_chat_session_id(
         .cloned()
         .or_else(|| state.store.load_chat(chat_id).ok())
         .ok_or_else(|| format!("chat `{chat_id}` not found while patching session"))?;
+
+    // CAS: if we expected a specific old id and the doc moved past it, abort.
+    if let Some(expected_old) = old_sid {
+        match doc.acp_session_id.as_deref() {
+            Some(current) if current != expected_old => {
+                // Another path already installed a different session.
+                return Ok(doc);
+            }
+            _ => {}
+        }
+    }
 
     if let Some(old) = old_sid {
         unmark_session_loaded(state, env_id, old);
@@ -1635,8 +1807,27 @@ pub async fn rollback_to_turn(
             .any(|t| t.status == "streaming" || t.status == "cancelling");
         if streaming {
             let _ = cancel_prompt(app.clone(), state.clone(), chat_id.clone()).await;
-            // Give cancel a moment to settle live_chats / disk.
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            // Wait for the backend prompt registry to release — the finalizer
+            // only clears after the agent settles (+150ms). A fixed 80ms sleep
+            // made edit-resend race "chat already has an in-flight prompt".
+            for _ in 0..100 {
+                if !state.inflight_prompts.lock().contains_key(&chat_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // Force-clear a stuck claim only if the live doc no longer has that turn.
+            {
+                let mut map = state.inflight_prompts.lock();
+                if let Some(tid) = map.get(&chat_id).cloned() {
+                    let still_there = load_chat_doc(&state, &chat_id)
+                        .map(|d| d.turns.iter().any(|t| t.id == tid && t.status == "streaming"))
+                        .unwrap_or(false);
+                    if !still_there {
+                        map.remove(&chat_id);
+                    }
+                }
+            }
         }
     }
 
@@ -1748,81 +1939,121 @@ pub async fn send_message(
         return Err(format!("too many attachments (max {MAX_ATTACHMENTS})"));
     }
 
-    let ensured = ensure_session_inner(&app, &state, &args.chat_id).await?;
-    // Re-load live after ensure so we never base the new turn on a stale snapshot
-    // if another path updated the cache during session recreate.
-    let mut doc = load_chat_doc(&state, &args.chat_id)?;
-    if let Some(sid) = ensured.chat.acp_session_id.clone() {
-        doc.acp_session_id = Some(sid);
+    // Backend authority: one prompt per chat until the previous future settles.
+    // Frontend queue is UX only — this prevents double-dispatch corruption.
+    {
+        let inflight = state.inflight_prompts.lock();
+        if let Some(turn_id) = inflight.get(&args.chat_id) {
+            return Err(format!(
+                "chat already has an in-flight prompt (turn {turn_id}); wait or cancel"
+            ));
+        }
     }
 
-    let env_id = {
-        let data = state.data.lock();
-        data.projects
-            .iter()
-            .find(|p| p.id == doc.project_id)
-            .map(|p| {
-                if p.environment_id.is_empty() {
-                    LOCAL_ENV_ID.to_string()
-                } else {
-                    p.environment_id.clone()
-                }
-            })
-            .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
-    };
-
-    let agent = agent_for_env(&state, &env_id)?;
-
-    let acp_session_id = doc
-        .acp_session_id
-        .clone()
-        .ok_or_else(|| "no ACP session after ensure".to_string())?;
+    let ensured = ensure_session_inner(&app, &state, &args.chat_id).await?;
 
     let data_dir = state.store.data_dir().to_path_buf();
     let mut attachments = Vec::new();
     for p in &payloads {
-        attachments.push(save_attachment(&data_dir, &doc.id, p)?);
+        attachments.push(save_attachment(&data_dir, &args.chat_id, p)?);
     }
 
-    if doc.turns.is_empty() && doc.title == "New chat" {
-        let seed = if !text.is_empty() {
-            text.clone()
-        } else if let Some(a) = attachments.first() {
-            format!("Attached {}", a.name)
-        } else {
-            "New chat".into()
-        };
-        doc.title = seed.chars().take(48).collect::<String>();
-        if seed.chars().count() > 48 {
-            doc.title.push('…');
+    // Append turn + claim inflight under the write lock so concurrent sends
+    // cannot load/append/save racing copies of the same document.
+    let (doc, turn_id, acp_session_id, env_id, agent) = {
+        let _guard = state.chat_write.lock();
+        if state.inflight_prompts.lock().contains_key(&args.chat_id) {
+            return Err("chat already has an in-flight prompt; wait or cancel".into());
         }
-    }
 
-    // Do not force-complete an in-flight turn here. Follow-ups are queued on the
-    // frontend (Codex-style); only an explicit cancel should stop the agent.
+        let mut doc = load_chat_doc(&state, &args.chat_id)?;
+        if let Some(sid) = ensured.chat.acp_session_id.clone() {
+            doc.acp_session_id = Some(sid);
+        }
 
-    let turn = Turn {
-        id: new_id(),
-        user_message: text.clone(),
-        intermediate: vec![],
-        assistant_message: String::new(),
-        status: "streaming".into(),
-        intermediate_collapsed: false,
-        attachments: attachments.clone(),
-        created_at: now(),
+        let env_id = {
+            let data = state.data.lock();
+            data.projects
+                .iter()
+                .find(|p| p.id == doc.project_id)
+                .map(|p| {
+                    if p.environment_id.is_empty() {
+                        LOCAL_ENV_ID.to_string()
+                    } else {
+                        p.environment_id.clone()
+                    }
+                })
+                .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
+        };
+
+        let agent = agent_for_env(&state, &env_id)?;
+
+        let acp_session_id = doc
+            .acp_session_id
+            .clone()
+            .ok_or_else(|| "no ACP session after ensure".to_string())?;
+
+        // Do not start a new prompt while this session is still in the cancel gate.
+        if state.cancelling_sessions.lock().contains(&acp_session_id) {
+            return Err(
+                "session is still settling after cancel; try again in a moment".into(),
+            );
+        }
+
+        if doc.turns.is_empty() && doc.title == "New chat" {
+            let seed = if !text.is_empty() {
+                text.clone()
+            } else if let Some(a) = attachments.first() {
+                format!("Attached {}", a.name)
+            } else {
+                "New chat".into()
+            };
+            doc.title = seed.chars().take(48).collect::<String>();
+            if seed.chars().count() > 48 {
+                doc.title.push('…');
+            }
+        }
+
+        let turn = Turn {
+            id: new_id(),
+            user_message: text.clone(),
+            intermediate: vec![],
+            assistant_message: String::new(),
+            status: "streaming".into(),
+            intermediate_collapsed: false,
+            attachments: attachments.clone(),
+            created_at: now(),
+        };
+        let turn_id = turn.id.clone();
+        doc.turns.push(turn);
+        doc.updated_at = now();
+        put_chat_doc(&state, doc.clone(), true)?;
+        // Claim *after* put+sync so a sync_meta I/O failure cannot leave a
+        // permanent inflight lock with no prompt future to release it.
+        sync_meta(&state, &doc)?;
+        state
+            .inflight_prompts
+            .lock()
+            .insert(args.chat_id.clone(), turn_id.clone());
+        (doc, turn_id, acp_session_id, env_id, agent)
     };
-    let turn_id = turn.id.clone();
-    doc.turns.push(turn);
-    doc.updated_at = now();
-    put_chat_doc(&state, doc.clone(), true)?;
-    sync_meta(&state, &doc)?;
 
     let mut prompt_text = text.clone();
     if state.needs_history_seed.lock().remove(&args.chat_id) {
         prompt_text = build_history_seed(&doc, &text);
     }
 
-    let prompt_blocks = build_prompt_blocks(&data_dir, &prompt_text, &attachments)?;
+    let prompt_blocks = match build_prompt_blocks(&data_dir, &prompt_text, &attachments) {
+        Ok(b) => b,
+        Err(e) => {
+            // Release claim so the chat is not permanently locked.
+            let mut map = state.inflight_prompts.lock();
+            if map.get(&args.chat_id).map(|t| t == &turn_id).unwrap_or(false) {
+                map.remove(&args.chat_id);
+            }
+            return Err(e);
+        }
+    };
 
     let _ = app.emit(
         "chat-updated",
@@ -1835,9 +2066,27 @@ pub async fn send_message(
             .iter()
             .find(|p| p.id == doc.project_id)
             .cloned()
-            .ok_or_else(|| "project not found".to_string())?
     };
-    let session_cwd = resolve_session_cwd(&state, &project_for_cwd, &doc.id).await?;
+    let project_for_cwd = match project_for_cwd {
+        Some(p) => p,
+        None => {
+            let mut map = state.inflight_prompts.lock();
+            if map.get(&args.chat_id).map(|t| t == &turn_id).unwrap_or(false) {
+                map.remove(&args.chat_id);
+            }
+            return Err("project not found".into());
+        }
+    };
+    let session_cwd = match resolve_session_cwd(&state, &project_for_cwd, &doc.id).await {
+        Ok(c) => c,
+        Err(e) => {
+            let mut map = state.inflight_prompts.lock();
+            if map.get(&args.chat_id).map(|t| t == &turn_id).unwrap_or(false) {
+                map.remove(&args.chat_id);
+            }
+            return Err(e);
+        }
+    };
 
     let agent2 = agent.clone();
     let session_id_initial = acp_session_id.clone();
@@ -1850,6 +2099,7 @@ pub async fn send_message(
     let live_chats = Arc::clone(&state.live_chats);
     let cancelling = Arc::clone(&state.cancelling_sessions);
     let loaded_sessions = Arc::clone(&state.loaded_sessions);
+    let inflight_prompts = Arc::clone(&state.inflight_prompts);
     let store = state.store.clone();
     let data_dir2 = data_dir.clone();
     let attachments2 = attachments.clone();
@@ -1976,6 +2226,9 @@ pub async fn send_message(
                 .or_else(|| store.load_chat(&chat_id).ok());
             if let Some(ref mut chat) = chat {
                 if let Some(t) = chat.turns.iter_mut().find(|t| t.id == turn_id2) {
+                    // Never overwrite a user-cancelled status with complete/error
+                    // from a late or racing prompt result.
+                    let already_cancelled = t.status == "cancelled" || t.status == "cancelling";
                     match &result {
                         Ok(val) => {
                             let reason = val
@@ -1983,8 +2236,12 @@ pub async fn send_message(
                                 .or_else(|| val.get("stop_reason"))
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("end_turn");
-                            stop_reason = Some(reason.to_string());
-                            if reason == "cancelled" {
+                            stop_reason = Some(if already_cancelled {
+                                "cancelled".to_string()
+                            } else {
+                                reason.to_string()
+                            });
+                            if already_cancelled || reason == "cancelled" {
                                 t.status = "cancelled".to_string();
                                 for b in t.intermediate.iter_mut() {
                                     if let IntermediateBlock::Tool { status, .. } = b {
@@ -1998,25 +2255,16 @@ pub async fn send_message(
                                 }
                             } else {
                                 t.status = "complete".to_string();
-                                // Don't leave subagent cards stuck "running" after
-                                // the parent turn ended — that kept open_subagents
-                                // high and used to suppress later parent text.
-                                for b in t.intermediate.iter_mut() {
-                                    if let IntermediateBlock::Subagent { status, .. } = b {
-                                        if status == "pending"
-                                            || status == "in_progress"
-                                            || status == "running"
-                                        {
-                                            *status = "completed".to_string();
-                                        }
-                                    }
-                                }
+                                // Leave running children as-is. Late subagent_finished /
+                                // task_completed / tool terminal updates still apply after
+                                // parent complete (see apply_one_update late-allow list).
                             }
                             t.intermediate_collapsed = true;
                         }
                         Err(err) => {
                             let msg = err.to_string();
-                            let looks_cancelled = msg.to_lowercase().contains("cancel")
+                            let looks_cancelled = already_cancelled
+                                || msg.to_lowercase().contains("cancel")
                                 || msg.to_lowercase().contains("disconnected")
                                 || msg.to_lowercase().contains("exited");
                             if looks_cancelled {
@@ -2062,10 +2310,17 @@ pub async fn send_message(
         }
 
         cancelling.lock().remove(&session_id);
+        // Release the send slot only for *this* turn (a newer claim would differ).
+        {
+            let mut map = inflight_prompts.lock();
+            if map.get(&chat_id).map(|t| t == &turn_id2).unwrap_or(false) {
+                map.remove(&chat_id);
+            }
+        }
 
         // Give the frontend a bit more time to apply trailing stream events
         // before UI treats the turn as fully sealed (late chunks still accepted
-        // on complete for agent_message_chunk).
+        // on complete for agent_message_chunk / child results).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let _ = app2.emit(
@@ -2134,6 +2389,42 @@ pub async fn cancel_prompt(
         .find(|t| t.status == "streaming" || t.status == "cancelling")
         .map(|t| t.id.clone());
 
+    // Stop racing a natural finish: if nothing is in the prompt registry,
+    // do NOT insert cancelling_sessions (finalizer already ran — a gate here
+    // would poison the session for ~30s with no finalizer to clear it).
+    let had_inflight = state.inflight_prompts.lock().contains_key(&chat_id);
+    if !had_inflight {
+        // Best-effort cancel notify; never poison the gate.
+        if let Ok(agent) = agent_for_env(&state, &env_id) {
+            let _ = agent.session_cancel(&sid).await;
+        }
+        // Still paint cancelled if UI shows streaming (stale).
+        if cancelled_turn_id.is_some() {
+            let _guard = state.chat_write.lock();
+            if let Ok(mut chat) = load_chat_doc(&state, &chat_id) {
+                for t in chat.turns.iter_mut() {
+                    if Some(&t.id) == cancelled_turn_id.as_ref()
+                        || t.status == "streaming"
+                        || t.status == "cancelling"
+                    {
+                        t.status = "cancelled".into();
+                        t.intermediate_collapsed = true;
+                    }
+                }
+                let _ = put_chat_doc(&state, chat, true);
+            }
+        }
+        let _ = app.emit(
+            "cancel-started",
+            json!({
+                "chatId": chat_id,
+                "sessionId": sid,
+                "turnId": cancelled_turn_id,
+            }),
+        );
+        return Ok(());
+    }
+
     // Mark live cancelled immediately so get_chat / ensure never re-report streaming.
     {
         let _guard = state.chat_write.lock();
@@ -2177,13 +2468,19 @@ pub async fn cancel_prompt(
         }
     }
 
-    // Drop further stream applies for this session so cancel isn't starved.
-    state.cancelling_sessions.lock().insert(sid.clone());
+    // Re-read live sid in case unknown-session retry swapped it mid-cancel.
+    let live_sid = load_chat_doc(&state, &chat_id)
+        .ok()
+        .and_then(|d| d.acp_session_id)
+        .unwrap_or_else(|| sid.clone());
+    state.cancelling_sessions.lock().insert(live_sid.clone());
+    if live_sid != sid {
+        state.cancelling_sessions.lock().insert(sid.clone());
+    }
 
     let agent = agent_for_env(&state, &env_id)?;
-    // session_cancel also rejects pending permissions (required by ACP).
     agent
-        .session_cancel(&sid)
+        .session_cancel(&live_sid)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2193,7 +2490,8 @@ pub async fn cancel_prompt(
     let store = state.store.clone();
     let chat_id_bg = chat_id.clone();
     let app_bg = app.clone();
-    let sid_bg = sid.clone();
+    let sid_bg = live_sid.clone();
+    let sid_old = sid.clone();
     let turn_id_bg = cancelled_turn_id.clone();
     let cancelling = Arc::clone(&state.cancelling_sessions);
     tokio::spawn(async move {
@@ -2248,18 +2546,17 @@ pub async fn cancel_prompt(
             let _ = app_bg.emit("chat-updated", json!({ "chatId": chat_id_bg }));
         }
 
-        // Keep dropping stream applies briefly, then clear the gate.
-        // (Do NOT emit a synthetic prompt-finished here — it races a new turn
-        // the user may have already started after Stop.)
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Safety net if the finalizer never runs (agent hang / kill path).
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         cancelling.lock().remove(&sid_bg);
+        cancelling.lock().remove(&sid_old);
     });
 
     let _ = app.emit(
         "cancel-started",
         json!({
             "chatId": chat_id,
-            "sessionId": sid,
+            "sessionId": live_sid,
             "turnId": cancelled_turn_id,
         }),
     );
@@ -2297,22 +2594,38 @@ fn is_stream_chunk_kind(kind: &str) -> bool {
     )
 }
 
+/// Kinds that may still apply after the parent turn is marked complete
+/// (late stream chunks and background child results).
+fn is_late_allowed_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "agent_message_chunk"
+            | "agent_thought_chunk"
+            | "subagent_finished"
+            | "task_completed"
+            | "tool_call_update"
+            | "subagent_spawned"
+    )
+}
+
+/// Find a turn that owns a subagent/task id (for late child updates after parent complete).
+fn find_turn_for_child_id(doc: &ChatDocument, child_id: &str) -> Option<usize> {
+    if child_id.is_empty() {
+        return None;
+    }
+    doc.turns.iter().rposition(|t| {
+        t.intermediate.iter().any(|b| match b {
+            IntermediateBlock::Subagent { subagent_id, .. } => subagent_id == child_id,
+            IntermediateBlock::Task { task_id, .. } => task_id == child_id,
+            IntermediateBlock::Tool { tool_call_id, .. } => tool_call_id == child_id,
+            _ => false,
+        })
+    })
+}
+
 /// Apply a single session/update into the chat's last turn.
 /// Returns the update kind when the event was considered (for flush decisions).
 fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option<String> {
-    // Prefer the latest streaming turn so a completed previous turn never
-    // swallows the new user message's stream.
-    let turn_idx = doc
-        .turns
-        .iter()
-        .rposition(|t| t.status == "streaming" || t.status == "cancelling")
-        .or_else(|| doc.turns.len().checked_sub(1))?;
-    let turn = doc.turns.get_mut(turn_idx)?;
-    // Already stopped — don't append more content to a dead turn.
-    if turn.status == "cancelled" || turn.status == "cancelling" {
-        return None;
-    }
-
     let kind = update
         .get("sessionUpdate")
         .or_else(|| update.get("session_update"))
@@ -2320,23 +2633,70 @@ fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option<String> {
         .unwrap_or("")
         .to_string();
 
-    // Late `agent_message_chunk`s often arrive after we mark the turn complete
-    // (prompt RPC returns before the last few stream events are applied).
-    // Still accept those so answers are not truncated. Other kinds stay gated.
-    let allow_late_message =
-        turn.status == "complete" && kind == "agent_message_chunk";
-    if turn.status != "streaming" && !allow_late_message {
+    // Prefer the latest streaming turn so a completed previous turn never
+    // swallows the new user message's stream.
+    let mut turn_idx = doc
+        .turns
+        .iter()
+        .rposition(|t| t.status == "streaming" || t.status == "cancelling")
+        .or_else(|| doc.turns.len().checked_sub(1))?;
+
+    // Route late child/tool results to the turn that owns that id.
+    if matches!(
+        kind.as_str(),
+        "subagent_finished" | "task_completed" | "subagent_spawned" | "tool_call_update"
+    ) {
+        let child_id = update
+            .get("subagent_id")
+            .or_else(|| update.get("subagentId"))
+            .or_else(|| update.get("task_id"))
+            .or_else(|| update.get("taskId"))
+            .or_else(|| update.get("toolCallId"))
+            .or_else(|| update.get("tool_call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let child_from_snap = update
+            .get("task_snapshot")
+            .and_then(|s| {
+                s.get("task_id")
+                    .or_else(|| s.get("taskId"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let id = if !child_id.is_empty() {
+            child_id
+        } else {
+            child_from_snap
+        };
+        if let Some(idx) = find_turn_for_child_id(doc, id) {
+            turn_idx = idx;
+        }
+    }
+
+    let turn = doc.turns.get_mut(turn_idx)?;
+    // Already stopped by user — don't append more content to a dead turn.
+    if turn.status == "cancelled" || turn.status == "cancelling" {
         return None;
     }
 
-    // While subagents are running, Grok fans *thought* chunks into the parent.
-    // Do NOT drop `agent_message_chunk`s — parent answers often lack messageId
-    // and stream while a child is still "running", which previously cut replies.
-    let open_subagents = count_open_subagents(turn);
+    // Late chunks after parent complete: accept message tails + child results.
+    if turn.status != "streaming" && !is_late_allowed_kind(&kind) {
+        return None;
+    }
+    if turn.status == "complete" && !is_late_allowed_kind(&kind) {
+        return None;
+    }
+    // error status: only allow late child terminal updates, not new parent text.
+    if turn.status == "error" && !matches!(kind.as_str(), "subagent_finished" | "task_completed" | "tool_call_update") {
+        return None;
+    }
 
     match kind.as_str() {
         "agent_message_chunk" => {
-            let text = extract_chunk_text(&update);
+            if turn.status != "streaming" && turn.status != "complete" {
+                return None;
+            }
+            let text = extract_chunk_text(update);
             if !text.is_empty() {
                 let message_id = update
                     .get("messageId")
@@ -2347,33 +2707,14 @@ fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option<String> {
             }
         }
         "agent_thought_chunk" => {
-            // Child thoughts fan into the parent without ids — drop while any
-            // subagent is open. Parent-level thinking mid-spawn is rare.
-            if open_subagents > 0 {
-                // ignore
-            } else {
-                let text = extract_chunk_text(&update);
-                if text.is_empty() {
-                    // nothing
-                } else {
-                    let append_to_last = matches!(
-                        turn.intermediate.last(),
-                        Some(IntermediateBlock::Thought { .. })
-                    );
-                    if append_to_last {
-                        if let Some(IntermediateBlock::Thought { text: existing, .. }) =
-                            turn.intermediate.last_mut()
-                        {
-                            existing.push_str(&text);
-                        }
-                    } else {
-                        turn.intermediate.push(IntermediateBlock::Thought {
-                            id: new_id(),
-                            text: text.to_string(),
-                            collapsed: true,
-                        });
-                    }
-                }
+            // Always append parent thoughts, including while children run and
+            // late tails after complete (apply backlog can lag the finalizer).
+            if turn.status != "streaming" && turn.status != "complete" {
+                return None;
+            }
+            let text = extract_chunk_text(update);
+            if !text.is_empty() {
+                append_agent_thought(turn, &text);
             }
         }
         "tool_call" => {
@@ -2410,9 +2751,10 @@ fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option<String> {
                     content.as_ref(),
                     raw_output.as_ref(),
                 );
-            } else if looks_like_subagent_wait(raw_input.as_ref(), &title) {
-                // Wait tool: don't clutter the main work list; fold outputs into cards.
-                apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
+            } else if looks_like_subagent_wait(raw_input.as_ref(), &title)
+                && apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref())
+            {
+                // Wait tool folded into subagent cards — skip main work list.
             } else if !tool_call_id.is_empty() {
                 // Accept parent tools even while subagents run. Child text fan-in is
                 // filtered on message/thought chunks; tool rows may include some child
@@ -2512,18 +2854,20 @@ fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option<String> {
             if !handled_as_subagent
                 && looks_like_subagent_wait(raw_input.as_ref(), &title)
             {
-                apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
-                handled_as_subagent = true;
+                // Only suppress normal tool handling when a real subagent matched.
+                handled_as_subagent =
+                    apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
             }
-            // Also fold wait results even when title/input arrive only on update.
+            // MultiResult may mix shell rows and subagent rows — only suppress
+            // the tool card when at least one subagent result was applied.
             if !handled_as_subagent && (raw_output.is_some() || content.is_some()) {
                 if raw_output
                     .as_ref()
                     .map(|v| v.get("MultiResult").is_some())
                     .unwrap_or(false)
                 {
-                    apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
-                    handled_as_subagent = true;
+                    handled_as_subagent =
+                        apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
                 }
             }
 
@@ -2839,6 +3183,7 @@ fn apply_updates_inner(
     state: &AppState,
     chat_id: &str,
     updates: &[Value],
+    expected_session_id: Option<&str>,
 ) -> Result<ChatDocument, String> {
     {
         // Prefer live cache for session id checks (disk may be stale mid-stream).
@@ -2849,6 +3194,23 @@ fn apply_updates_inner(
             .cloned()
             .or_else(|| state.store.load_chat(chat_id).ok());
         if let Some(doc) = doc_peek {
+            // Reject batches from an invalidated session (post-rollback recreate).
+            if let Some(expected) = expected_session_id {
+                match doc.acp_session_id.as_deref() {
+                    Some(current) if current == expected => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "session id mismatch for chat {chat_id}: batch={expected}, doc={}",
+                            doc.acp_session_id.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "session id mismatch for chat {chat_id}: batch={expected}, doc=none"
+                        ));
+                    }
+                }
+            }
             if let Some(sid) = doc.acp_session_id.as_ref() {
                 if state.replaying_sessions.lock().contains(sid) {
                     return Ok(doc);
@@ -2864,6 +3226,14 @@ fn apply_updates_inner(
 
     let _guard = state.chat_write.lock();
     let mut doc = load_chat_doc(state, chat_id)?;
+    // Re-check session after lock (rollback may have recreated mid-flight).
+    if let Some(expected) = expected_session_id {
+        if doc.acp_session_id.as_deref() != Some(expected) {
+            return Err(format!(
+                "session id mismatch for chat {chat_id} after lock"
+            ));
+        }
+    }
     if updates.is_empty() {
         return Ok(doc);
     }
@@ -2895,8 +3265,14 @@ pub fn apply_session_update(
     state: State<'_, AppState>,
     chat_id: String,
     update: Value,
+    session_id: String,
 ) -> Result<ChatDocument, String> {
-    apply_updates_inner(&state, &chat_id, std::slice::from_ref(&update))
+    apply_updates_inner(
+        &state,
+        &chat_id,
+        std::slice::from_ref(&update),
+        Some(session_id.as_str()),
+    )
 }
 
 /// Apply many session/updates in one lock + one IPC response (streaming fast-path).
@@ -2905,8 +3281,9 @@ pub fn apply_session_updates(
     state: State<'_, AppState>,
     chat_id: String,
     updates: Vec<Value>,
+    session_id: String,
 ) -> Result<ChatDocument, String> {
-    apply_updates_inner(&state, &chat_id, &updates)
+    apply_updates_inner(&state, &chat_id, &updates, Some(session_id.as_str()))
 }
 
 /// Text from an ACP content chunk update (`agent_message_chunk` / `agent_thought_chunk`).
@@ -3176,11 +3553,15 @@ fn upsert_subagent_from_spawn_tool(
     }
 }
 
+/// Apply MultiResult / wait output to subagent cards.
+/// Returns true if at least one real subagent row was matched or created
+/// (caller should only then skip normal tool status/output handling).
 fn apply_subagent_wait_output(
     turn: &mut Turn,
     content: Option<&Value>,
     raw_output: Option<&Value>,
-) {
+) -> bool {
+    let mut matched_any = false;
     // MultiResult.results[] with command like "[subagent:explore] Desc" + output
     if let Some(results) = raw_output
         .and_then(|v| v.pointer("/MultiResult/results"))
@@ -3289,6 +3670,7 @@ fn apply_subagent_wait_output(
                     *subagent_id = task_id.to_string();
                 }
                 *collapsed = false;
+                matched_any = true;
             } else if is_subagent_cmd && (!parsed_desc.is_empty() || !task_id.is_empty()) {
                 // New subagent report we haven't seen yet (wait returned first).
                 turn.intermediate.push(IntermediateBlock::Subagent {
@@ -3314,10 +3696,11 @@ fn apply_subagent_wait_output(
                     output,
                     collapsed: false,
                 });
+                matched_any = true;
             }
             // else: shell / non-subagent MultiResult row — ignore for the rail
         }
-        return;
+        return matched_any;
     }
 
     // Single-result wait: whole blob is one subagent report.
@@ -3329,7 +3712,7 @@ fn apply_subagent_wait_output(
         s
     };
     if blob.is_empty() {
-        return;
+        return false;
     }
     // Prefer the oldest running subagent without output.
     if let Some(IntermediateBlock::Subagent {
@@ -3346,7 +3729,9 @@ fn apply_subagent_wait_output(
         *st = "completed".into();
         *out = blob;
         *collapsed = false;
+        return true;
     }
+    false
 }
 
 /// True when MultiResult.command is a subagent wait label, not a shell line.
@@ -3373,6 +3758,7 @@ fn parse_subagent_command_label(command: &str) -> (String, String) {
     (String::new(), String::new())
 }
 
+#[allow(dead_code)]
 fn count_open_subagents(turn: &Turn) -> usize {
     turn.intermediate
         .iter()
@@ -3392,6 +3778,55 @@ fn count_open_subagents(turn: &Turn) -> usize {
 /// end so the UI reads: [work/thoughts…] → [one continuous answer].
 ///
 /// Tools / subagents / tasks / plans are hard boundaries (new message after).
+/// Append a thought chunk. Walk back through tools/tasks so a tool call mid-
+/// think does not start a brand-new truncated Thought block (Grok often
+/// continues the same thought stream after tools).
+fn append_agent_thought(turn: &mut Turn, text: &str) {
+    // Only skip past tools/tasks/subagents — a Message is a hard boundary
+    // (new reasoning after a status line is a new thought).
+    let mut target_idx: Option<usize> = None;
+    for (i, b) in turn.intermediate.iter().enumerate().rev() {
+        match b {
+            IntermediateBlock::Thought { .. } => {
+                target_idx = Some(i);
+                break;
+            }
+            IntermediateBlock::Tool { .. }
+            | IntermediateBlock::Task { .. }
+            | IntermediateBlock::Subagent { .. }
+            | IntermediateBlock::Plan { .. } => continue,
+            IntermediateBlock::Message { .. } => break,
+        }
+    }
+
+    if let Some(i) = target_idx {
+        if let IntermediateBlock::Thought {
+            text: existing,
+            collapsed,
+            ..
+        } = &mut turn.intermediate[i]
+        {
+            // ACP thought chunks are deltas — append verbatim. Do not use
+            // ends_with/starts_with heuristics (they drop valid repeats like
+            // "ha"+"ha" and can duplicate on shorter snapshot prefixes).
+            existing.push_str(text);
+            *collapsed = false; // keep latest thinking readable
+        }
+        // Move the growing thought after intervening tools so the timeline
+        // reads: work → thinking (current) rather than stale early thoughts.
+        if i + 1 != turn.intermediate.len() {
+            let thought = turn.intermediate.remove(i);
+            turn.intermediate.push(thought);
+        }
+    } else {
+        turn.intermediate.push(IntermediateBlock::Thought {
+            id: new_id(),
+            text: text.to_string(),
+            collapsed: false,
+        });
+    }
+}
+
 fn append_agent_message(turn: &mut Turn, message_id: Option<String>, text: &str) {
     // Walk from the end: skip Thoughts only.
     let mut target_idx: Option<usize> = None;
@@ -3468,14 +3903,11 @@ pub fn set_turn_collapsed(
     collapsed: bool,
 ) -> Result<ChatDocument, String> {
     let _guard = state.chat_write.lock();
-    let mut doc = state
-        .store
-        .load_chat(&chat_id)
-        .map_err(|e| e.to_string())?;
+    let mut doc = load_chat_doc(&state, &chat_id)?;
     if let Some(t) = doc.turns.iter_mut().find(|t| t.id == turn_id) {
         t.intermediate_collapsed = collapsed;
     }
-    state.store.save_chat(&doc).map_err(|e| e.to_string())?;
+    put_chat_doc(&state, doc.clone(), true)?;
     Ok(doc)
 }
 
@@ -3488,10 +3920,7 @@ pub fn set_block_collapsed(
     collapsed: bool,
 ) -> Result<ChatDocument, String> {
     let _guard = state.chat_write.lock();
-    let mut doc = state
-        .store
-        .load_chat(&chat_id)
-        .map_err(|e| e.to_string())?;
+    let mut doc = load_chat_doc(&state, &chat_id)?;
     if let Some(t) = doc.turns.iter_mut().find(|t| t.id == turn_id) {
         for b in &mut t.intermediate {
             match b {
@@ -3508,7 +3937,7 @@ pub fn set_block_collapsed(
             }
         }
     }
-    state.store.save_chat(&doc).map_err(|e| e.to_string())?;
+    put_chat_doc(&state, doc.clone(), true)?;
     Ok(doc)
 }
 

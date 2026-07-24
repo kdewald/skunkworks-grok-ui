@@ -20,12 +20,17 @@ function App() {
   const ready = useAppStore((s) => s.ready);
   const workspaceMode = useAppStore((s) => s.workspaceMode);
 
-  // Connect once on mount. Empty deps + ignore flag avoids StrictMode double-connect races.
+  // Connect once on mount. selectChat may also connect; both paths are single-flight.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       await bootstrap();
       if (cancelled) return;
+      // Bootstrap/selectChat may already have connected for the saved chat's env.
+      const state = useAppStore.getState();
+      if (state.connectedEnvironments.includes(state.activeEnvironmentId)) {
+        return;
+      }
       try {
         await connectAgent();
       } catch {
@@ -45,15 +50,17 @@ function App() {
 
     void (async () => {
       const pairs: Array<Promise<UnlistenFn>> = [
-        listen<{ sessionId: string; update: unknown }>(
-          "session-update",
-          (event) => {
-            void applySessionUpdate(
-              event.payload.sessionId,
-              event.payload.update,
-            );
-          },
-        ),
+        listen<{
+          sessionId: string;
+          update: unknown;
+          environmentId?: string;
+        }>("session-update", (event) => {
+          void applySessionUpdate(
+            event.payload.sessionId,
+            event.payload.update,
+            event.payload.environmentId,
+          );
+        }),
         listen<PermissionRequest>("permission-request", (event) => {
           const p = event.payload as PermissionRequest & {
             request_id?: number | string;
@@ -81,15 +88,45 @@ function App() {
             message: event.payload.message,
             environmentId: event.payload.environmentId,
           });
-          // If the agent dies mid-turn, unlock the composer immediately.
-          // Backend also fails pending session/prompt so prompt-finished follows.
+          // Scope disconnect to the environment owning the inflight chat —
+          // an SSH agent death must not abort a healthy local turn.
           if (!event.payload.connected) {
             const state = useAppStore.getState();
+            const deadEnv = event.payload.environmentId;
+            const inflightId = state.inflightChatId;
+            let inflightOnDeadEnv = !deadEnv;
+            if (deadEnv && inflightId) {
+              const meta = state.chats.find((c) => c.id === inflightId);
+              const project = state.projects.find(
+                (p) => p.id === (meta?.projectId ?? state.activeChat?.projectId),
+              );
+              const chatEnv = project?.environmentId || state.activeEnvironmentId;
+              inflightOnDeadEnv = chatEnv === deadEnv;
+            }
+            if (!inflightOnDeadEnv) {
+              return;
+            }
             const active = state.activeChat;
-            if (active?.turns.some((t) => t.status === "streaming")) {
+            const activeOnDeadEnv =
+              !deadEnv ||
+              (() => {
+                const project = state.projects.find(
+                  (p) => p.id === active?.projectId,
+                );
+                return (
+                  (project?.environmentId || state.activeEnvironmentId) ===
+                  deadEnv
+                );
+              })();
+            if (
+              activeOnDeadEnv &&
+              active?.turns.some((t) => t.status === "streaming")
+            ) {
               useAppStore.setState({
                 busy: false,
                 inflightChatId: null,
+                inflightTurnId: null,
+                inflightGeneration: null,
                 permission: null,
                 activeChat: {
                   ...active,
@@ -107,12 +144,26 @@ function App() {
                   ),
                 },
               });
-            } else {
+            } else if (inflightOnDeadEnv) {
               useAppStore.setState({
                 busy: false,
                 inflightChatId: null,
+                inflightTurnId: null,
+                inflightGeneration: null,
                 permission: null,
               });
+            }
+            // Disconnect (including cancel hard-kill) clears the slot without
+            // prompt-finished — flush the global queue so follow-ups are not
+            // stranded forever behind a never-matching finish event.
+            if (inflightOnDeadEnv) {
+              const finishedChat = inflightId;
+              void (async () => {
+                await waitForApplyDrain();
+                await useAppStore
+                  .getState()
+                  .flushMessageQueue(finishedChat ?? undefined);
+              })();
             }
           }
         }),
@@ -131,27 +182,25 @@ function App() {
           void (async () => {
             const state = useAppStore.getState();
             const isActiveChat = state.activeChatId === event.payload.chatId;
-            const isInflightChat =
-              state.inflightChatId === event.payload.chatId;
-            const active = isActiveChat ? state.activeChat : null;
             const finishedTurnId = event.payload.turnId ?? null;
-            const last = active?.turns[active.turns.length - 1];
-            // Clear busy when this chat's inflight turn ends (even if user switched away).
-            const shouldClearBusy =
-              isInflightChat ||
-              (isActiveChat &&
-                (!last ||
-                  !finishedTurnId ||
-                  last.id === finishedTurnId ||
-                  last.status !== "streaming"));
+            // Turn-scoped: only clear the send slot when this exact generation
+            // finishes (late finish for turn A must not unlock turn B).
+            // While send_message is still in flight (inflightTurnId not set yet),
+            // ignore finishes with a turnId — dispatchSend will adopt the turn
+            // id from the response; a stale prior finish must not unlock early.
+            const isOurInflight =
+              state.inflightChatId === event.payload.chatId &&
+              (state.inflightTurnId != null
+                ? finishedTurnId === state.inflightTurnId
+                : finishedTurnId == null);
+            const active = isActiveChat ? state.activeChat : null;
 
-            if (shouldClearBusy) {
+            if (isOurInflight) {
               useAppStore.setState({
                 busy: false,
-                inflightChatId:
-                  state.inflightChatId === event.payload.chatId
-                    ? null
-                    : state.inflightChatId,
+                inflightChatId: null,
+                inflightTurnId: null,
+                inflightGeneration: null,
                 error:
                   isActiveChat &&
                   event.payload.ok === false &&
@@ -236,7 +285,8 @@ function App() {
               }
             }
 
-            if (shouldClearBusy) {
+            // Only after the cancelled/finished turn has settled: schedule queue.
+            if (isOurInflight) {
               await useAppStore
                 .getState()
                 .flushMessageQueue(event.payload.chatId);
@@ -303,28 +353,19 @@ function App() {
           (event) => {
             const state = useAppStore.getState();
             const turnId = event.payload.turnId;
-            // Clear inflight even if this chat is not focused.
-            const clearInflight =
-              state.inflightChatId === event.payload.chatId
-                ? { busy: false as const, inflightChatId: null as string | null }
-                : {};
+            // Do NOT clear busy/inflight here — wait for prompt-finished so a
+            // queued follow-up cannot start while the session is still cancelling.
             if (state.activeChat?.id !== event.payload.chatId) {
-              useAppStore.setState(clearInflight);
               return;
             }
             const active = state.activeChat;
-            if (!active) {
-              useAppStore.setState(clearInflight);
-              return;
-            }
+            if (!active) return;
             useAppStore.setState({
-              ...clearInflight,
-              busy: false,
-              inflightChatId:
-                state.inflightChatId === event.payload.chatId
-                  ? null
-                  : state.inflightChatId,
               permission: null,
+              inflightTurnId:
+                state.inflightChatId === event.payload.chatId
+                  ? turnId ?? state.inflightTurnId
+                  : state.inflightTurnId,
               activeChat: {
                 ...active,
                 turns: active.turns.map((t) => {

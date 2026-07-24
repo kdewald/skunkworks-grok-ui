@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## [0.5.3] — 2026-07-24
+
+### Added
+
+- KaTeX rendering for LaTeX in assistant / subagent markdown (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`)
+
+### Fixed
+
+- Backend prompt registry: one in-flight `send_message` per chat (turn append under write lock)
+- Stop + queued follow-up: keep send slot until turn settles; cancel hard-kill after timeout (no synthetic cancel success)
+- Stop no longer poisons `cancelling_sessions` when the turn already finished (30s send lock)
+- Global FIFO message queue; disconnect/cancel-kill flushes; retriable queue head + idle flush kick
+- `ensure_chat_session` / `selectChat` only patch session meta; ensure single-flight + CAS
+- Connect single-flight per environment; ACP `shutdown()` kills child; dead connections replaced
+- Stream apply requires matching `sessionId`; late subagent/task/tool/thought updates after complete
+- Shell-only MultiResult no longer swallows normal tool output
+- Thought chunks append as ACP deltas (no ends_with heuristic)
+- Live-cache disk mutations; delete/remove project/env refuse inflight and clear queue for deleted chats
+- Edit-resend waits for inflight release; does not hijack another chat’s send slot
+- Finalizer never overwrites a cancelled turn with complete
+- `sync_meta` failure no longer leaves a permanent inflight claim
+- Disconnect handling scoped to the environment that owns the inflight chat
+- LaTeX normalize protects inline code and fences
+- Tool work strip more compact (collapsed “Work N tools” by default; denser rows)
+
+### Packaging
+
+- Version bump to 0.5.3
+
 ## [0.5.1] — 2026-07-24
 
 ### Added
