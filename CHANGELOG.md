@@ -9,10 +9,11 @@
 - **LSP bridge** for local workspaces (stdio language servers):
   - TypeScript/JavaScript → `typescript-language-server`
   - Python → `pyright-langserver` / `basedpyright` / `pylsp`
-  - Rust → `rust-analyzer`
+  - Rust → `rust-analyzer` (prefers `rustup which`; detects dead rustup proxies)
   - C/C++ → `clangd`
   - Completions, hover, go-to-definition, diagnostics (when servers are installed)
   - Status chip in the file bar when an LSP attaches
+- Files editor **autosave** (~900ms after you stop typing); Save button still available
 
 ## [0.5.4] — 2026-07-25
 

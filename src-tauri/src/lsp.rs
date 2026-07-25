@@ -136,12 +136,16 @@ impl LspHub {
         let stdout = child.stdout.take().ok_or("lsp stdout missing")?;
         let stderr = child.stderr.take();
 
+        // Collect stderr so initialize failures can surface install/proxy errors.
+        let stderr_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         if let Some(stderr) = stderr {
             let lang = id.to_string();
             let app_err = app.clone();
+            let buf = Arc::clone(&stderr_buf);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    buf.lock().push(line.clone());
                     let _ = app_err.emit(
                         "lsp-log",
                         json!({ "serverId": lang, "stream": "stderr", "line": line }),
@@ -162,6 +166,7 @@ impl LspHub {
         let lang = id.to_string();
         let child_r = Arc::clone(&child);
         let stdin_r = Arc::clone(&stdin);
+        let stderr_for_exit = Arc::clone(&stderr_buf);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -179,10 +184,21 @@ impl LspHub {
                     }
                 }
             }
+            let detail = {
+                let lines = stderr_for_exit.lock();
+                if lines.is_empty() {
+                    "language server exited".to_string()
+                } else {
+                    format!(
+                        "language server exited: {}",
+                        lines.iter().rev().take(3).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ")
+                    )
+                }
+            };
             {
                 let mut pend = pending_r.lock();
                 for (_, tx) in pend.map.drain() {
-                    let _ = tx.send(Err("language server exited".into()));
+                    let _ = tx.send(Err(detail.clone()));
                 }
             }
             if let Some(mut c) = child_r.lock().await.take() {
@@ -201,52 +217,73 @@ impl LspHub {
         });
 
         let root_uri = path_to_uri(&root);
-        live.request(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "clientInfo": {
-                    "name": "skunkworks-grok-ui",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "rootUri": root_uri,
-                "rootPath": root.to_string_lossy(),
-                "capabilities": {
-                    "textDocument": {
-                        "synchronization": {
-                            "dynamicRegistration": false,
-                            "didSave": true
-                        },
-                        "completion": {
-                            "completionItem": {
-                                "snippetSupport": true,
-                                "documentationFormat": ["markdown", "plaintext"]
+        let init = live
+            .request(
+                "initialize",
+                json!({
+                    "processId": std::process::id(),
+                    "clientInfo": {
+                        "name": "skunkworks-grok-ui",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "rootUri": root_uri,
+                    "rootPath": root.to_string_lossy(),
+                    "capabilities": {
+                        "textDocument": {
+                            "synchronization": {
+                                "dynamicRegistration": false,
+                                "didSave": true
                             },
-                            "contextSupport": true
+                            "completion": {
+                                "completionItem": {
+                                    "snippetSupport": true,
+                                    "documentationFormat": ["markdown", "plaintext"]
+                                },
+                                "contextSupport": true
+                            },
+                            "hover": {
+                                "contentFormat": ["markdown", "plaintext"]
+                            },
+                            "definition": { "linkSupport": true },
+                            "publishDiagnostics": {
+                                "relatedInformation": true
+                            }
                         },
-                        "hover": {
-                            "contentFormat": ["markdown", "plaintext"]
-                        },
-                        "definition": { "linkSupport": true },
-                        "publishDiagnostics": {
-                            "relatedInformation": true
+                        "workspace": {
+                            "workspaceFolders": true,
+                            "configuration": true
                         }
                     },
-                    "workspace": {
-                        "workspaceFolders": true,
-                        "configuration": true
-                    }
-                },
-                "workspaceFolders": [{
-                    "uri": root_uri,
-                    "name": root.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("workspace")
-                }],
-                "initializationOptions": initialization_options(id)
-            }),
-        )
-        .await?;
+                    "workspaceFolders": [{
+                        "uri": root_uri,
+                        "name": root.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("workspace")
+                    }],
+                    "initializationOptions": initialization_options(id)
+                }),
+            )
+            .await;
+
+        if let Err(e) = init {
+            // Tear down failed server so the next open can retry cleanly.
+            if let Some(mut c) = live.child.lock().await.take() {
+                let _ = c.kill().await;
+            }
+            let stderr_tail = {
+                let lines = stderr_buf.lock();
+                lines.iter().rev().take(4).cloned().collect::<Vec<_>>()
+                    .into_iter().rev().collect::<Vec<_>>().join(" | ")
+            };
+            let hint = if id == "rust" && (e.contains("Unknown binary") || e.contains("unknown binary") || stderr_tail.contains("Unknown binary") || stderr_tail.contains("unknown binary")) {
+                missing_hint("rust")
+            } else if stderr_tail.is_empty() {
+                e
+            } else {
+                format!("{e} ({stderr_tail})")
+            };
+            return Err(hint);
+        }
 
         live.notify("initialized", json!({})).await?;
 
@@ -501,7 +538,10 @@ fn missing_hint(id: &str) -> String {
         "python" => {
             "Install: pip install pyright  (or basedpyright / python-lsp-server)".into()
         }
-        "rust" => "Install: rustup component add rust-analyzer".into(),
+        "rust" => {
+            // Common failure: ~/.cargo/bin/rust-analyzer is a rustup proxy without the component.
+            "Install: rustup component add rust-analyzer  (PATH has a rustup proxy, but the component was missing)".into()
+        }
         "cpp" => "Install: clangd (e.g. brew install llvm)".into(),
         _ => format!("No language server configured for `{id}`"),
     }
@@ -527,17 +567,57 @@ fn resolve_server_command(id: &str) -> Option<(String, Vec<String>)> {
             ("basedpyright-langserver", vec!["--stdio".into()]),
             ("pylsp", vec![]),
         ]),
-        "rust" => first_which(&[("rust-analyzer", vec![])]),
+        "rust" => resolve_rust_analyzer(),
         "cpp" => first_which(&[("clangd", vec![])]),
         _ => None,
     }
 }
 
+/// Prefer the real toolchain binary from `rustup which` — `~/.cargo/bin/rust-analyzer`
+/// is often a rustup proxy that exits immediately if the component isn't installed.
+fn resolve_rust_analyzer() -> Option<(String, Vec<String>)> {
+    if let Ok(output) = std::process::Command::new("rustup")
+        .args(["which", "rust-analyzer"])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() && Path::new(&path).is_file() && probe_version(&path, &[]) {
+                return Some((path, vec![]));
+            }
+        }
+    }
+    // Fall back to PATH, but only if --version actually works (filters dead proxies).
+    first_which(&[("rust-analyzer", vec![])])
+}
+
 fn first_which(candidates: &[(&str, Vec<String>)]) -> Option<(String, Vec<String>)> {
     for (bin, args) in candidates {
         if let Ok(path) = which::which(bin) {
-            return Some((path.to_string_lossy().to_string(), args.clone()));
+            let p = path.to_string_lossy().to_string();
+            // Skip binaries that immediately fail (e.g. rustup proxy without component).
+            if probe_version(&p, args) {
+                return Some((p, args.clone()));
+            }
         }
     }
     None
+}
+
+/// True if `bin --version` (or `bin args --version`) exits 0 within a short timeout.
+fn probe_version(bin: &str, args: &[String]) -> bool {
+    let mut cmd = std::process::Command::new(bin);
+    for a in args {
+        // Don't pass --stdio to --version probes.
+        if a == "--stdio" {
+            continue;
+        }
+        cmd.arg(a);
+    }
+    cmd.arg("--version");
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    match cmd.output() {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
 }

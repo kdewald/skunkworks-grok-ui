@@ -106,7 +106,11 @@ export function FilesView() {
   const [draft, setDraft] = useState("");
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  /** Brief "Saved" flash after successful autosave / manual save. */
+  const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const autosaveTimer = useRef<number | null>(null);
+  const saveFileRef = useRef<() => Promise<void>>(async () => {});
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
   const [selection, setSelection] = useState<LineRange | null>(null);
@@ -263,8 +267,11 @@ export function FilesView() {
 
   const saveFile = useCallback(async () => {
     if (!activeProjectId || !activePath || !file || !canEdit || saving) return;
+    // Avoid no-op saves (e.g. autosave race after manual save).
+    if (!dirty && draft === file.content) return;
     setSaving(true);
     setSaveError(null);
+    setJustSaved(false);
     try {
       await invoke("write_workspace_file", {
         projectId: activeProjectId,
@@ -279,6 +286,8 @@ export function FilesView() {
         truncated: false,
       });
       setDirty(false);
+      setJustSaved(true);
+      window.setTimeout(() => setJustSaved(false), 1500);
       void lspDidSave(activePath, draft);
       void loadGitStatus();
     } catch (e) {
@@ -292,16 +301,38 @@ export function FilesView() {
     file,
     canEdit,
     saving,
+    dirty,
     draft,
     chatIdForFs,
     loadGitStatus,
   ]);
+
+  saveFileRef.current = () => saveFile();
+
+  /** Debounced autosave (~900ms after last edit). */
+  useEffect(() => {
+    if (!dirty || !canEdit || saving) return;
+    if (autosaveTimer.current != null) {
+      window.clearTimeout(autosaveTimer.current);
+    }
+    autosaveTimer.current = window.setTimeout(() => {
+      autosaveTimer.current = null;
+      void saveFileRef.current();
+    }, 900);
+    return () => {
+      if (autosaveTimer.current != null) {
+        window.clearTimeout(autosaveTimer.current);
+        autosaveTimer.current = null;
+      }
+    };
+  }, [draft, dirty, canEdit, saving, activePath]);
 
   const onDraftChange = useCallback(
     (value: string) => {
       setDraft(value);
       setDirty(value !== (file?.content ?? ""));
       setSaveError(null);
+      setJustSaved(false);
     },
     [file?.content],
   );
@@ -528,11 +559,17 @@ export function FilesView() {
                           : "ghost-btn compact"
                       }
                       onClick={() => void saveFile()}
-                      disabled={!dirty || saving}
-                      title="Save file (⌘S / Ctrl+S)"
+                      disabled={(!dirty && !justSaved) || saving}
+                      title="Autosaves after you pause typing; ⌘S / Ctrl+S saves now"
                     >
                       <Save size={14} strokeWidth={1.75} />
-                      {saving ? "Saving…" : "Save"}
+                      {saving
+                        ? "Saving…"
+                        : justSaved
+                          ? "Saved"
+                          : dirty
+                            ? "Save"
+                            : "Saved"}
                     </button>
                   )}
                   {selection && (
