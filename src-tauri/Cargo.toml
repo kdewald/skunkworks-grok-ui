@@ -1,6 +1,6 @@
 [package]
 name = "skunkworks-grok-ui"
-version = "0.5.3"
+version = "0.5.4"
 description = "Unofficial skunkworks desktop UI for Grok Build via ACP. Not affiliated with xAI."
 authors = ["kdewald"]
 license = "Apache-2.0"
@@ -16,6 +16,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+serde_json = "1"
+which = "8"
 
 [dependencies]
 tauri = { version = "2", features = [] }

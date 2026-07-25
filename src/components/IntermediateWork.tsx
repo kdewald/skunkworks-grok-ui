@@ -73,10 +73,24 @@ function PayloadView({ value, label }: { value: unknown; label: string }) {
   );
 }
 
-/** Visible thinking stream — distinct from assistant replies, content always readable. */
-function ThoughtStream({ text }: { text: string }) {
-  // Stay open while short; longer thoughts default open so nothing looks truncated.
-  const [open, setOpen] = useState(true);
+/** Visible thinking stream — distinct from assistant replies. */
+function ThoughtStream({
+  text,
+  defaultOpen,
+}: {
+  text: string;
+  /** Open while streaming; collapse when the turn is done so replies stay primary. */
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const prevDefault = useRef(defaultOpen);
+  useEffect(() => {
+    // Follow streaming → complete transition (collapse when turn settles).
+    if (prevDefault.current !== defaultOpen) {
+      setOpen(defaultOpen);
+      prevDefault.current = defaultOpen;
+    }
+  }, [defaultOpen]);
   if (!text.trim()) return null;
   return (
     <div className={`thought-stream ${open ? "is-open" : "is-closed"}`}>
@@ -346,8 +360,9 @@ function isSubagentRailTool(b: IntermediateBlock): boolean {
 }
 
 /**
- * Group intermediate into: thought streams (visible), work (tools/etc), messages.
- * Consecutive thoughts are merged so thinking reads as one stream.
+ * Group intermediate into: thought streams, work (tools/etc), messages.
+ * Consecutive same-kind runs merge; tools are hard boundaries.
+ * Do NOT reorder message↔thought (that made replies look "mixed into" thinking).
  */
 function buildTimeline(blocks: IntermediateBlock[]): TimelineRun[] {
   const runs: TimelineRun[] = [];
@@ -383,33 +398,7 @@ function buildTimeline(blocks: IntermediateBlock[]): TimelineRun[] {
       runs.push({ kind: "work", key: b.id, blocks: [b] });
     }
   }
-
-  // message → thought → message  ⇒  thought, then one merged message
-  const coalesced: TimelineRun[] = [];
-  for (let i = 0; i < runs.length; i++) {
-    const cur = runs[i];
-    const prev = coalesced[coalesced.length - 1];
-    const next = runs[i + 1];
-    if (
-      cur.kind === "thought" &&
-      prev?.kind === "message" &&
-      next?.kind === "message"
-    ) {
-      const msg = coalesced.pop();
-      if (msg?.kind === "message") {
-        coalesced.push(cur);
-        coalesced.push({
-          kind: "message",
-          key: msg.key,
-          text: msg.text + next.text,
-        });
-        i += 1;
-        continue;
-      }
-    }
-    coalesced.push(cur);
-  }
-  return coalesced;
+  return runs;
 }
 
 function WorkGroup({
@@ -507,7 +496,13 @@ export function IntermediateWork({ turn }: { turn: Turn }) {
           return <AssistantMessage key={run.key} text={run.text} />;
         }
         if (run.kind === "thought") {
-          return <ThoughtStream key={run.key} text={run.text} />;
+          return (
+            <ThoughtStream
+              key={run.key}
+              text={run.text}
+              defaultOpen={streaming}
+            />
+          );
         }
         const laterHasMessage = timeline
           .slice(idx + 1)

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## [0.5.4] — 2026-07-25
+
+### Fixed
+
+- Thinking stream no longer glues bare ACP tokens without spaces (`change`+`I` → `changeI`, `fontsGot it`)
+- Status-like monologue markers (`Got it`, `I found …`) split out of Thinking into the assistant message stream
+- Mid-answer thought chunks fold into the open message bubble
+- Thinking collapses when a turn finishes so replies stay primary
+- Timeline no longer reorders message↔thought runs
+
+### Added
+
+- Live ACP integration tests against `grok agent stdio` (`GROK_ACP_LIVE=1`)
+- Unit tests for thought/message stream assembly
+
+### Packaging
+
+- Version bump to 0.5.4
+
 ## [0.5.3] — 2026-07-24
 
 ### Added
