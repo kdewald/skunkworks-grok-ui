@@ -75,6 +75,7 @@ pub fn run() {
             commands::close_terminal,
             commands::list_workspace_dir,
             commands::read_workspace_file,
+            commands::write_workspace_file,
             commands::git_workspace_status,
         ])
         .run(tauri::generate_context!())

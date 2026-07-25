@@ -311,6 +311,23 @@ pub fn read_local(root: &Path, rel: &str) -> Result<WorkspaceFileContent, String
     })
 }
 
+/// Write UTF-8 text to a file under the local project root.
+pub fn write_local(root: &Path, rel: &str, content: &str) -> Result<(), String> {
+    let rel = normalize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("path is empty".into());
+    }
+    let file = join_root(root, &rel)?;
+    if file.exists() && !file.is_file() {
+        return Err(format!("not a file: {rel}"));
+    }
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    fs::write(&file, content.as_bytes()).map_err(|e| format!("write {rel}: {e}"))?;
+    Ok(())
+}
+
 pub fn list_remote(host: &str, root: &str, rel: &str) -> Result<WorkspaceListing, String> {
     let rel = normalize_rel(rel)?;
     // Build remote path. root may contain $HOME for scratch.
@@ -506,6 +523,60 @@ head -c {} "$target"
         binary: false,
         language,
     })
+}
+
+/// Write UTF-8 text to a remote path over SSH (stdin → cat).
+pub fn write_remote(host: &str, root: &str, rel: &str, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let rel = normalize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("path is empty".into());
+    }
+    let remote_path = if root.contains("$HOME") {
+        format!("{root}/{rel}")
+    } else {
+        format!("{}/{rel}", root.trim_end_matches('/'))
+    };
+
+    let portable = format!(
+        r#"set -e
+target={}
+target=$(eval echo "$target")
+mkdir -p "$(dirname "$target")"
+cat > "$target"
+"#,
+        shell_single_quote(&remote_path)
+    );
+
+    let mut child = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host])
+        .arg(format!("bash -lc {}", shell_single_quote(&portable)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh write spawn: {e}"))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "ssh write: stdin missing".to_string())?;
+        stdin
+            .write_all(content.as_bytes())
+            .map_err(|e| format!("ssh write stdin: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("ssh write wait: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh write failed: {}", err.trim()));
+    }
+    Ok(())
 }
 
 /// Ensure relative path components are safe (used in tests / helpers).

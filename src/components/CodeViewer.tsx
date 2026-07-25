@@ -8,7 +8,11 @@ import {
   drawSelection,
   keymap,
 } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+} from "@codemirror/commands";
 import { bracketMatching, foldGutter } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { loadLanguageSupport, resolveLanguageKey } from "../languages";
@@ -20,8 +24,11 @@ type Props = {
   /** Backend language id and/or path for extension mapping. */
   language?: string;
   path?: string;
+  editable?: boolean;
+  onChange?: (value: string) => void;
   onSelectionChange?: (range: LineRange | null) => void;
   onContextMenu?: (e: MouseEvent, range: LineRange | null) => void;
+  onSave?: () => void;
 };
 
 /** Align One Dark base with our Ghostty palette (highlight colors come from oneDark). */
@@ -79,17 +86,25 @@ export function CodeViewer({
   content,
   language,
   path,
+  editable = false,
+  onChange,
   onSelectionChange,
   onContextMenu,
+  onSave,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onSelRef = useRef(onSelectionChange);
   const onCtxRef = useRef(onContextMenu);
+  const onChangeRef = useRef(onChange);
+  const onSaveRef = useRef(onSave);
+  const suppressChangeRef = useRef(false);
   onSelRef.current = onSelectionChange;
   onCtxRef.current = onContextMenu;
+  onChangeRef.current = onChange;
+  onSaveRef.current = onSave;
 
-  // Recreate editor when path, language, or content identity changes.
+  // Recreate editor when path / language / editable mode changes (not every keystroke).
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -102,8 +117,15 @@ export function CodeViewer({
       if (cancelled || !hostRef.current) return;
 
       const updateListener = EditorView.updateListener.of((update) => {
-        if (update.selectionSet || update.docChanged) {
+        if (update.selectionSet) {
           onSelRef.current?.(lineRangeFromState(update.state));
+        }
+        if (update.docChanged) {
+          if (suppressChangeRef.current) {
+            suppressChangeRef.current = false;
+            return;
+          }
+          onChangeRef.current?.(update.state.doc.toString());
         }
       });
 
@@ -116,7 +138,16 @@ export function CodeViewer({
         },
       });
 
-      // oneDark already includes syntaxHighlighting(oneDarkHighlightStyle).
+      const saveKey = keymap.of([
+        {
+          key: "Mod-s",
+          run: () => {
+            onSaveRef.current?.();
+            return true;
+          },
+        },
+      ]);
+
       const extensions: Extension[] = [
         lineNumbers(),
         highlightActiveLine(),
@@ -126,9 +157,11 @@ export function CodeViewer({
         bracketMatching(),
         history(),
         keymap.of([...defaultKeymap, ...historyKeymap]),
+        saveKey,
         oneDark,
         grokEditorTheme,
-        EditorState.readOnly.of(true),
+        EditorState.readOnly.of(!editable),
+        EditorView.editable.of(editable),
         EditorView.lineWrapping,
         updateListener,
         contextHandler,
@@ -148,15 +181,27 @@ export function CodeViewer({
 
     return () => {
       cancelled = true;
-      // Always tear down whatever is mounted (local `view` may still be null
-      // if cleanup runs mid-async load).
       if (viewRef.current) {
         viewRef.current.destroy();
         viewRef.current = null;
       }
       host.replaceChildren();
     };
-  }, [language, path, content]);
+    // Intentionally omit `content` — parent drives doc updates via the effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [language, path, editable]);
+
+  // Sync external content (open another file / discard / after save) without full remount.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const cur = view.state.doc.toString();
+    if (cur === content) return;
+    suppressChangeRef.current = true;
+    view.dispatch({
+      changes: { from: 0, to: cur.length, insert: content },
+    });
+  }, [content]);
 
   return <div className="code-viewer-host" ref={hostRef} />;
 }

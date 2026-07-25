@@ -17,6 +17,7 @@ import {
   FolderPlus,
   MessageSquarePlus,
   RefreshCw,
+  Save,
 } from "lucide-react";
 import { useAppStore } from "../store";
 import { chipId } from "../contextChips";
@@ -115,6 +116,11 @@ export function FilesView() {
   const [remote, setRemote] = useState(false);
   const [activePath, setActivePath] = useState<string | null>(null);
   const [file, setFile] = useState<WorkspaceFileContent | null>(null);
+  /** Working buffer for the open file (may differ from disk when dirty). */
+  const [draft, setDraft] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
   const [selection, setSelection] = useState<LineRange | null>(null);
@@ -241,7 +247,9 @@ export function FilesView() {
       setActivePath(path);
       setFileLoading(true);
       setFileError(null);
+      setSaveError(null);
       setSelection(null);
+      setDirty(false);
       try {
         const content = await invoke<WorkspaceFileContent>(
           "read_workspace_file",
@@ -252,14 +260,63 @@ export function FilesView() {
           },
         );
         setFile(content);
+        setDraft(content.binary ? "" : content.content);
       } catch (e) {
         setFile(null);
+        setDraft("");
         setFileError(String(e));
       } finally {
         setFileLoading(false);
       }
     },
     [activeProjectId, chatIdForFs],
+  );
+
+  const canEdit =
+    !!file && !file.binary && !file.truncated && !fileLoading;
+
+  const saveFile = useCallback(async () => {
+    if (!activeProjectId || !activePath || !file || !canEdit || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await invoke("write_workspace_file", {
+        projectId: activeProjectId,
+        path: activePath,
+        content: draft,
+        chatId: chatIdForFs,
+      });
+      setFile({
+        ...file,
+        content: draft,
+        size: new TextEncoder().encode(draft).length,
+        truncated: false,
+      });
+      setDirty(false);
+      void loadGitStatus();
+    } catch (e) {
+      setSaveError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    activeProjectId,
+    activePath,
+    file,
+    canEdit,
+    saving,
+    draft,
+    chatIdForFs,
+    loadGitStatus,
+  ]);
+
+  const onDraftChange = useCallback(
+    (value: string) => {
+      setDraft(value);
+      setDirty(value !== (file?.content ?? ""));
+      setSaveError(null);
+    },
+    [file?.content],
   );
 
   function toggleDir(path: string) {
@@ -460,6 +517,7 @@ export function FilesView() {
               <div className="file-viewer-bar">
                 <div className="file-viewer-path mono" title={activePath}>
                   {activePath}
+                  {dirty && <span className="file-badge dirty">edited</span>}
                   {!file.binary && file.language && file.language !== "text" && (
                     <span className="file-badge lang">{file.language}</span>
                   )}
@@ -498,6 +556,22 @@ export function FilesView() {
                       ))}
                     </div>
                   )}
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className={
+                        dirty
+                          ? "ghost-btn compact is-save-dirty"
+                          : "ghost-btn compact"
+                      }
+                      onClick={() => void saveFile()}
+                      disabled={!dirty || saving}
+                      title="Save file (⌘S / Ctrl+S)"
+                    >
+                      <Save size={14} strokeWidth={1.75} />
+                      {saving ? "Saving…" : "Save"}
+                    </button>
+                  )}
                   {selection && (
                     <button
                       type="button"
@@ -513,7 +587,7 @@ export function FilesView() {
                     <button
                       type="button"
                       className="ghost-btn compact"
-                      onClick={() => addFileChip(activePath, file.content)}
+                      onClick={() => addFileChip(activePath, draft)}
                       title="Add this file to chat context"
                     >
                       <FilePlus2 size={14} strokeWidth={1.75} />
@@ -529,6 +603,17 @@ export function FilesView() {
                   </button>
                 </div>
               </div>
+              {saveError && (
+                <div className="file-save-error" role="alert">
+                  {saveError}
+                </div>
+              )}
+              {file.truncated && !file.binary && (
+                <div className="file-save-error muted" role="status">
+                  File is truncated in the preview — open it externally to edit
+                  the full contents.
+                </div>
+              )}
               {file.binary ? (
                 <div className="file-viewer-empty">
                   Binary file ({formatBytes(file.size)}). Add the path from the
@@ -538,9 +623,12 @@ export function FilesView() {
                 <div className="editor-compare">
                   <div className="editor-compare-pane">
                     <CodeViewer
-                      content={file.content}
+                      content={draft}
                       language={file.language}
                       path={activePath}
+                      editable={canEdit}
+                      onChange={onDraftChange}
+                      onSave={() => void saveFile()}
                       onSelectionChange={setSelection}
                       onContextMenu={(e, range) => openViewerCtx(e, range)}
                     />
@@ -549,9 +637,12 @@ export function FilesView() {
                   <div className="editor-compare-divider" aria-hidden />
                   <div className="editor-compare-pane">
                     <MonacoViewer
-                      content={file.content}
+                      content={draft}
                       language={file.language}
                       path={activePath}
+                      editable={canEdit}
+                      onChange={onDraftChange}
+                      onSave={() => void saveFile()}
                       onSelectionChange={setSelection}
                       onContextMenu={(e, range) => openViewerCtx(e, range)}
                     />
@@ -560,17 +651,23 @@ export function FilesView() {
                 </div>
               ) : editorEngine === "monaco" ? (
                 <MonacoViewer
-                  content={file.content}
+                  content={draft}
                   language={file.language}
                   path={activePath}
+                  editable={canEdit}
+                  onChange={onDraftChange}
+                  onSave={() => void saveFile()}
                   onSelectionChange={setSelection}
                   onContextMenu={(e, range) => openViewerCtx(e, range)}
                 />
               ) : (
                 <CodeViewer
-                  content={file.content}
+                  content={draft}
                   language={file.language}
                   path={activePath}
+                  editable={canEdit}
+                  onChange={onDraftChange}
+                  onSave={() => void saveFile()}
                   onSelectionChange={setSelection}
                   onContextMenu={(e, range) => openViewerCtx(e, range)}
                 />

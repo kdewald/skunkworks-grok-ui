@@ -1368,6 +1368,35 @@ button {
   padding: 1px 6px;
 }
 
+.file-badge.dirty {
+  color: #1d1f21;
+  background: var(--accent);
+}
+
+.ghost-btn.compact.is-save-dirty {
+  color: #1d1f21;
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.ghost-btn.compact.is-save-dirty:disabled {
+  opacity: 0.7;
+}
+
+.file-save-error {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--danger, #cc6666);
+  background: rgba(204, 102, 102, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.file-save-error.muted {
+  color: var(--text-dim);
+  background: transparent;
+}
+
 .file-viewer-actions {
   display: flex;
   align-items: center;

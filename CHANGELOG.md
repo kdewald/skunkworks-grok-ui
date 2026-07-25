@@ -5,6 +5,7 @@
 ### Added
 
 - Files viewer: optional **Monaco** editor alongside CodeMirror (toggle CM / Monaco / Both; preference persisted)
+- Files viewer: edit + save text files (⌘S / Ctrl+S; local and SSH workspaces)
 
 ## [0.5.4] — 2026-07-25
 

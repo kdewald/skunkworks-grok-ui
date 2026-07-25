@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { resolveMonacoLanguage } from "../monacoLanguages";
@@ -8,8 +8,13 @@ type Props = {
   content: string;
   language?: string;
   path?: string;
+  /** When false (default for binary/truncated), editing is disabled. */
+  editable?: boolean;
+  onChange?: (value: string) => void;
   onSelectionChange?: (range: LineRange | null) => void;
   onContextMenu?: (e: MouseEvent, range: LineRange | null) => void;
+  /** Cmd/Ctrl+S */
+  onSave?: () => void;
   /** Optional label strip (used in compare mode). */
   label?: string;
 };
@@ -20,7 +25,6 @@ function lineRangeFromEditor(
   const sel = ed.getSelection();
   if (!sel || sel.isEmpty()) return null;
   const start = Math.min(sel.startLineNumber, sel.endLineNumber);
-  // Monaco end column 1 on a lower line means the previous line is the last full line.
   let end = Math.max(sel.startLineNumber, sel.endLineNumber);
   if (
     sel.endLineNumber > sel.startLineNumber &&
@@ -33,43 +37,74 @@ function lineRangeFromEditor(
 }
 
 /**
- * Read-only Monaco file viewer — same surface API as CodeViewer for A/B compare.
- * CodeMirror remains the default; this path is for side-by-side evaluation.
+ * Monaco file viewer/editor — same surface API as CodeViewer for A/B compare.
  */
 export function MonacoViewer({
   content,
   language,
   path,
+  editable = false,
+  onChange,
   onSelectionChange,
   onContextMenu,
+  onSave,
   label,
 }: Props) {
   const edRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const onSelRef = useRef(onSelectionChange);
   const onCtxRef = useRef(onContextMenu);
+  const onChangeRef = useRef(onChange);
+  const onSaveRef = useRef(onSave);
   onSelRef.current = onSelectionChange;
   onCtxRef.current = onContextMenu;
+  onChangeRef.current = onChange;
+  onSaveRef.current = onSave;
+
+  // Avoid feedback loops when parent pushes the same content after save.
+  const lastEmitted = useRef(content);
 
   const monacoLang = useMemo(
     () => resolveMonacoLanguage(language, path),
     [language, path],
   );
 
-  const handleMount = useCallback<OnMount>((ed) => {
-    edRef.current = ed;
-    ed.onDidChangeCursorSelection(() => {
-      onSelRef.current?.(lineRangeFromEditor(ed));
+  const handleMount = useCallback<OnMount>(
+    (ed, monaco) => {
+      edRef.current = ed;
+      lastEmitted.current = ed.getValue();
+
+      ed.onDidChangeCursorSelection(() => {
+        onSelRef.current?.(lineRangeFromEditor(ed));
+      });
+      ed.onDidChangeModelContent(() => {
+        const v = ed.getValue();
+        if (v === lastEmitted.current) return;
+        lastEmitted.current = v;
+        onChangeRef.current?.(v);
+      });
+      ed.onContextMenu((e) => {
+        const dom = e.event?.browserEvent as MouseEvent | undefined;
+        if (dom) {
+          onCtxRef.current?.(dom, lineRangeFromEditor(ed));
+          dom.preventDefault();
+          dom.stopPropagation();
+        }
+      });
+
+      ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+        onSaveRef.current?.();
+      });
+    },
+    [],
+  );
+
+  // Keep readOnly in sync without remounting.
+  useEffect(() => {
+    edRef.current?.updateOptions({
+      readOnly: !editable,
+      domReadOnly: !editable,
     });
-    ed.onContextMenu((e) => {
-      // Monaco's event is editor-relative; use the browser event when present.
-      const dom = e.event?.browserEvent as MouseEvent | undefined;
-      if (dom) {
-        onCtxRef.current?.(dom, lineRangeFromEditor(ed));
-        dom.preventDefault();
-        dom.stopPropagation();
-      }
-    });
-  }, []);
+  }, [editable]);
 
   return (
     <div className="code-viewer-host monaco-viewer-host">
@@ -83,8 +118,8 @@ export function MonacoViewer({
         path={path ?? undefined}
         onMount={handleMount}
         options={{
-          readOnly: true,
-          domReadOnly: true,
+          readOnly: !editable,
+          domReadOnly: !editable,
           minimap: { enabled: false },
           fontSize: 12.5,
           fontFamily:
