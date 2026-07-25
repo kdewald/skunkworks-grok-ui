@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Files viewer: optional **Monaco** editor alongside CodeMirror (toggle CM / Monaco / Both; preference persisted)
+
 ## [0.5.4] — 2026-07-25
 
 ### Fixed

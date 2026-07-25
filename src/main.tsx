@@ -1,4 +1,5 @@
 import ReactDOM from "react-dom/client";
+import "./monacoEnv";
 import App from "./App";
 import { handleExternalAnchorClick } from "./openExternal";
 
