@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.6.0] — 2026-07-25
 
 ### Added
 
@@ -14,6 +14,17 @@
   - Completions, hover, go-to-definition, diagnostics (when servers are installed)
   - Status chip in the file bar when an LSP attaches
 - Files editor **autosave** (~900ms after you stop typing); Save button still available
+- Monaco context menu actions: **Add Selection to Chat** / **Add File to Chat** (alongside Go to Definition)
+
+### Fixed
+
+- Go-to-definition / hover / completions when Monaco model URIs were workspace-relative while LSP used absolute `file://` paths
+- Append-to-chat from the editor: custom overlay was hidden under Monaco’s context menu; actions now live in Monaco’s menu
+- Selection context chips use the live draft buffer, not a stale disk snapshot
+
+### Packaging
+
+- Version bump to 0.6.0
 
 ## [0.5.4] — 2026-07-25
 

@@ -8,21 +8,35 @@ import {
   lspDidChange,
   lspDidOpen,
   lspDidSave,
+  monacoModelPath,
 } from "../lsp/client";
 
 type Props = {
   content: string;
   language?: string;
+  /** Workspace-relative path (used for LSP didOpen / didChange). */
   path?: string;
+  /**
+   * Absolute filesystem path for the Monaco model URI. Must match the LSP
+   * file:// URI or go-to-definition / diagnostics won't attach to the model.
+   * When omitted, falls back to `monacoModelPath(path)` once the LSP workspace is set.
+   */
+  modelPath?: string;
   /** When false (default for binary/truncated), editing is disabled. */
   editable?: boolean;
   onChange?: (value: string) => void;
   onSelectionChange?: (range: LineRange | null) => void;
-  onContextMenu?: (e: MouseEvent, range: LineRange | null) => void;
   /** Cmd/Ctrl+S */
   onSave?: () => void;
   /** Fired when LSP attach status changes (for status UI). */
   onLspStatus?: (msg: string | null) => void;
+  /**
+   * Context-menu / action: add the current non-empty line selection to chat.
+   * Wired into Monaco's own context menu so it sits next to Go to Definition.
+   */
+  onAddSelectionToChat?: (range: LineRange) => void;
+  /** Context-menu / action: add the whole file to chat. */
+  onAddFileToChat?: () => void;
 };
 
 function lineRangeFromEditor(
@@ -49,24 +63,28 @@ export function MonacoViewer({
   content,
   language,
   path,
+  modelPath: modelPathProp,
   editable = false,
   onChange,
   onSelectionChange,
-  onContextMenu,
   onSave,
   onLspStatus,
+  onAddSelectionToChat,
+  onAddFileToChat,
 }: Props) {
   const edRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const onSelRef = useRef(onSelectionChange);
-  const onCtxRef = useRef(onContextMenu);
   const onChangeRef = useRef(onChange);
   const onSaveRef = useRef(onSave);
   const onLspRef = useRef(onLspStatus);
+  const onAddSelRef = useRef(onAddSelectionToChat);
+  const onAddFileRef = useRef(onAddFileToChat);
   onSelRef.current = onSelectionChange;
-  onCtxRef.current = onContextMenu;
   onChangeRef.current = onChange;
   onSaveRef.current = onSave;
   onLspRef.current = onLspStatus;
+  onAddSelRef.current = onAddSelectionToChat;
+  onAddFileRef.current = onAddFileToChat;
 
   const lastEmitted = useRef(content);
   const pathRef = useRef(path);
@@ -75,6 +93,12 @@ export function MonacoViewer({
   const monacoLang = useMemo(
     () => resolveMonacoLanguage(language, path),
     [language, path],
+  );
+
+  // Absolute FS path so Monaco model URI matches LSP file:// (relative paths break go-to-def).
+  const modelPath = useMemo(
+    () => modelPathProp ?? monacoModelPath(path) ?? path,
+    [modelPathProp, path],
   );
 
   const handleMount = useCallback<OnMount>((ed, monaco) => {
@@ -94,17 +118,34 @@ export function MonacoViewer({
         lspDidChange(pathRef.current, v);
       }
     });
-    ed.onContextMenu((e) => {
-      const dom = e.event?.browserEvent as MouseEvent | undefined;
-      if (dom) {
-        onCtxRef.current?.(dom, lineRangeFromEditor(ed));
-        dom.preventDefault();
-        dom.stopPropagation();
-      }
-    });
 
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       onSaveRef.current?.();
+    });
+
+    // Register in Monaco's own context menu (sits with Go to Definition).
+    // A separate overlay menu was buried under Monaco's z-index ~10000 layer.
+    ed.addAction({
+      id: "skunkworks.addSelectionToChat",
+      label: "Add Selection to Chat",
+      contextMenuGroupId: "9_skunkworks",
+      contextMenuOrder: 1,
+      precondition: "editorHasSelection",
+      run: (editor) => {
+        const range = lineRangeFromEditor(
+          editor as MonacoEditor.IStandaloneCodeEditor,
+        );
+        if (range) onAddSelRef.current?.(range);
+      },
+    });
+    ed.addAction({
+      id: "skunkworks.addFileToChat",
+      label: "Add File to Chat",
+      contextMenuGroupId: "9_skunkworks",
+      contextMenuOrder: 2,
+      run: () => {
+        onAddFileRef.current?.();
+      },
     });
   }, []);
 
@@ -147,8 +188,6 @@ export function MonacoViewer({
     };
   }, [path, language, monacoLang]); // content only on open — not every keystroke
 
-  // Notify parent save path to also call lspDidSave externally.
-
   return (
     <div className="code-viewer-host monaco-viewer-host">
       <Editor
@@ -157,7 +196,7 @@ export function MonacoViewer({
         theme="vs-dark"
         language={monacoLang}
         value={content}
-        path={path ?? undefined}
+        path={modelPath ?? undefined}
         onMount={handleMount}
         options={{
           readOnly: !editable,

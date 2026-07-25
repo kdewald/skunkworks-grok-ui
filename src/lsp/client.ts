@@ -7,6 +7,11 @@
  *  - syncs textDocument didOpen/didChange/didSave
  *  - registers Monaco completion / hover / definition
  *  - applies publishDiagnostics as model markers
+ *
+ * URI alignment: Monaco models must use absolute file paths so their
+ * `file://` URIs match what we send to the language server. Relative
+ * workspace paths produce models like `file:///src/foo.rs` that never
+ * match openDocs / definition targets.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -30,15 +35,23 @@ type Ctx = {
   remote: boolean;
 };
 
+type OpenDoc = {
+  serverId: LspServerId;
+  version: number;
+  languageId: string;
+  /** Workspace-relative path used by the Files UI. */
+  relPath: string;
+};
+
 let monacoApi: typeof Monaco | null = null;
 let ctx: Ctx | null = null;
 let unlistenNotif: UnlistenFn | null = null;
 let providersRegistered = false;
-const openDocs = new Map<
-  string,
-  { serverId: LspServerId; version: number; languageId: string }
->();
-const changeTimers = new Map<string, number>();
+
+/** LSP file:// URI → open doc metadata. */
+const openDocs = new Map<string, OpenDoc>();
+/** Workspace-relative path → LSP file:// URI. */
+const uriByRelPath = new Map<string, string>();
 
 function languageIdForMonaco(monacoLang: string): string {
   // LSP textDocument languageId
@@ -49,17 +62,75 @@ function languageIdForMonaco(monacoLang: string): string {
   return monacoLang;
 }
 
+/** Normalize path separators and collapse trailing slash (except root). */
+function normPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+}
+
+/** file:///Users/foo/bar → /Users/foo/bar ; file://localhost/Users/... handled. */
+function fileUriToFsPath(uri: string): string {
+  let u = uri;
+  try {
+    u = decodeURIComponent(uri);
+  } catch {
+    /* keep raw */
+  }
+  if (u.startsWith("file://")) {
+    let rest = u.slice("file://".length);
+    // file:///Users/... → /Users/...
+    // file://localhost/Users/... → /Users/...
+    if (rest.startsWith("localhost")) rest = rest.slice("localhost".length);
+    if (!rest.startsWith("/")) rest = `/${rest}`;
+    // Windows file:///C:/... → C:/...
+    if (/^\/[A-Za-z]:\//.test(rest)) rest = rest.slice(1);
+    return rest;
+  }
+  return u;
+}
+
+/** Absolute FS path for a workspace-relative path, or null if no local LSP ctx. */
+export function lspAbsPath(relPath: string): string | null {
+  if (!ctx || ctx.remote) return null;
+  const root = normPath(ctx.rootAbs);
+  const rel = relPath.replace(/\\/g, "/").replace(/^\/+/, "");
+  return rel ? `${root}/${rel}` : root;
+}
+
+/** Absolute path string suitable for Monaco `path` prop (aligns model URI with LSP). */
+export function monacoModelPath(relPath: string | undefined | null): string | undefined {
+  if (!relPath) return undefined;
+  return lspAbsPath(relPath) ?? relPath;
+}
+
 export async function lspListStatus(): Promise<LspServerStatus[]> {
   return invoke<LspServerStatus[]>("lsp_status");
 }
 
+/** Configure local workspace for LSP. Returns absolute root, or null if remote/unavailable. */
 export async function setLspWorkspace(opts: {
   projectId: string;
   chatId?: string | null;
   remote: boolean;
-}): Promise<void> {
+}): Promise<string | null> {
+  // Close tracked docs when switching workspace (best-effort).
+  const prevUris = [...openDocs.keys()];
+  for (const uri of prevUris) {
+    const doc = openDocs.get(uri);
+    if (!doc) continue;
+    try {
+      await invoke("lsp_notify", {
+        serverId: doc.serverId,
+        method: "textDocument/didClose",
+        params: { textDocument: { uri } },
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+  openDocs.clear();
+  uriByRelPath.clear();
   ctx = null;
-  if (opts.remote) return;
+  if (opts.remote) return null;
   try {
     const rootAbs = await invoke<string>("get_workspace_abs_root", {
       projectId: opts.projectId,
@@ -68,11 +139,13 @@ export async function setLspWorkspace(opts: {
     ctx = {
       projectId: opts.projectId,
       chatId: opts.chatId ?? null,
-      rootAbs,
+      rootAbs: normPath(rootAbs),
       remote: false,
     };
+    return ctx.rootAbs;
   } catch {
     ctx = null;
+    return null;
   }
 }
 
@@ -124,7 +197,31 @@ export async function lspDidOpen(opts: {
     });
 
     const languageId = languageIdForMonaco(opts.monacoLanguage);
-    openDocs.set(uri, { serverId, version: 1, languageId });
+    const existing = openDocs.get(uri);
+    if (existing) {
+      // Already open — re-sync full text via didChange so the server matches the editor.
+      existing.version += 1;
+      existing.languageId = languageId;
+      existing.relPath = opts.path;
+      await invoke("lsp_notify", {
+        serverId: existing.serverId,
+        method: "textDocument/didChange",
+        params: {
+          textDocument: { uri, version: existing.version },
+          contentChanges: [{ text: opts.content }],
+        },
+      });
+      uriByRelPath.set(opts.path, uri);
+      return { serverId, status };
+    }
+
+    openDocs.set(uri, {
+      serverId,
+      version: 1,
+      languageId,
+      relPath: opts.path,
+    });
+    uriByRelPath.set(opts.path, uri);
 
     await invoke("lsp_notify", {
       serverId,
@@ -157,14 +254,41 @@ export function lspDidChange(uriOrPath: string, text: string): void {
   );
 }
 
-async function flushDidChange(path: string, text: string): Promise<void> {
-  if (!ctx) return;
+const changeTimers = new Map<string, number>();
+
+async function resolveUriFromPathOrUri(pathOrUri: string): Promise<string | null> {
+  if (pathOrUri.startsWith("file:")) {
+    if (openDocs.has(pathOrUri)) return pathOrUri;
+    const decoded = (() => {
+      try {
+        return decodeURIComponent(pathOrUri);
+      } catch {
+        return pathOrUri;
+      }
+    })();
+    if (openDocs.has(decoded)) return decoded;
+  }
+  // Workspace-relative path
+  const byRel = uriByRelPath.get(pathOrUri);
+  if (byRel) return byRel;
+  if (!ctx) return null;
   try {
     const uri = await invoke<string>("lsp_file_uri", {
       projectId: ctx.projectId,
-      path,
+      path: pathOrUri,
       chatId: ctx.chatId,
     });
+    return uri;
+  } catch {
+    return null;
+  }
+}
+
+async function flushDidChange(path: string, text: string): Promise<void> {
+  if (!ctx) return;
+  try {
+    const uri = await resolveUriFromPathOrUri(path);
+    if (!uri) return;
     const doc = openDocs.get(uri);
     if (!doc) return;
     doc.version += 1;
@@ -184,11 +308,8 @@ async function flushDidChange(path: string, text: string): Promise<void> {
 export async function lspDidSave(path: string, text: string): Promise<void> {
   if (!ctx) return;
   try {
-    const uri = await invoke<string>("lsp_file_uri", {
-      projectId: ctx.projectId,
-      path,
-      chatId: ctx.chatId,
-    });
+    const uri = await resolveUriFromPathOrUri(path);
+    if (!uri) return;
     const doc = openDocs.get(uri);
     if (!doc) return;
     await invoke("lsp_notify", {
@@ -207,14 +328,12 @@ export async function lspDidSave(path: string, text: string): Promise<void> {
 export async function lspDidClose(path: string): Promise<void> {
   if (!ctx) return;
   try {
-    const uri = await invoke<string>("lsp_file_uri", {
-      projectId: ctx.projectId,
-      path,
-      chatId: ctx.chatId,
-    });
+    const uri = await resolveUriFromPathOrUri(path);
+    if (!uri) return;
     const doc = openDocs.get(uri);
     if (!doc) return;
     openDocs.delete(uri);
+    uriByRelPath.delete(doc.relPath);
     await invoke("lsp_notify", {
       serverId: doc.serverId,
       method: "textDocument/didClose",
@@ -238,18 +357,44 @@ type DiagnosticsParams = {
   }>;
 };
 
+function findModelForLspUri(
+  monaco: typeof Monaco,
+  lspUri: string,
+): Monaco.editor.ITextModel | null {
+  const models = monaco.editor.getModels();
+  const targetFs = normPath(fileUriToFsPath(lspUri));
+  const targetUriStr = lspUri;
+
+  for (const m of models) {
+    const mu = m.uri.toString();
+    if (mu === targetUriStr) return m;
+    try {
+      if (decodeURIComponent(mu) === targetUriStr) return m;
+    } catch {
+      /* ignore */
+    }
+    const mFs = normPath(m.uri.scheme === "file" ? m.uri.path : fileUriToFsPath(mu));
+    if (mFs === targetFs) return m;
+    // Suffix match: relative model path vs absolute LSP uri
+    if (targetFs.endsWith(mFs) || mFs.endsWith(targetFs)) return m;
+  }
+
+  // Match via openDocs relPath
+  const doc = openDocs.get(lspUri);
+  if (doc) {
+    for (const m of models) {
+      const p = m.uri.path.replace(/\\/g, "/");
+      if (p.endsWith("/" + doc.relPath) || p === "/" + doc.relPath || p === doc.relPath) {
+        return m;
+      }
+    }
+  }
+  return null;
+}
+
 function applyDiagnostics(params: DiagnosticsParams): void {
   if (!monacoApi) return;
-  const model = monacoApi.editor
-    .getModels()
-    .find((m) => m.uri.toString() === params.uri || m.uri.toString() === decodeURI(params.uri));
-  // Also match by path suffix — Monaco model URIs may differ slightly
-  const model2 =
-    model ??
-    monacoApi.editor.getModels().find((m) => {
-      const u = m.uri.toString();
-      return params.uri.endsWith(m.uri.path) || u.endsWith(params.uri.replace("file://", ""));
-    });
+  const model2 = findModelForLspUri(monacoApi, params.uri);
   if (!model2) return;
 
   const sev = monacoApi.MarkerSeverity;
@@ -285,17 +430,15 @@ function registerProviders(monaco: typeof Monaco): void {
   monaco.languages.registerCompletionItemProvider(selector as never, {
     triggerCharacters: [".", ":", "<", '"', "'", "/", "@"],
     provideCompletionItems: async (model, position) => {
-      const result = await lspRequestForModel(
-        model,
-        "textDocument/completion",
-        {
-          textDocument: { uri: await modelUri(model) },
-          position: {
-            line: position.lineNumber - 1,
-            character: position.column - 1,
-          },
+      const uri = resolveModelLspUri(model);
+      if (!uri) return { suggestions: [] };
+      const result = await lspRequestForUri(uri, "textDocument/completion", {
+        textDocument: { uri },
+        position: {
+          line: position.lineNumber - 1,
+          character: position.column - 1,
         },
-      );
+      });
       if (!result) return { suggestions: [] };
       const items = Array.isArray(result)
         ? result
@@ -333,8 +476,10 @@ function registerProviders(monaco: typeof Monaco): void {
 
   monaco.languages.registerHoverProvider(selector as never, {
     provideHover: async (model, position) => {
-      const result = await lspRequestForModel(model, "textDocument/hover", {
-        textDocument: { uri: await modelUri(model) },
+      const uri = resolveModelLspUri(model);
+      if (!uri) return null;
+      const result = await lspRequestForUri(uri, "textDocument/hover", {
+        textDocument: { uri },
         position: {
           line: position.lineNumber - 1,
           character: position.column - 1,
@@ -350,22 +495,20 @@ function registerProviders(monaco: typeof Monaco): void {
 
   monaco.languages.registerDefinitionProvider(selector as never, {
     provideDefinition: async (model, position) => {
-      const result = await lspRequestForModel(
-        model,
-        "textDocument/definition",
-        {
-          textDocument: { uri: await modelUri(model) },
-          position: {
-            line: position.lineNumber - 1,
-            character: position.column - 1,
-          },
+      const uri = resolveModelLspUri(model);
+      if (!uri) return null;
+      const result = await lspRequestForUri(uri, "textDocument/definition", {
+        textDocument: { uri },
+        position: {
+          line: position.lineNumber - 1,
+          character: position.column - 1,
         },
-      );
+      });
       if (!result) return null;
       const locs = Array.isArray(result) ? result : [result];
       return (locs as Array<Record<string, unknown>>)
         .map((loc) => {
-          const target = (loc.targetUri ? loc : loc) as {
+          const target = loc as {
             uri?: string;
             targetUri?: string;
             range?: {
@@ -376,12 +519,22 @@ function registerProviders(monaco: typeof Monaco): void {
               start: { line: number; character: number };
               end: { line: number; character: number };
             };
+            targetSelectionRange?: {
+              start: { line: number; character: number };
+              end: { line: number; character: number };
+            };
           };
-          const uri = target.targetUri ?? target.uri;
-          const range = target.targetRange ?? target.range;
-          if (!uri || !range) return null;
+          const targetUri = target.targetUri ?? target.uri;
+          const range =
+            target.targetSelectionRange ?? target.targetRange ?? target.range;
+          if (!targetUri || !range) return null;
+
+          // Prefer an already-loaded Monaco model so go-to-def actually navigates.
+          const existing = findModelForLspUri(monaco, targetUri);
+          const monacoUri = existing?.uri ?? monaco.Uri.parse(targetUri);
+
           return {
-            uri: monaco.Uri.parse(uri),
+            uri: monacoUri,
             range: {
               startLineNumber: range.start.line + 1,
               startColumn: range.start.character + 1,
@@ -395,26 +548,60 @@ function registerProviders(monaco: typeof Monaco): void {
   });
 }
 
-async function modelUri(model: Monaco.editor.ITextModel): Promise<string> {
-  // Prefer LSP-tracked file URI if we opened via workspace path.
-  // Monaco model uri may be inmemory:// or file:// from path prop.
+/**
+ * Map a Monaco model to the LSP file:// URI we used in didOpen.
+ * Never trust model.uri alone when it is a relative-looking file URI.
+ */
+function resolveModelLspUri(model: Monaco.editor.ITextModel): string | null {
   const u = model.uri.toString();
-  if (u.startsWith("file:")) return u;
-  // Fallback: match openDocs by path suffix
-  for (const [uri] of openDocs) {
-    if (uri.endsWith(model.uri.path) || model.uri.path.endsWith(uri.replace(/^file:\/\//, ""))) {
+  if (openDocs.has(u)) return u;
+  try {
+    const decoded = decodeURIComponent(u);
+    if (openDocs.has(decoded)) return decoded;
+  } catch {
+    /* ignore */
+  }
+
+  const modelFs = normPath(
+    model.uri.scheme === "file" ? model.uri.path : fileUriToFsPath(u),
+  );
+
+  for (const [uri, doc] of openDocs) {
+    const abs = normPath(fileUriToFsPath(uri));
+    if (abs === modelFs) return uri;
+    if (modelFs.endsWith("/" + doc.relPath) || modelFs.endsWith(doc.relPath)) {
+      return uri;
+    }
+    // Relative model: path prop was "src/foo.rs" → uri path often "/src/foo.rs"
+    const relNorm = doc.relPath.replace(/\\/g, "/");
+    if (
+      modelFs === "/" + relNorm ||
+      modelFs === relNorm ||
+      model.uri.path === relNorm ||
+      model.uri.path === "/" + relNorm
+    ) {
       return uri;
     }
   }
-  return u;
+
+  // Last resort: if under workspace root, synthesize URI and require openDocs hit.
+  if (ctx) {
+    const root = normPath(ctx.rootAbs);
+    if (modelFs.startsWith(root + "/") || modelFs === root) {
+      const rel = modelFs === root ? "" : modelFs.slice(root.length + 1);
+      const byRel = uriByRelPath.get(rel);
+      if (byRel) return byRel;
+    }
+  }
+
+  return null;
 }
 
-async function lspRequestForModel(
-  model: Monaco.editor.ITextModel,
+async function lspRequestForUri(
+  uri: string,
   method: string,
   params: unknown,
 ): Promise<unknown | null> {
-  const uri = await modelUri(model);
   const doc = openDocs.get(uri);
   if (!doc) return null;
   try {
@@ -423,7 +610,8 @@ async function lspRequestForModel(
       method,
       params,
     });
-  } catch {
+  } catch (e) {
+    console.warn(`[lsp] ${method} failed:`, e);
     return null;
   }
 }

@@ -56,14 +56,6 @@ type CtxMenu =
       x: number;
       y: number;
       path: string;
-    }
-  | {
-      kind: "viewer";
-      x: number;
-      y: number;
-      path: string;
-      hasSelection: boolean;
-      binary: boolean;
     };
 
 const emptyTree = (): TreeState => ({
@@ -115,6 +107,8 @@ export function FilesView() {
   const [fileError, setFileError] = useState<string | null>(null);
   const [selection, setSelection] = useState<LineRange | null>(null);
   const [lspStatusMsg, setLspStatusMsg] = useState<string | null>(null);
+  /** Absolute local workspace root (for Monaco model URIs / LSP). Null for SSH. */
+  const [workspaceAbsRoot, setWorkspaceAbsRoot] = useState<string | null>(null);
   const [treeWidth, setTreeWidth] = useState(260);
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
@@ -211,12 +205,21 @@ export function FilesView() {
 
   // Point the LSP hub at the local workspace root (no-op for SSH).
   useEffect(() => {
-    if (!activeProjectId) return;
+    if (!activeProjectId) {
+      setWorkspaceAbsRoot(null);
+      return;
+    }
+    let cancelled = false;
     void setLspWorkspace({
       projectId: activeProjectId,
       chatId: chatIdForFs,
       remote,
+    }).then((root) => {
+      if (!cancelled) setWorkspaceAbsRoot(root);
     });
+    return () => {
+      cancelled = true;
+    };
   }, [activeProjectId, chatIdForFs, remote]);
 
   // Refresh git status when Files is focused / periodically while open.
@@ -369,8 +372,10 @@ export function FilesView() {
 
   function addSelectionChip(sel?: { start: number; end: number } | null) {
     const range = sel ?? selection;
-    if (!activePath || !file || !range) return;
-    const fileLines = file.content.split("\n");
+    if (!activePath || !file || file.binary || !range) return;
+    // Prefer the live draft (what Monaco shows), not the last disk snapshot.
+    const source = draft.length > 0 || dirty ? draft : file.content;
+    const fileLines = source.split("\n");
     const start = Math.min(range.start, range.end);
     const end = Math.max(range.start, range.end);
     const snippet = fileLines.slice(start - 1, end).join("\n");
@@ -393,25 +398,6 @@ export function FilesView() {
     e.stopPropagation();
     const { x, y } = clampMenuPos(e.clientX, e.clientY);
     setCtxMenu({ kind, x, y, path });
-  }
-
-  function openViewerCtx(
-    e: MouseEvent | ReactMouseEvent,
-    rangeOverride?: { start: number; end: number } | null,
-  ) {
-    e.preventDefault();
-    if (!activePath || !file) return;
-    const range = rangeOverride ?? selection;
-    if (rangeOverride) setSelection(rangeOverride);
-    const { x, y } = clampMenuPos(e.clientX, e.clientY, 220, 140);
-    setCtxMenu({
-      kind: "viewer",
-      x,
-      y,
-      path: activePath,
-      hasSelection: !!range,
-      binary: file.binary,
-    });
   }
 
   if (!activeProjectId || !project) {
@@ -624,12 +610,23 @@ export function FilesView() {
                   content={draft}
                   language={file.language}
                   path={activePath}
+                  modelPath={
+                    workspaceAbsRoot && activePath
+                      ? `${workspaceAbsRoot.replace(/\/+$/, "")}/${activePath.replace(/^\/+/, "")}`
+                      : undefined
+                  }
                   editable={canEdit}
                   onChange={onDraftChange}
                   onSave={() => void saveFile()}
                   onSelectionChange={setSelection}
-                  onContextMenu={(e, range) => openViewerCtx(e, range)}
                   onLspStatus={setLspStatusMsg}
+                  onAddSelectionToChat={(range) => {
+                    setSelection(range);
+                    addSelectionChip(range);
+                  }}
+                  onAddFileToChat={() => {
+                    if (activePath) addFileChip(activePath, draft);
+                  }}
                 />
               )}
             </>
@@ -687,56 +684,6 @@ export function FilesView() {
               <FolderPlus size={13} strokeWidth={1.75} />
               Add folder to chat
             </button>
-          )}
-          {ctxMenu.kind === "viewer" && (
-            <>
-              {ctxMenu.hasSelection && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="files-ctx-item"
-                  onClick={() => {
-                    addSelectionChip();
-                    setCtxMenu(null);
-                  }}
-                >
-                  <MessageSquarePlus size={13} strokeWidth={1.75} />
-                  Add selection to chat
-                </button>
-              )}
-              {!ctxMenu.binary && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="files-ctx-item"
-                  onClick={() => {
-                    if (file && !file.binary) {
-                      addFileChip(ctxMenu.path, file.content);
-                    } else {
-                      addFileChip(ctxMenu.path);
-                    }
-                    setCtxMenu(null);
-                  }}
-                >
-                  <FilePlus2 size={13} strokeWidth={1.75} />
-                  Add file to chat
-                </button>
-              )}
-              {ctxMenu.binary && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="files-ctx-item"
-                  onClick={() => {
-                    addFileChip(ctxMenu.path);
-                    setCtxMenu(null);
-                  }}
-                >
-                  <FilePlus2 size={13} strokeWidth={1.75} />
-                  Add path to chat
-                </button>
-              )}
-            </>
           )}
         </div>
       )}
