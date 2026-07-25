@@ -1373,6 +1373,16 @@ button {
   background: var(--accent);
 }
 
+.file-badge.lsp {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .ghost-btn.compact.is-save-dirty {
   color: #1d1f21;
   background: var(--accent);

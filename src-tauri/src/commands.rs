@@ -24,6 +24,7 @@ use crate::store::{
     LOCAL_ENV_ID, SCRATCH_PROJECT_ID,
 };
 use crate::terminal::{TerminalInfo, TerminalManager};
+use crate::lsp::{rel_to_uri, LspHub, LspServerStatus};
 use crate::workspace_fs::{
     git_status_local, git_status_remote, list_local, list_remote, read_local, read_remote,
     resolve_workspace_root, write_local, write_remote, WorkspaceFileContent, WorkspaceGitStatus,
@@ -61,6 +62,8 @@ pub struct AppState {
     pub ensuring_chats: Mutex<HashSet<String>>,
     /// Interactive project terminals (local PTY / SSH).
     pub terminals: TerminalManager,
+    /// Local language servers (stdio LSP).
+    pub lsp: Arc<LspHub>,
 }
 
 impl AppState {
@@ -87,6 +90,7 @@ impl AppState {
             connecting_envs: Mutex::new(HashSet::new()),
             ensuring_chats: Mutex::new(HashSet::new()),
             terminals: TerminalManager::default(),
+            lsp: Arc::new(LspHub::new()),
         })
     }
 }
@@ -4292,6 +4296,95 @@ pub fn write_workspace_file(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "SSH host missing".to_string())?;
     write_remote(host, &root, &path, &content)
+}
+
+/// Absolute local workspace root (for file:// URIs / LSP). Fails for SSH remotes.
+#[tauri::command]
+pub fn get_workspace_abs_root(
+    state: State<'_, AppState>,
+    project_id: String,
+    chat_id: Option<String>,
+) -> Result<String, String> {
+    let data = state.data.lock().clone();
+    let (_project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+    if remote {
+        return Err("LSP is only available for local workspaces".into());
+    }
+    let path = std::path::PathBuf::from(&root);
+    if !path.is_absolute() {
+        return Err(format!("workspace root is not absolute: {root}"));
+    }
+    Ok(root)
+}
+
+#[tauri::command]
+pub fn lsp_status(state: State<'_, AppState>) -> Vec<LspServerStatus> {
+    state.lsp.status_all()
+}
+
+#[tauri::command]
+pub async fn lsp_ensure(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server_id: String,
+    project_id: String,
+    chat_id: Option<String>,
+) -> Result<LspServerStatus, String> {
+    let data = state.data.lock().clone();
+    let (_project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+    if remote {
+        return Err("LSP is only available for local workspaces".into());
+    }
+    let root = std::path::PathBuf::from(root);
+    state.lsp.ensure(app, &server_id, root).await
+}
+
+#[tauri::command]
+pub async fn lsp_stop(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<(), String> {
+    state.lsp.stop(&server_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lsp_request(
+    state: State<'_, AppState>,
+    server_id: String,
+    method: String,
+    params: Value,
+) -> Result<Value, String> {
+    state.lsp.request(&server_id, &method, params).await
+}
+
+#[tauri::command]
+pub async fn lsp_notify(
+    state: State<'_, AppState>,
+    server_id: String,
+    method: String,
+    params: Value,
+) -> Result<(), String> {
+    state.lsp.notify(&server_id, &method, params).await
+}
+
+/// Build a file:// URI for a workspace-relative path (local only).
+#[tauri::command]
+pub fn lsp_file_uri(
+    state: State<'_, AppState>,
+    project_id: String,
+    path: String,
+    chat_id: Option<String>,
+) -> Result<String, String> {
+    let data = state.data.lock().clone();
+    let (_project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+    if remote {
+        return Err("LSP URIs only for local workspaces".into());
+    }
+    Ok(rel_to_uri(std::path::Path::new(&root), &path))
 }
 
 #[tauri::command]

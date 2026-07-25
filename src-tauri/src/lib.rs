@@ -1,5 +1,6 @@
 mod acp;
 mod commands;
+mod lsp;
 mod store;
 mod terminal;
 mod workspace_fs;
@@ -76,6 +77,13 @@ pub fn run() {
             commands::list_workspace_dir,
             commands::read_workspace_file,
             commands::write_workspace_file,
+            commands::get_workspace_abs_root,
+            commands::lsp_status,
+            commands::lsp_ensure,
+            commands::lsp_stop,
+            commands::lsp_request,
+            commands::lsp_notify,
+            commands::lsp_file_uri,
             commands::git_workspace_status,
         ])
         .run(tauri::generate_context!())

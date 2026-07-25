@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { resolveMonacoLanguage } from "../monacoLanguages";
-import type { LineRange } from "./CodeViewer";
+import type { LineRange } from "../editorTypes";
+import {
+  ensureLspListeners,
+  lspDidChange,
+  lspDidOpen,
+  lspDidSave,
+} from "../lsp/client";
 
 type Props = {
   content: string;
@@ -15,8 +21,8 @@ type Props = {
   onContextMenu?: (e: MouseEvent, range: LineRange | null) => void;
   /** Cmd/Ctrl+S */
   onSave?: () => void;
-  /** Optional label strip (used in compare mode). */
-  label?: string;
+  /** Fired when LSP attach status changes (for status UI). */
+  onLspStatus?: (msg: string | null) => void;
 };
 
 function lineRangeFromEditor(
@@ -37,7 +43,7 @@ function lineRangeFromEditor(
 }
 
 /**
- * Monaco file viewer/editor — same surface API as CodeViewer for A/B compare.
+ * Monaco file editor with optional LSP (completion, hover, definition, diagnostics).
  */
 export function MonacoViewer({
   content,
@@ -48,57 +54,60 @@ export function MonacoViewer({
   onSelectionChange,
   onContextMenu,
   onSave,
-  label,
+  onLspStatus,
 }: Props) {
   const edRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const onSelRef = useRef(onSelectionChange);
   const onCtxRef = useRef(onContextMenu);
   const onChangeRef = useRef(onChange);
   const onSaveRef = useRef(onSave);
+  const onLspRef = useRef(onLspStatus);
   onSelRef.current = onSelectionChange;
   onCtxRef.current = onContextMenu;
   onChangeRef.current = onChange;
   onSaveRef.current = onSave;
+  onLspRef.current = onLspStatus;
 
-  // Avoid feedback loops when parent pushes the same content after save.
   const lastEmitted = useRef(content);
+  const pathRef = useRef(path);
+  pathRef.current = path;
 
   const monacoLang = useMemo(
     () => resolveMonacoLanguage(language, path),
     [language, path],
   );
 
-  const handleMount = useCallback<OnMount>(
-    (ed, monaco) => {
-      edRef.current = ed;
-      lastEmitted.current = ed.getValue();
+  const handleMount = useCallback<OnMount>((ed, monaco) => {
+    edRef.current = ed;
+    lastEmitted.current = ed.getValue();
+    void ensureLspListeners(monaco);
 
-      ed.onDidChangeCursorSelection(() => {
-        onSelRef.current?.(lineRangeFromEditor(ed));
-      });
-      ed.onDidChangeModelContent(() => {
-        const v = ed.getValue();
-        if (v === lastEmitted.current) return;
-        lastEmitted.current = v;
-        onChangeRef.current?.(v);
-      });
-      ed.onContextMenu((e) => {
-        const dom = e.event?.browserEvent as MouseEvent | undefined;
-        if (dom) {
-          onCtxRef.current?.(dom, lineRangeFromEditor(ed));
-          dom.preventDefault();
-          dom.stopPropagation();
-        }
-      });
+    ed.onDidChangeCursorSelection(() => {
+      onSelRef.current?.(lineRangeFromEditor(ed));
+    });
+    ed.onDidChangeModelContent(() => {
+      const v = ed.getValue();
+      if (v === lastEmitted.current) return;
+      lastEmitted.current = v;
+      onChangeRef.current?.(v);
+      if (pathRef.current) {
+        lspDidChange(pathRef.current, v);
+      }
+    });
+    ed.onContextMenu((e) => {
+      const dom = e.event?.browserEvent as MouseEvent | undefined;
+      if (dom) {
+        onCtxRef.current?.(dom, lineRangeFromEditor(ed));
+        dom.preventDefault();
+        dom.stopPropagation();
+      }
+    });
 
-      ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-        onSaveRef.current?.();
-      });
-    },
-    [],
-  );
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      onSaveRef.current?.();
+    });
+  }, []);
 
-  // Keep readOnly in sync without remounting.
   useEffect(() => {
     edRef.current?.updateOptions({
       readOnly: !editable,
@@ -106,9 +115,42 @@ export function MonacoViewer({
     });
   }, [editable]);
 
+  // Attach LSP when path/content opens (local workspace only — client no-ops if unset).
+  useEffect(() => {
+    if (!path || !content) {
+      onLspRef.current?.(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const res = await lspDidOpen({
+        path,
+        language,
+        content,
+        monacoLanguage: monacoLang,
+      });
+      if (cancelled) return;
+      if (res.error) {
+        onLspRef.current?.(
+          res.serverId
+            ? `LSP (${res.serverId}): ${res.error}`
+            : null,
+        );
+      } else if (res.serverId) {
+        onLspRef.current?.(`LSP: ${res.serverId}`);
+      } else {
+        onLspRef.current?.(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [path, language, monacoLang]); // content only on open — not every keystroke
+
+  // Notify parent save path to also call lspDidSave externally.
+
   return (
     <div className="code-viewer-host monaco-viewer-host">
-      {label && <div className="editor-pane-label">{label}</div>}
       <Editor
         className="monaco-editor-root"
         height="100%"
@@ -120,26 +162,30 @@ export function MonacoViewer({
         options={{
           readOnly: !editable,
           domReadOnly: !editable,
-          minimap: { enabled: false },
+          minimap: { enabled: true, scale: 1, showSlider: "mouseover" },
           fontSize: 12.5,
           fontFamily:
             "IBM Plex Mono, SF Mono, ui-monospace, Menlo, Monaco, Consolas, monospace",
           lineHeight: 18,
           scrollBeyondLastLine: false,
           wordWrap: "on",
-          renderLineHighlight: "line",
-          overviewRulerLanes: 0,
-          hideCursorInOverviewRuler: true,
+          renderLineHighlight: "all",
+          stickyScroll: { enabled: true },
+          bracketPairColorization: { enabled: true },
           scrollbar: {
             verticalScrollbarSize: 10,
             horizontalScrollbarSize: 10,
           },
           padding: { top: 4, bottom: 24 },
-          contextmenu: false,
+          contextmenu: true,
           automaticLayout: true,
+          quickSuggestions: editable,
+          suggestOnTriggerCharacters: editable,
         }}
         loading={<div className="file-viewer-empty">Loading Monaco…</div>}
       />
     </div>
   );
 }
+
+export { lspDidSave };

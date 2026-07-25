@@ -4,8 +4,15 @@
 
 ### Added
 
-- Files viewer: optional **Monaco** editor alongside CodeMirror (toggle CM / Monaco / Both; preference persisted)
+- Files viewer uses **Monaco** as the sole editor (CodeMirror removed)
 - Files viewer: edit + save text files (⌘S / Ctrl+S; local and SSH workspaces)
+- **LSP bridge** for local workspaces (stdio language servers):
+  - TypeScript/JavaScript → `typescript-language-server`
+  - Python → `pyright-langserver` / `basedpyright` / `pylsp`
+  - Rust → `rust-analyzer`
+  - C/C++ → `clangd`
+  - Completions, hover, go-to-definition, diagnostics (when servers are installed)
+  - Status chip in the file bar when an LSP attaches
 
 ## [0.5.4] — 2026-07-25
 

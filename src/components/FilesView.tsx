@@ -31,25 +31,11 @@ import type {
 import { SCRATCH_PROJECT_ID } from "../types";
 import { WorkspaceHeader } from "./WorkspaceHeader";
 import { Composer } from "./Composer";
-import { CodeViewer, type LineRange } from "./CodeViewer";
-import { MonacoViewer } from "./MonacoViewer";
+import { MonacoViewer, lspDidSave } from "./MonacoViewer";
+import type { LineRange } from "../editorTypes";
+import { setLspWorkspace } from "../lsp/client";
 import { displayPath } from "../pathDisplay";
 import { buildGitStatusMap, entryGitKind, gitStatusClass } from "../gitStatus";
-
-/** Files preview engine — keep CodeMirror; Monaco is for A/B compare. */
-export type FilesEditorEngine = "codemirror" | "monaco" | "compare";
-
-const EDITOR_ENGINE_KEY = "skunkworks.filesEditorEngine";
-
-function loadEditorEngine(): FilesEditorEngine {
-  try {
-    const v = localStorage.getItem(EDITOR_ENGINE_KEY);
-    if (v === "monaco" || v === "compare" || v === "codemirror") return v;
-  } catch {
-    /* ignore */
-  }
-  return "codemirror";
-}
 
 type TreeState = {
   expanded: Record<string, boolean>;
@@ -124,21 +110,11 @@ export function FilesView() {
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
   const [selection, setSelection] = useState<LineRange | null>(null);
-  const [editorEngine, setEditorEngine] =
-    useState<FilesEditorEngine>(loadEditorEngine);
+  const [lspStatusMsg, setLspStatusMsg] = useState<string | null>(null);
   const [treeWidth, setTreeWidth] = useState(260);
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   const [gitStatus, setGitStatus] = useState<WorkspaceGitStatus | null>(null);
-
-  const setEngine = useCallback((engine: FilesEditorEngine) => {
-    setEditorEngine(engine);
-    try {
-      localStorage.setItem(EDITOR_ENGINE_KEY, engine);
-    } catch {
-      /* ignore */
-    }
-  }, []);
 
   const chatIdForFs = isScratch ? activeChatId : null;
   const gitMap = useMemo(() => buildGitStatusMap(gitStatus), [gitStatus]);
@@ -229,6 +205,16 @@ export function FilesView() {
     }
   }, [activeProjectId, chatIdForFs, loadDir, loadGitStatus]);
 
+  // Point the LSP hub at the local workspace root (no-op for SSH).
+  useEffect(() => {
+    if (!activeProjectId) return;
+    void setLspWorkspace({
+      projectId: activeProjectId,
+      chatId: chatIdForFs,
+      remote,
+    });
+  }, [activeProjectId, chatIdForFs, remote]);
+
   // Refresh git status when Files is focused / periodically while open.
   useEffect(() => {
     if (!activeProjectId) return;
@@ -293,6 +279,7 @@ export function FilesView() {
         truncated: false,
       });
       setDirty(false);
+      void lspDidSave(activePath, draft);
       void loadGitStatus();
     } catch (e) {
       setSaveError(String(e));
@@ -527,34 +514,10 @@ export function FilesView() {
                   {file.binary && <span className="file-badge">binary</span>}
                 </div>
                 <div className="file-viewer-actions">
-                  {!file.binary && (
-                    <div
-                      className="editor-engine-toggle"
-                      role="group"
-                      aria-label="Code editor engine"
-                      title="Compare CodeMirror (default) and Monaco"
-                    >
-                      {(
-                        [
-                          ["codemirror", "CM"],
-                          ["monaco", "Monaco"],
-                          ["compare", "Both"],
-                        ] as const
-                      ).map(([id, label]) => (
-                        <button
-                          key={id}
-                          type="button"
-                          className={
-                            editorEngine === id
-                              ? "editor-engine-btn is-active"
-                              : "editor-engine-btn"
-                          }
-                          onClick={() => setEngine(id)}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
+                  {lspStatusMsg && (
+                    <span className="file-badge lsp" title={lspStatusMsg}>
+                      {lspStatusMsg}
+                    </span>
                   )}
                   {canEdit && (
                     <button
@@ -619,37 +582,7 @@ export function FilesView() {
                   Binary file ({formatBytes(file.size)}). Add the path from the
                   tree, or open it in an external editor.
                 </div>
-              ) : editorEngine === "compare" ? (
-                <div className="editor-compare">
-                  <div className="editor-compare-pane">
-                    <CodeViewer
-                      content={draft}
-                      language={file.language}
-                      path={activePath}
-                      editable={canEdit}
-                      onChange={onDraftChange}
-                      onSave={() => void saveFile()}
-                      onSelectionChange={setSelection}
-                      onContextMenu={(e, range) => openViewerCtx(e, range)}
-                    />
-                    <div className="editor-pane-label">CodeMirror</div>
-                  </div>
-                  <div className="editor-compare-divider" aria-hidden />
-                  <div className="editor-compare-pane">
-                    <MonacoViewer
-                      content={draft}
-                      language={file.language}
-                      path={activePath}
-                      editable={canEdit}
-                      onChange={onDraftChange}
-                      onSave={() => void saveFile()}
-                      onSelectionChange={setSelection}
-                      onContextMenu={(e, range) => openViewerCtx(e, range)}
-                    />
-                    <div className="editor-pane-label">Monaco</div>
-                  </div>
-                </div>
-              ) : editorEngine === "monaco" ? (
+              ) : (
                 <MonacoViewer
                   content={draft}
                   language={file.language}
@@ -659,17 +592,7 @@ export function FilesView() {
                   onSave={() => void saveFile()}
                   onSelectionChange={setSelection}
                   onContextMenu={(e, range) => openViewerCtx(e, range)}
-                />
-              ) : (
-                <CodeViewer
-                  content={draft}
-                  language={file.language}
-                  path={activePath}
-                  editable={canEdit}
-                  onChange={onDraftChange}
-                  onSave={() => void saveFile()}
-                  onSelectionChange={setSelection}
-                  onContextMenu={(e, range) => openViewerCtx(e, range)}
+                  onLspStatus={setLspStatusMsg}
                 />
               )}
             </>

@@ -1,23 +1,7 @@
 /**
- * Extensible language support for the Files viewer (CodeMirror 6).
- *
- * Core languages (markdown, python, c/c++, js/ts, json, rust) are static
- * imports so Vite always bundles them — dynamic import can fail silently
- * in the Tauri webview and leave monochrome plain text.
- *
- * To add a language:
- * 1. Prefer static import for anything used often
- * 2. Or dynamic import for rarer langs
- * 3. Map file extensions / backend language ids in ALIASES
+ * Language identity for the Files editor (Monaco + LSP).
+ * Extension / backend language id → registry key.
  */
-import type { Extension } from "@codemirror/state";
-import type { LanguageSupport } from "@codemirror/language";
-import { markdown } from "@codemirror/lang-markdown";
-import { python } from "@codemirror/lang-python";
-import { cpp } from "@codemirror/lang-cpp";
-import { javascript } from "@codemirror/lang-javascript";
-import { json } from "@codemirror/lang-json";
-import { rust } from "@codemirror/lang-rust";
 
 export type LanguageKey =
   | "javascript"
@@ -34,60 +18,10 @@ export type LanguageKey =
   | "yaml"
   | "c"
   | "cpp"
-  | "go"
   | "java"
   | "php"
   | "sql"
   | "text";
-
-type LangLoader = () => Promise<LanguageSupport | Extension> | LanguageSupport | Extension;
-
-const loaders: Record<Exclude<LanguageKey, "text">, LangLoader> = {
-  // --- static (always bundled) ---
-  markdown: () => markdown(),
-  python: () => python(),
-  c: () => cpp(),
-  cpp: () => cpp(),
-  javascript: () => javascript(),
-  typescript: () => javascript({ typescript: true }),
-  jsx: () => javascript({ jsx: true }),
-  tsx: () => javascript({ jsx: true, typescript: true }),
-  json: () => json(),
-  rust: () => rust(),
-  // --- dynamic (lazy) ---
-  html: async () => {
-    const { html } = await import("@codemirror/lang-html");
-    return html();
-  },
-  css: async () => {
-    const { css } = await import("@codemirror/lang-css");
-    return css();
-  },
-  xml: async () => {
-    const { xml } = await import("@codemirror/lang-xml");
-    return xml();
-  },
-  yaml: async () => {
-    const { yaml } = await import("@codemirror/lang-yaml");
-    return yaml();
-  },
-  go: async () => {
-    const { go } = await import("@codemirror/lang-go");
-    return go();
-  },
-  java: async () => {
-    const { java } = await import("@codemirror/lang-java");
-    return java();
-  },
-  php: async () => {
-    const { php } = await import("@codemirror/lang-php");
-    return php();
-  },
-  sql: async () => {
-    const { sql } = await import("@codemirror/lang-sql");
-    return sql();
-  },
-};
 
 /** Backend `language` field or file extension → registry key. */
 const ALIASES: Record<string, LanguageKey> = {
@@ -97,7 +31,6 @@ const ALIASES: Record<string, LanguageKey> = {
   json: "json",
   markdown: "markdown",
   python: "python",
-  go: "go",
   java: "java",
   kotlin: "java",
   c: "c",
@@ -149,6 +82,27 @@ const ALIASES: Record<string, LanguageKey> = {
   log: "text",
 };
 
+const KNOWN_KEYS = new Set<string>([
+  "javascript",
+  "typescript",
+  "jsx",
+  "tsx",
+  "json",
+  "markdown",
+  "rust",
+  "python",
+  "html",
+  "css",
+  "xml",
+  "yaml",
+  "c",
+  "cpp",
+  "java",
+  "php",
+  "sql",
+  "text",
+]);
+
 export function resolveLanguageKey(
   languageOrExt: string | undefined | null,
   path?: string | null,
@@ -158,7 +112,7 @@ export function resolveLanguageKey(
     const k = raw.trim().toLowerCase();
     if (!k) return null;
     if (k in ALIASES) return ALIASES[k];
-    if (k in loaders) return k as LanguageKey;
+    if (KNOWN_KEYS.has(k)) return k as LanguageKey;
     return null;
   };
 
@@ -175,18 +129,31 @@ export function resolveLanguageKey(
   return "text";
 }
 
-/** Load CodeMirror language support (empty for plain text). */
-export async function loadLanguageSupport(
-  key: LanguageKey,
-): Promise<Extension[]> {
-  if (key === "text") return [];
-  const loader = loaders[key];
-  if (!loader) return [];
-  try {
-    const support = await Promise.resolve(loader());
-    return [support];
-  } catch (e) {
-    console.warn(`Failed to load language ${key}`, e);
-    return [];
+/**
+ * Map file language → LSP server id we manage (null = no LSP).
+ * Go is intentionally unsupported.
+ */
+export type LspServerId = "typescript" | "python" | "rust" | "cpp";
+
+export function lspServerForLanguage(
+  languageOrExt: string | undefined | null,
+  path?: string | null,
+): LspServerId | null {
+  const key = resolveLanguageKey(languageOrExt, path);
+  switch (key) {
+    case "typescript":
+    case "javascript":
+    case "tsx":
+    case "jsx":
+      return "typescript";
+    case "python":
+      return "python";
+    case "rust":
+      return "rust";
+    case "c":
+    case "cpp":
+      return "cpp";
+    default:
+      return null;
   }
 }

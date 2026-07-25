@@ -1,6 +1,5 @@
 /**
  * Map our LanguageKey / path hints to Monaco language ids.
- * @see https://microsoft.github.io/monaco-editor/docs.html#functions/languages.getLanguages.html
  */
 import { resolveLanguageKey, type LanguageKey } from "./languages";
 
@@ -19,7 +18,6 @@ const MONACO_BY_KEY: Record<LanguageKey, string> = {
   yaml: "yaml",
   c: "c",
   cpp: "cpp",
-  go: "go",
   java: "java",
   php: "php",
   sql: "sql",
