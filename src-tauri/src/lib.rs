@@ -2,6 +2,7 @@ mod acp;
 mod chat;
 mod commands;
 mod lsp;
+mod ssh;
 mod store;
 mod terminal;
 mod workspace_fs;

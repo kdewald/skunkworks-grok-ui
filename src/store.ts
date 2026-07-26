@@ -13,223 +13,25 @@ import type {
 } from "./types";
 import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID, scratchProjectIdForEnv } from "./types";
 import { formatContextChips } from "./contextChips";
+import {
+  drainSessionApplies,
+  enqueueSessionUpdate,
+} from "./state/stream";
+import {
+  dispatchSend,
+  healStuckBusy,
+  isRetriableQueueError,
+  queueId,
+  type QueuedAttachment,
+} from "./state/send";
+import { markTurnsCancelled } from "./state/turns";
 
-/**
- * Stream apply path:
- * - Buffer every session-update in memory (no per-token IPC).
- * - Drain with one `apply_session_updates` invoke per batch.
- * - Paint React only on rAF / after drain so UI doesn't drip after the agent is done.
- */
-type PendingBatch = {
-  sessionId: string;
-  environmentId?: string;
-  updates: unknown[];
-};
-const pendingBatches: PendingBatch[] = [];
-let applyDrainRunning = false;
-let applyDrainPromise: Promise<void> = Promise.resolve();
-/** Latest chat doc waiting to paint. */
-let pendingUiChat: ChatDocument | null = null;
-let uiRaf: number | null = null;
+export { waitForApplyDrain } from "./state/stream";
+export { healStuckBusy } from "./state/send";
+export type { QueuedAttachment } from "./state/send";
+
 /** Single-flight connect promises keyed by environment id. */
 const connectPromises = new Map<string, Promise<void>>();
-/** Monotonic client generation for send slot ownership (turn-scoped finish). */
-let sendGeneration = 0;
-
-function flushPendingUiChat(
-  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
-  get: () => AppStore,
-) {
-  if (uiRaf != null) {
-    cancelAnimationFrame(uiRaf);
-    uiRaf = null;
-  }
-  const chat = pendingUiChat;
-  pendingUiChat = null;
-  if (!chat) return;
-  if (get().activeChatId === chat.id) {
-    set({ activeChat: chat });
-  }
-}
-
-/** Coalesce paints to one frame while streaming; force-paint when drain ends. */
-function scheduleUiChat(
-  chat: ChatDocument,
-  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
-  get: () => AppStore,
-  immediate = false,
-) {
-  pendingUiChat = chat;
-  if (immediate) {
-    flushPendingUiChat(set, get);
-    return;
-  }
-  if (uiRaf != null) return;
-  uiRaf = requestAnimationFrame(() => {
-    uiRaf = null;
-    flushPendingUiChat(set, get);
-  });
-}
-
-function chatEnvId(
-  get: () => AppStore,
-  chatId: string,
-): string | null {
-  const meta = get().chats.find((c) => c.id === chatId);
-  const projectId =
-    meta?.projectId ??
-    (get().activeChat?.id === chatId ? get().activeChat?.projectId : null);
-  if (!projectId) return null;
-  const project = get().projects.find((p) => p.id === projectId);
-  return project?.environmentId || LOCAL_ENV_ID;
-}
-
-function resolveChatIdForSession(
-  get: () => AppStore,
-  sessionId: string,
-  environmentId?: string | null,
-): string | null {
-  const envMatches = (chatId: string) => {
-    if (!environmentId) return true;
-    const chatEnv = chatEnvId(get, chatId);
-    return !chatEnv || chatEnv === environmentId;
-  };
-
-  const bySession = get().chats.find(
-    (c) => c.acpSessionId === sessionId && envMatches(c.id),
-  );
-  if (bySession) return bySession.id;
-  const active = get().activeChat;
-  if (
-    active?.acpSessionId === sessionId &&
-    envMatches(active.id)
-  ) {
-    return active.id;
-  }
-  // After a mid-turn session recreate, meta may lag briefly. Only bind to
-  // inflight when that chat's known session is missing or already matches.
-  const inflight = get().inflightChatId;
-  if (inflight && envMatches(inflight)) {
-    const meta = get().chats.find((c) => c.id === inflight);
-    const live = get().activeChat?.id === inflight ? get().activeChat : null;
-    const known =
-      live?.acpSessionId ?? meta?.acpSessionId ?? null;
-    if (!known || known === sessionId) return inflight;
-  }
-  // Drop unmatched updates rather than applying them to the open chat.
-  return null;
-}
-
-function updateKind(update: unknown): string {
-  if (update && typeof update === "object" && "sessionUpdate" in update) {
-    return String((update as { sessionUpdate?: string }).sessionUpdate ?? "");
-  }
-  return "";
-}
-
-const URGENT_KINDS = new Set([
-  "tool_call",
-  "subagent_spawned",
-  "subagent_finished",
-  "task_backgrounded",
-  "task_completed",
-  "turn_completed",
-  "plan",
-]);
-
-function enqueueSessionUpdate(
-  sessionId: string,
-  update: unknown,
-  environmentId?: string,
-) {
-  const last = pendingBatches[pendingBatches.length - 1];
-  if (
-    last &&
-    last.sessionId === sessionId &&
-    (last.environmentId ?? "") === (environmentId ?? "")
-  ) {
-    last.updates.push(update);
-    return;
-  }
-  pendingBatches.push({ sessionId, environmentId, updates: [update] });
-}
-
-function drainSessionApplies(
-  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
-  get: () => AppStore,
-): Promise<void> {
-  // Coalesce concurrent kicks onto the in-flight promise so waiters see the full drain.
-  if (applyDrainRunning) return applyDrainPromise;
-  applyDrainRunning = true;
-  applyDrainPromise = (async () => {
-    try {
-      while (pendingBatches.length > 0) {
-        // Take the front batch; fold any same-session batches that piled up mid-IPC.
-        const batch = pendingBatches.shift()!;
-        while (
-          pendingBatches.length > 0 &&
-          pendingBatches[0].sessionId === batch.sessionId &&
-          (pendingBatches[0].environmentId ?? "") === (batch.environmentId ?? "")
-        ) {
-          batch.updates.push(...pendingBatches.shift()!.updates);
-        }
-        if (batch.updates.length === 0) continue;
-
-        const targetId = resolveChatIdForSession(
-          get,
-          batch.sessionId,
-          batch.environmentId,
-        );
-        if (!targetId) continue;
-
-        try {
-          const updated = await invoke<ChatDocument>("apply_session_updates", {
-            chatId: targetId,
-            updates: batch.updates,
-            // Reject late batches from a rolled-back / recreated session.
-            sessionId: batch.sessionId,
-          });
-          if (get().activeChatId !== updated.id) continue;
-
-          const urgent = batch.updates.some((u) =>
-            URGENT_KINDS.has(updateKind(u)),
-          );
-          const morePending = pendingBatches.length > 0;
-          scheduleUiChat(updated, set, get, urgent || !morePending);
-        } catch (err) {
-          console.error("apply_session_updates failed", err);
-        }
-      }
-    } finally {
-      applyDrainRunning = false;
-      if (pendingBatches.length === 0 && pendingUiChat) {
-        flushPendingUiChat(set, get);
-      }
-    }
-    // Batches may have been enqueued after we cleared the running flag.
-    if (pendingBatches.length > 0) {
-      await drainSessionApplies(set, get);
-    }
-  })();
-  return applyDrainPromise;
-}
-
-/** Wait until all buffered stream applies have hit Rust + painted. */
-export async function waitForApplyDrain(): Promise<void> {
-  for (let i = 0; i < 500; i++) {
-    await applyDrainPromise;
-    if (!applyDrainRunning && pendingBatches.length === 0) return;
-    await new Promise((r) => setTimeout(r, 0));
-  }
-}
-
-export type QueuedAttachment = {
-  kind: string;
-  data: string;
-  mimeType: string;
-  name?: string;
-  dataUrl?: string;
-};
 
 export type QueuedMessage = {
   id: string;
@@ -361,145 +163,6 @@ type AppStore = {
   setAgentStatus: (s: Partial<AgentStatus>) => void;
   isEnvConnected: (environmentId: string) => boolean;
 };
-
-function queueId() {
-  return `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** True if the active chat has a turn still streaming. */
-function isActivelyStreaming(get: () => Pick<AppStore, "activeChat">): boolean {
-  return !!get().activeChat?.turns.some((t) => t.status === "streaming");
-}
-
-/**
- * Clear a stuck composer lock: `busy` without a streaming turn means we missed
- * prompt-finished (webview navigation, HMR, dropped event). Without this, Send
- * and Enter silently no-op forever.
- *
- * Only call with force from explicit user send / a delayed watchdog — not on
- * every busy transition, or you race the real pre-stream invoke window.
- */
-export function healStuckBusy(
-  set: (partial: Partial<AppStore>) => void,
-  get: () => Pick<
-    AppStore,
-    "busy" | "activeChat" | "activeChatId" | "inflightChatId" | "inflightTurnId"
-  >,
-  opts: { force?: boolean } = {},
-): boolean {
-  if (!opts.force) return false;
-  if (!get().busy) return false;
-  // Never clear while any chat owns the send slot — optimistic cancel paints
-  // turns as cancelled while the backend prompt may still be settling.
-  // Only prompt-finished / confirmed agent death may clear inflight.
-  if (get().inflightChatId != null) return false;
-  if (isActivelyStreaming(get)) return false;
-  set({
-    busy: false,
-    inflightChatId: null,
-    inflightTurnId: null,
-    inflightGeneration: null,
-  });
-  return true;
-}
-
-type Get = () => AppStore;
-type Set = (
-  partial:
-    | Partial<AppStore>
-    | ((state: AppStore) => Partial<AppStore>),
-) => void;
-
-async function dispatchSend(
-  get: Get,
-  set: Set,
-  chatId: string,
-  text: string,
-  attachments: QueuedAttachment[] = [],
-) {
-  // Claim the send slot BEFORE any await so a second Enter cannot race connect.
-  // Client generation guards against a stale prompt-finished from a prior turn
-  // unlocking this slot during the pre-response window.
-  const generation = ++sendGeneration;
-  set({
-    busy: true,
-    inflightChatId: chatId,
-    inflightTurnId: null,
-    inflightGeneration: generation,
-    error: null,
-  });
-
-  // Resolve project from the target chat when possible (not always the active view).
-  const targetMeta = get().chats.find((c) => c.id === chatId);
-  const project = get().projects.find(
-    (p) =>
-      p.id ===
-      (targetMeta?.projectId ||
-        get().activeChat?.projectId ||
-        get().activeProjectId),
-  );
-  const envId = project?.environmentId || get().activeEnvironmentId;
-  try {
-    if (!get().connectedEnvironments.includes(envId)) {
-      await get().connectAgent(envId);
-    }
-    const chat = await invoke<ChatDocument>("send_message", {
-      args: {
-        chatId,
-        text,
-        attachments: attachments.map((a) => ({
-          kind: a.kind,
-          data: a.data,
-          mimeType: a.mimeType,
-          name: a.name ?? null,
-          dataUrl: a.dataUrl ?? null,
-        })),
-        images: [],
-      },
-    });
-    // If the turn already finished (or never started streaming), don't leave
-    // the composer locked waiting for a prompt-finished that won't come.
-    const streamingTurn = [...chat.turns]
-      .reverse()
-      .find((t) => t.status === "streaming");
-    const stillStreaming = !!streamingTurn;
-    const stillViewing = get().activeChatId === chatId;
-    // Only adopt if this generation still owns the slot.
-    if (get().inflightGeneration !== generation) {
-      return;
-    }
-    set({
-      // Never overwrite another chat the user switched to while this sent.
-      activeChat: stillViewing ? chat : get().activeChat,
-      busy: stillStreaming,
-      inflightChatId: stillStreaming ? chatId : null,
-      inflightTurnId: stillStreaming ? streamingTurn?.id ?? null : null,
-      inflightGeneration: stillStreaming ? generation : null,
-      chats: get().chats.map((c) =>
-        c.id === chat.id
-          ? {
-              ...c,
-              title: chat.title,
-              updatedAt: chat.updatedAt,
-              preview: (text || "Attachment").slice(0, 120),
-              acpSessionId: chat.acpSessionId,
-            }
-          : c,
-      ),
-    });
-  } catch (e) {
-    if (get().inflightGeneration === generation) {
-      set({
-        error: String(e),
-        busy: false,
-        inflightChatId: null,
-        inflightTurnId: null,
-        inflightGeneration: null,
-      });
-    }
-    throw e;
-  }
-}
 
 function chatsForProject(chats: ChatMeta[], projectId: string | null) {
   if (!projectId) return [];
@@ -1391,8 +1054,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const err = String(e);
       // Transient settle errors: requeue and schedule a short retry so a
       // cancel-window reject does not permanently poison the FIFO head.
-      const retriable =
-        /settling after cancel|in-flight prompt|try again/i.test(err);
+      const retriable = isRetriableQueueError(err);
       set({
         messageQueue: [
           next,
@@ -1460,23 +1122,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         error: null,
         activeChat: {
           ...active,
-          turns: active.turns.map((t) =>
-            t.status === "streaming" || t.status === "cancelling"
-              ? {
-                  ...t,
-                  status: "cancelled",
-                  intermediateCollapsed: true,
-                  intermediate: t.intermediate.map((b) =>
-                    b.type === "tool" &&
-                    (b.status === "pending" ||
-                      b.status === "in_progress" ||
-                      b.status === "running")
-                      ? { ...b, status: "cancelled" }
-                      : b,
-                  ),
-                }
-              : t,
-          ),
+          turns: markTurnsCancelled(active.turns),
         },
       });
     } else {

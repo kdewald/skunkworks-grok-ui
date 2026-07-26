@@ -7,7 +7,6 @@ import {
   ensureLspListeners,
   lspDidChange,
   lspDidOpen,
-  lspDidSave,
   monacoModelPath,
 } from "../lsp/client";
 
@@ -227,4 +226,3 @@ export function MonacoViewer({
   );
 }
 
-export { lspDidSave };

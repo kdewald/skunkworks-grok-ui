@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::acp::{
+use crate::acp::{AcpConnection, AgentSpawnTarget};
+use crate::ssh::{
     ensure_remote_scratch_dir, list_remote_directory, list_ssh_config_hosts, probe_ssh_host,
-    resolve_remote_project_path, AcpConnection, AgentSpawnTarget, RemoteDirListing,
+    resolve_remote_project_path, RemoteDirListing,
 };
 use crate::store::{
     ensure_scratch_root, local_env_display_name, migrate_app_data, new_id, now,
@@ -23,13 +24,8 @@ use crate::store::{
     Environment, FileAttachment, IntermediateBlock, Project, Store, Turn,
     LOCAL_ENV_ID, SCRATCH_PROJECT_ID,
 };
-use crate::terminal::{TerminalInfo, TerminalManager};
-use crate::lsp::{rel_to_uri, LspHub, LspServerStatus};
-use crate::workspace_fs::{
-    git_status_local, git_status_remote, list_local, list_remote, read_local, read_remote,
-    resolve_workspace_root, write_local, write_remote, WorkspaceFileContent, WorkspaceGitStatus,
-    WorkspaceListing,
-};
+use crate::terminal::TerminalManager;
+use crate::lsp::LspHub;
 
 use crate::chat::transcript::{
     apply_one_update, is_stream_chunk_kind, promote_subagent_tools_in_doc,
@@ -2685,252 +2681,10 @@ pub fn set_block_collapsed(
 
 // ── Project terminal ────────────────────────────────────────────────────────
 
-#[tauri::command]
-pub fn open_terminal(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    project_id: String,
-    chat_id: Option<String>,
-    cols: Option<u16>,
-    rows: Option<u16>,
-) -> Result<TerminalInfo, String> {
-    let data = state.data.lock().clone();
-    state.terminals.open(
-        app,
-        &data,
-        &project_id,
-        chat_id.as_deref(),
-        cols.unwrap_or(120),
-        rows.unwrap_or(24),
-    )
-}
+pub mod lsp;
+pub mod terminal;
+pub mod workspace;
 
-#[tauri::command]
-pub fn write_terminal(
-    state: State<'_, AppState>,
-    terminal_id: String,
-    data: String,
-) -> Result<(), String> {
-    state.terminals.write(&terminal_id, &data)
-}
-
-#[tauri::command]
-pub fn resize_terminal(
-    state: State<'_, AppState>,
-    terminal_id: String,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
-    state.terminals.resize(&terminal_id, cols, rows)
-}
-
-#[tauri::command]
-pub fn close_terminal(state: State<'_, AppState>, terminal_id: String) -> Result<(), String> {
-    state.terminals.close(&terminal_id)
-}
-
-// ── Workspace filesystem (Files view) ───────────────────────────────────────
-
-#[tauri::command]
-pub fn list_workspace_dir(
-    state: State<'_, AppState>,
-    project_id: String,
-    path: Option<String>,
-    chat_id: Option<String>,
-) -> Result<WorkspaceListing, String> {
-    let data = state.data.lock().clone();
-    let (project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-    let rel = path.unwrap_or_default();
-
-    if !remote {
-        return list_local(std::path::Path::new(&root), &rel);
-    }
-
-    let env = data
-        .environments
-        .iter()
-        .find(|e| e.id == project.environment_id)
-        .ok_or_else(|| "environment not found".to_string())?;
-    let host = env
-        .ssh_host
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "SSH host missing".to_string())?;
-    list_remote(host, &root, &rel)
-}
-
-#[tauri::command]
-pub fn read_workspace_file(
-    state: State<'_, AppState>,
-    project_id: String,
-    path: String,
-    chat_id: Option<String>,
-) -> Result<WorkspaceFileContent, String> {
-    let data = state.data.lock().clone();
-    let (project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-
-    if !remote {
-        return read_local(std::path::Path::new(&root), &path);
-    }
-
-    let env = data
-        .environments
-        .iter()
-        .find(|e| e.id == project.environment_id)
-        .ok_or_else(|| "environment not found".to_string())?;
-    let host = env
-        .ssh_host
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "SSH host missing".to_string())?;
-    read_remote(host, &root, &path)
-}
-
-/// Write a text file in the project workspace (local or SSH).
-#[tauri::command]
-pub fn write_workspace_file(
-    state: State<'_, AppState>,
-    project_id: String,
-    path: String,
-    content: String,
-    chat_id: Option<String>,
-) -> Result<(), String> {
-    let data = state.data.lock().clone();
-    let (project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-
-    if !remote {
-        return write_local(std::path::Path::new(&root), &path, &content);
-    }
-
-    let env = data
-        .environments
-        .iter()
-        .find(|e| e.id == project.environment_id)
-        .ok_or_else(|| "environment not found".to_string())?;
-    let host = env
-        .ssh_host
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "SSH host missing".to_string())?;
-    write_remote(host, &root, &path, &content)
-}
-
-/// Absolute local workspace root (for file:// URIs / LSP). Fails for SSH remotes.
-#[tauri::command]
-pub fn get_workspace_abs_root(
-    state: State<'_, AppState>,
-    project_id: String,
-    chat_id: Option<String>,
-) -> Result<String, String> {
-    let data = state.data.lock().clone();
-    let (_project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-    if remote {
-        return Err("LSP is only available for local workspaces".into());
-    }
-    let path = std::path::PathBuf::from(&root);
-    if !path.is_absolute() {
-        return Err(format!("workspace root is not absolute: {root}"));
-    }
-    Ok(root)
-}
-
-#[tauri::command]
-pub fn lsp_status(state: State<'_, AppState>) -> Vec<LspServerStatus> {
-    state.lsp.status_all()
-}
-
-#[tauri::command]
-pub async fn lsp_ensure(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    server_id: String,
-    project_id: String,
-    chat_id: Option<String>,
-) -> Result<LspServerStatus, String> {
-    let data = state.data.lock().clone();
-    let (_project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-    if remote {
-        return Err("LSP is only available for local workspaces".into());
-    }
-    let root = std::path::PathBuf::from(root);
-    state.lsp.ensure(app, &server_id, root).await
-}
-
-#[tauri::command]
-pub async fn lsp_stop(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<(), String> {
-    state.lsp.stop(&server_id).await;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn lsp_request(
-    state: State<'_, AppState>,
-    server_id: String,
-    method: String,
-    params: Value,
-) -> Result<Value, String> {
-    state.lsp.request(&server_id, &method, params).await
-}
-
-#[tauri::command]
-pub async fn lsp_notify(
-    state: State<'_, AppState>,
-    server_id: String,
-    method: String,
-    params: Value,
-) -> Result<(), String> {
-    state.lsp.notify(&server_id, &method, params).await
-}
-
-/// Build a file:// URI for a workspace-relative path (local only).
-#[tauri::command]
-pub fn lsp_file_uri(
-    state: State<'_, AppState>,
-    project_id: String,
-    path: String,
-    chat_id: Option<String>,
-) -> Result<String, String> {
-    let data = state.data.lock().clone();
-    let (_project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-    if remote {
-        return Err("LSP URIs only for local workspaces".into());
-    }
-    Ok(rel_to_uri(std::path::Path::new(&root), &path))
-}
-
-#[tauri::command]
-pub fn git_workspace_status(
-    state: State<'_, AppState>,
-    project_id: String,
-    chat_id: Option<String>,
-) -> Result<WorkspaceGitStatus, String> {
-    let data = state.data.lock().clone();
-    let (project, root, remote) =
-        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
-
-    if !remote {
-        return Ok(git_status_local(std::path::Path::new(&root)));
-    }
-
-    let env = data
-        .environments
-        .iter()
-        .find(|e| e.id == project.environment_id)
-        .ok_or_else(|| "environment not found".to_string())?;
-    let host = env
-        .ssh_host
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "SSH host missing".to_string())?;
-    Ok(git_status_remote(host, &root))
-}
-
+pub use lsp::*;
+pub use terminal::*;
+pub use workspace::*;

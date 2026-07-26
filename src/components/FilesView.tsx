@@ -31,7 +31,8 @@ import type {
 import { SCRATCH_PROJECT_ID } from "../types";
 import { WorkspaceHeader } from "./WorkspaceHeader";
 import { Composer } from "./Composer";
-import { MonacoViewer, lspDidSave } from "./MonacoViewer";
+import { MonacoViewer } from "./MonacoViewer";
+import { lspDidSave } from "../lsp/client";
 import type { LineRange } from "../editorTypes";
 import { setLspWorkspace } from "../lsp/client";
 import { displayPath } from "../pathDisplay";
@@ -234,9 +235,13 @@ export function FilesView() {
     };
   }, [activeProjectId, loadGitStatus]);
 
+  /** Guards late open/save results when the user switches files quickly. */
+  const fileSessionGen = useRef(0);
+
   const openFile = useCallback(
     async (path: string) => {
       if (!activeProjectId) return;
+      const gen = ++fileSessionGen.current;
       setActivePath(path);
       setFileLoading(true);
       setFileError(null);
@@ -252,14 +257,18 @@ export function FilesView() {
             chatId: chatIdForFs,
           },
         );
+        if (fileSessionGen.current !== gen) return;
         setFile(content);
         setDraft(content.binary ? "" : content.content);
       } catch (e) {
+        if (fileSessionGen.current !== gen) return;
         setFile(null);
         setDraft("");
         setFileError(String(e));
       } finally {
-        setFileLoading(false);
+        if (fileSessionGen.current === gen) {
+          setFileLoading(false);
+        }
       }
     },
     [activeProjectId, chatIdForFs],
@@ -272,31 +281,41 @@ export function FilesView() {
     if (!activeProjectId || !activePath || !file || !canEdit || saving) return;
     // Avoid no-op saves (e.g. autosave race after manual save).
     if (!dirty && draft === file.content) return;
+    const gen = fileSessionGen.current;
+    const path = activePath;
+    const snapshot = draft;
+    const fileSnap = file;
     setSaving(true);
     setSaveError(null);
     setJustSaved(false);
     try {
       await invoke("write_workspace_file", {
         projectId: activeProjectId,
-        path: activePath,
-        content: draft,
+        path,
+        content: snapshot,
         chatId: chatIdForFs,
       });
+      // Late save must not clobber a different open file.
+      if (fileSessionGen.current !== gen || activePath !== path) return;
       setFile({
-        ...file,
-        content: draft,
-        size: new TextEncoder().encode(draft).length,
+        ...fileSnap,
+        content: snapshot,
+        size: new TextEncoder().encode(snapshot).length,
         truncated: false,
       });
       setDirty(false);
       setJustSaved(true);
       window.setTimeout(() => setJustSaved(false), 1500);
-      void lspDidSave(activePath, draft);
+      void lspDidSave(path, snapshot);
       void loadGitStatus();
     } catch (e) {
-      setSaveError(String(e));
+      if (fileSessionGen.current === gen) {
+        setSaveError(String(e));
+      }
     } finally {
-      setSaving(false);
+      if (fileSessionGen.current === gen) {
+        setSaving(false);
+      }
     }
   }, [
     activeProjectId,

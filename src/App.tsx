@@ -6,6 +6,13 @@ import { FilesView } from "./components/FilesView";
 import { PermissionModal } from "./components/PermissionModal";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { useAppStore, waitForApplyDrain } from "./store";
+import {
+  abortStreamingTurnsOnDisconnect,
+  collectCancelledTurnIds,
+  markTurnCancelledById,
+  markTurnsCancelled,
+  reassertCancelledTurns,
+} from "./state/turns";
 import type { PermissionRequest } from "./types";
 import "./App.css";
 
@@ -128,21 +135,10 @@ function App() {
                 inflightTurnId: null,
                 inflightGeneration: null,
                 permission: null,
-                activeChat: {
-                  ...active,
-                  turns: active.turns.map((t) =>
-                    t.status === "streaming"
-                      ? {
-                          ...t,
-                          status: "error",
-                          intermediateCollapsed: true,
-                          assistantMessage: t.assistantMessage
-                            ? `${t.assistantMessage}\n\n---\n**Turn aborted:** agent disconnected (${event.payload.message})`
-                            : `**Turn aborted:** agent disconnected (${event.payload.message})`,
-                        }
-                      : t,
-                  ),
-                },
+                activeChat: abortStreamingTurnsOnDisconnect(
+                  active,
+                  event.payload.message,
+                ),
               });
             } else if (inflightOnDeadEnv) {
               useAppStore.setState({
@@ -231,15 +227,7 @@ function App() {
               useAppStore.setState({
                 activeChat: {
                   ...active,
-                  turns: active.turns.map((t) =>
-                    t.id === finishedTurnId
-                      ? {
-                          ...t,
-                          status: "cancelled",
-                          intermediateCollapsed: true,
-                        }
-                      : t,
-                  ),
+                  turns: markTurnCancelledById(active.turns, finishedTurnId),
                 },
               });
             }
@@ -265,21 +253,13 @@ function App() {
               const after = useAppStore.getState();
               if (after.activeChat?.id === event.payload.chatId) {
                 const chat = after.activeChat;
-                const t = chat.turns.find((x) => x.id === finishedTurnId);
-                if (t && (t.status === "streaming" || t.status === "cancelling")) {
+                const { turns, changed } = reassertCancelledTurns(
+                  chat.turns,
+                  new Set([finishedTurnId]),
+                );
+                if (changed) {
                   useAppStore.setState({
-                    activeChat: {
-                      ...chat,
-                      turns: chat.turns.map((x) =>
-                        x.id === finishedTurnId
-                          ? {
-                              ...x,
-                              status: "cancelled",
-                              intermediateCollapsed: true,
-                            }
-                          : x,
-                      ),
-                    },
+                    activeChat: { ...chat, turns },
                   });
                 }
               }
@@ -318,28 +298,17 @@ function App() {
           }
           // Ignore transcript refresh for chats the user is not viewing.
           if (state.activeChatId !== event.payload.chatId) return;
-          const cancelledIds = new Set(
-            state.activeChat?.turns
-              .filter((t) => t.status === "cancelled")
-              .map((t) => t.id) ?? [],
-          );
+          const cancelledIds = collectCancelledTurnIds(state.activeChat);
           void (async () => {
             await refreshChat(event.payload.chatId);
             if (cancelledIds.size === 0) return;
             const after = useAppStore.getState();
             if (after.activeChat?.id !== event.payload.chatId) return;
             const active = after.activeChat;
-            let changed = false;
-            const turns = active.turns.map((t) => {
-              if (
-                cancelledIds.has(t.id) &&
-                (t.status === "streaming" || t.status === "cancelling")
-              ) {
-                changed = true;
-                return { ...t, status: "cancelled", intermediateCollapsed: true };
-              }
-              return t;
-            });
+            const { turns, changed } = reassertCancelledTurns(
+              active.turns,
+              cancelledIds,
+            );
             if (changed) {
               useAppStore.setState({ activeChat: { ...active, turns } });
             }
@@ -368,25 +337,7 @@ function App() {
                   : state.inflightTurnId,
               activeChat: {
                 ...active,
-                turns: active.turns.map((t) => {
-                  const match = turnId
-                    ? t.id === turnId
-                    : t.status === "streaming" || t.status === "cancelling";
-                  if (!match) return t;
-                  return {
-                    ...t,
-                    status: "cancelled",
-                    intermediateCollapsed: true,
-                    intermediate: t.intermediate.map((b) =>
-                      b.type === "tool" &&
-                      (b.status === "pending" ||
-                        b.status === "in_progress" ||
-                        b.status === "running")
-                        ? { ...b, status: "cancelled" }
-                        : b,
-                    ),
-                  };
-                }),
+                turns: markTurnsCancelled(active.turns, { turnId }),
               },
             });
           },
