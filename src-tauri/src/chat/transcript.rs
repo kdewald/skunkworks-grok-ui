@@ -198,17 +198,14 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
             }
         }
         "agent_thought_chunk" => {
-            // Always append parent thoughts, including while children run and
-            // late tails after complete (apply backlog can lag the finalizer).
+            // Match Grok TUI: reasoning channel → thought buffer only.
+            // Pure concat of content.text (no space glue, no kind re-routing).
             if turn.status != "streaming" && turn.status != "complete" {
                 return None;
             }
             let text = extract_chunk_text(update);
             if !text.is_empty() {
-                // Grok streams bare tokens (no leading spaces) and sometimes
-                // continues monologue with draft/status on the thought channel.
-                // append_agent_thought_smart: glue spaces, split status markers.
-                append_agent_thought_smart(turn, &text);
+                append_agent_thought(turn, &text);
             }
         }
         "tool_call" => {
@@ -1155,248 +1152,23 @@ fn count_open_subagents(turn: &Turn) -> usize {
         .count()
 }
 
-/// True when the most recent text block (ignoring nothing — tools seal the
-/// stream) is a Message. Used to fold mislabeled thought chunks into the
-/// open answer instead of starting a new "Thinking" card mid-reply.
-fn last_text_block_is_message(turn: &Turn) -> bool {
-    for b in turn.intermediate.iter().rev() {
-        match b {
-            IntermediateBlock::Message { .. } => return true,
-            IntermediateBlock::Thought { .. } => return false,
-            IntermediateBlock::Tool { .. }
-            | IntermediateBlock::Task { .. }
-            | IntermediateBlock::Subagent { .. }
-            | IntermediateBlock::Plan { .. } => return false,
-        }
-    }
-    false
-}
-
-/// Grok frequently emits user-facing progress / status lines on the thought
-/// channel. Those should render as assistant messages, not inside Thinking.
-fn thought_chunk_looks_like_status_message(text: &str) -> bool {
-    let t = text.trim_start();
-    if t.is_empty() {
-        return false;
-    }
-    // Leading quote/markdown noise
-    let t = t.trim_start_matches(['*', '_', '`', '"', '\'', '“', '”']);
-    const PREFIXES: &[&str] = &[
-        "Got it",
-        "I'll ",
-        "I will ",
-        "I see ",
-        "I see what",
-        "Here's ",
-        "Here are ",
-        "Here is ",
-        "Done.",
-        "Done!",
-        "Done —",
-        "Done -",
-        "Fixing ",
-        "Implementing ",
-        "Restoring ",
-        "Checking ",
-        "Reading ",
-        "Looking ",
-        "Building ",
-        "Updating ",
-        "Cleaning ",
-        "Removing ",
-        "Adding ",
-        "Creating ",
-        "Writing ",
-        "Running ",
-        "Sorry ",
-        "Sure ",
-        "Of course",
-        "Sounds good",
-        "On it",
-        "Working on",
-        "Let me know",
-    ];
-    PREFIXES.iter().any(|p| {
-        t.starts_with(p) || t.starts_with(&p.to_ascii_lowercase())
-    })
-}
-
-fn should_route_thought_chunk_to_message(turn: &Turn, text: &str) -> bool {
-    // Mid-answer: agent often fans the rest of the reply as thought chunks.
-    if last_text_block_is_message(turn) {
-        return true;
-    }
-    // Status / progress openers that belong in the chat bubble, not Thinking.
-    if thought_chunk_looks_like_status_message(text) {
-        return true;
-    }
-    false
-}
-
-/// Status markers that sometimes appear mid-thought after planning (agent monologue
-/// drifts into a draft reply). Returns byte index of the earliest marker.
-fn status_marker_at(s: &str) -> Option<usize> {
-    const MARKERS: &[&str] = &[
-        "Got it",
-        "I see what you mean",
-        "I'll restore",
-        "I'll modernize",
-        "I'll read",
-        "I'll check",
-        "I'll fix",
-        "I'll implement",
-        "Let me summarize",
-        "I found the ",
-        "I found ",
-    ];
-    let mut best: Option<usize> = None;
-    for m in MARKERS {
-        if let Some(i) = s.find(m) {
-            best = Some(best.map(|b| b.min(i)).unwrap_or(i));
-        }
-    }
-    best
-}
-
-/// Open thought we would append to (same walk as `append_agent_thought`).
-fn open_thought_text(turn: &Turn) -> Option<&str> {
-    for b in turn.intermediate.iter().rev() {
-        match b {
-            IntermediateBlock::Thought { text, .. } => return Some(text.as_str()),
-            IntermediateBlock::Tool { .. }
-            | IntermediateBlock::Task { .. }
-            | IntermediateBlock::Subagent { .. }
-            | IntermediateBlock::Plan { .. } => continue,
-            IntermediateBlock::Message { .. } => return None,
-        }
-    }
-    None
-}
-
-/// Insert a separator when gluing ACP text deltas.
+/// Append an ACP text delta literally (Grok Build contract).
 ///
-/// The agent often streams pieces without leading spaces. Two cases collide:
-/// - **Word boundary:** `"change"` + `"I"` must become `"change I"` (not `changeI`)
-/// - **Subword / BPE piece:** `"min"` + `"ion"` must stay `"minion"` (not `min ion`)
-///
-/// Heuristic: insert a space only when the join looks like a real word break
-/// (case change, digit boundary, markdown opener) — never between two lowercase
-/// letters, which is the usual subword continuation shape.
+/// The CLI forwards model SSE fragments with pure `push_str` and merges chunks
+/// with `format!("{}{}", a, b)`. Clients must not invent spaces or newlines.
 pub(crate) fn append_delta(existing: &mut String, text: &str) {
     if text.is_empty() {
         return;
     }
-    if existing.is_empty() {
-        existing.push_str(text);
-        return;
-    }
-    let prev = existing.chars().last().unwrap_or(' ');
-    let next = text.chars().next().unwrap_or(' ');
-    if !prev.is_whitespace() && !next.is_whitespace() {
-        if matches!(prev, ':' | '.' | '!' | '?') {
-            existing.push('\n');
-        } else if needs_glue_space(prev, next) {
-            existing.push(' ');
-        }
-    }
     existing.push_str(text);
 }
 
-/// Whether to insert a single space between `prev` (end of buffer) and `next`
-/// (start of incoming chunk).
-fn needs_glue_space(prev: char, next: char) -> bool {
-    // Markdown / quote openers after a word: `see` + `**bold**`
-    if prev.is_alphanumeric() && matches!(next, '*' | '#' | '`' | '[' | '_' | '"' | '\'') {
-        return true;
-    }
-    if !prev.is_alphanumeric() || !next.is_alphanumeric() {
-        return false;
-    }
-    // Subword continuation: "min" + "ion", "work" + "space"
-    if prev.is_lowercase() && next.is_lowercase() {
-        return false;
-    }
-    // New capitalized word/token: "change" + "I", "fonts" + "Got"
-    if next.is_uppercase() {
-        return true;
-    }
-    // Pronoun / acronym end + continuation word: "I" + "found"
-    if prev.is_uppercase() && next.is_lowercase() {
-        return true;
-    }
-    // Letter↔digit boundaries: "step" + "1", "2" + "px"
-    if prev.is_ascii_alphabetic() && next.is_ascii_digit() {
-        return true;
-    }
-    if prev.is_ascii_digit() && next.is_ascii_alphabetic() {
-        return true;
-    }
-    false
-}
-
-/// Apply a thought chunk with glue fix + optional split of mid-stream status.
-pub(crate) fn append_agent_thought_smart(turn: &mut Turn, text: &str) {
-    // Entire chunk is status / mid-answer fan-in → message channel.
-    if should_route_thought_chunk_to_message(turn, text) {
-        append_agent_message(turn, None, text);
-        return;
-    }
-
-    // Preview the glued thought text; split if a status marker appears mid-stream.
-    let mut preview = String::new();
-    if let Some(ex) = open_thought_text(turn) {
-        preview.push_str(ex);
-        append_delta(&mut preview, text);
-    } else {
-        preview.push_str(text);
-    }
-
-    if let Some(cut) = status_marker_at(&preview).filter(|&c| c > 0) {
-        let thought_part = preview[..cut].trim_end().to_string();
-        let message_part = preview[cut..].to_string();
-
-        // Write thought_part into the open thought (or create one).
-        let mut target_idx: Option<usize> = None;
-        for (i, b) in turn.intermediate.iter().enumerate().rev() {
-            match b {
-                IntermediateBlock::Thought { .. } => {
-                    target_idx = Some(i);
-                    break;
-                }
-                IntermediateBlock::Tool { .. }
-                | IntermediateBlock::Task { .. }
-                | IntermediateBlock::Subagent { .. }
-                | IntermediateBlock::Plan { .. } => continue,
-                IntermediateBlock::Message { .. } => break,
-            }
-        }
-        if let Some(i) = target_idx {
-            if let IntermediateBlock::Thought { text: existing, .. } = &mut turn.intermediate[i]
-            {
-                *existing = thought_part;
-            }
-        } else if !thought_part.is_empty() {
-            turn.intermediate.push(IntermediateBlock::Thought {
-                id: new_id(),
-                text: thought_part,
-                collapsed: false,
-            });
-        }
-        if !message_part.is_empty() {
-            append_agent_message(turn, None, &message_part);
-        }
-        return;
-    }
-
-    append_agent_thought(turn, text);
-}
-
-/// Append a thought chunk. Walk back through tools/tasks so a tool call mid-
-/// think does not start a brand-new truncated Thought block (Grok often
-/// continues the same thought stream after tools).
+/// Append a thought chunk (ACP agent_thought_chunk / reasoning channel).
+/// Walk back through tools/tasks so a tool call mid-think continues the same
+/// Thought block when Grok resumes reasoning after tools.
 ///
-/// A Message is a hard boundary — never append pre-message thoughts once a
-/// status/answer line has started (new reasoning becomes a new Thought after).
+/// A Message is a hard boundary (new Thought after answer text) — matches the
+/// Grok TUI finishing thinking when agent_message_chunk arrives.
 fn append_agent_thought(turn: &mut Turn, text: &str) {
     let mut target_idx: Option<usize> = None;
     for (i, b) in turn.intermediate.iter().enumerate().rev() {
@@ -1572,128 +1344,65 @@ mod stream_tests {
     }
 
     #[test]
-    fn append_delta_inserts_space_between_bare_tokens() {
-        // Live wire: "change" + "I" → must not be "changeI"
-        let mut s = String::from("change");
-        append_delta(&mut s, "I");
-        assert_eq!(s, "change I");
-        append_delta(&mut s, " found");
-        assert_eq!(s, "change I found");
-    }
-
-    #[test]
-    fn append_delta_does_not_split_subword_tokens() {
-        // BPE-style pieces of one word must not gain a space.
+    fn append_delta_is_pure_concat() {
+        // Grok CLI / sampler / merge buffer all use push_str only.
         let mut s = String::from("min");
         append_delta(&mut s, "ion");
         assert_eq!(s, "minion");
         append_delta(&mut s, "-local");
         assert_eq!(s, "minion-local");
-        // "work" + "space" as lowercase pieces → "workspace"
-        let mut w = String::from("work");
-        append_delta(&mut w, "space");
-        assert_eq!(w, "workspace");
+
+        // Spaces only appear when the wire already contains them.
+        let mut t = String::from("Hello,");
+        append_delta(&mut t, " world");
+        assert_eq!(t, "Hello, world");
+
+        // No invented space between bare fragments (matches agent merge tests).
+        let mut u = String::from("change");
+        append_delta(&mut u, "I");
+        assert_eq!(u, "changeI");
     }
 
     #[test]
-    fn append_delta_spaces_before_capitalized_words() {
-        let mut s = String::from("fonts");
-        append_delta(&mut s, "Got");
-        assert_eq!(s, "fonts Got");
-        // "I" + "found" (uppercase then lowercase word)
-        let mut t = String::from("I");
-        append_delta(&mut t, "found");
-        assert_eq!(t, "I found");
-    }
-
-    #[test]
-    fn append_delta_newline_after_colon() {
-        let mut s = String::from("wants me to:");
-        append_delta(&mut s, "1. Restore");
-        assert_eq!(s, "wants me to:\n1. Restore");
-    }
-
-    #[test]
-    fn fonts_got_it_scenario_splits_status_out_of_thought() {
-        // Historical desktop bug: planning + "Got it—" glued in one Thought.
+    fn thought_channel_stays_in_thought() {
+        // TUI parity: agent_thought_chunk never re-routes to message by content.
         let mut turn = empty_turn();
-        for tok in [
-            "The user wants me to:\n",
-            "1. Restore the old fonts",
-            "Got it—I'll restore the original font classes from layout.tsx and clean up the LLM note.",
-        ] {
-            append_agent_thought_smart(&mut turn, tok);
-        }
+        append_agent_thought(
+            &mut turn,
+            "The user wants me to:\n1. Restore the old fonts\n",
+        );
+        append_agent_thought(
+            &mut turn,
+            "Got it—I'll restore the original font classes.",
+        );
+        assert!(message_text(&turn).is_empty(), "msg={:?}", message_text(&turn));
         let th = thought_text(&turn);
-        let msg = message_text(&turn);
-        assert!(
-            th.contains("Restore the old fonts"),
-            "thought should keep planning: {th:?}"
-        );
-        assert!(
-            !th.contains("Got it"),
-            "thought must not keep status 'Got it': {th:?}"
-        );
-        assert!(
-            msg.contains("Got it"),
-            "status should be on message: {msg:?}"
-        );
+        assert!(th.contains("Restore the old fonts"), "{th:?}");
+        assert!(th.contains("Got it"), "{th:?}");
     }
 
     #[test]
-    fn tool_turn_glue_and_post_tool_thought() {
-        // Live tool-turn wire: bare tokens then "I found…" on thought channel.
+    fn message_and_thought_channels_stay_separate() {
         let mut turn = empty_turn();
-        for tok in [
-            "The user wants me to:\n",
-            "1. Think step by step about what to change",
-            "I found the layout.tsx file. Let me summarize what I found for the user based on their preferences:\n",
-        ] {
-            append_agent_thought_smart(&mut turn, tok);
-        }
-        let th = thought_text(&turn);
-        let msg = message_text(&turn);
-        // Glue: never "changeI"
-        assert!(
-            !th.contains("changeI") && !msg.contains("changeI"),
-            "missing token space: thought={th:?} message={msg:?}"
-        );
-        // "I found " marker should split to message when after planning text
-        assert!(
-            msg.contains("I found") || th.contains("I found"),
-            "expected 'I found' somewhere: thought={th:?} message={msg:?}"
-        );
-        // Prefer split: planning in thought, "I found" on message
-        assert!(
-            !th.contains("I found"),
-            "post-tool status monologue should leave thought: {th:?}"
-        );
-        assert!(
-            msg.contains("I found the layout"),
-            "should be message: {msg:?}"
-        );
+        append_agent_thought(&mut turn, "Planning step by step…\n");
+        append_agent_message(&mut turn, None, "Here is the answer: ");
+        // Later thought is a NEW thought block (message is hard boundary), not folded.
+        append_agent_thought(&mut turn, "extra reasoning");
+        assert_eq!(message_text(&turn), "Here is the answer: ");
+        assert!(thought_text(&turn).contains("Planning"));
+        assert!(thought_text(&turn).contains("extra reasoning"));
     }
 
     #[test]
     fn pure_reasoning_stays_in_thought() {
         let mut turn = empty_turn();
-        append_agent_thought_smart(
+        append_agent_thought(
             &mut turn,
             "The problem asks to compute (17 × 23) + (41 × 19) − 88.\n",
         );
-        append_agent_thought_smart(&mut turn, "I need to show intermediate products.");
+        append_agent_thought(&mut turn, "I need to show intermediate products.");
         assert!(message_text(&turn).is_empty(), "no false status route");
         assert!(thought_text(&turn).contains("17 × 23"));
-    }
-
-    #[test]
-    fn mid_answer_thought_folds_into_message() {
-        let mut turn = empty_turn();
-        append_agent_message(&mut turn, None, "Here is the answer: ");
-        // Mislabeled thought mid-reply
-        append_agent_thought_smart(&mut turn, "1082");
-        assert_eq!(message_text(&turn), "Here is the answer: 1082");
-        assert!(thought_text(&turn).is_empty());
     }
 
     fn doc_with_streaming_turn() -> ChatDocument {

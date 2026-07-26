@@ -73,34 +73,46 @@ function PayloadView({ value, label }: { value: unknown; label: string }) {
   );
 }
 
-/** Visible thinking stream — distinct from assistant replies. */
+/**
+ * Reasoning / agent_thought_chunk stream — mirrors Grok TUI ThinkingBlock:
+ * header "Thinking…" while live, "Thought" when settled; collapsed by default
+ * after the turn finishes so the reply stays primary.
+ */
 function ThoughtStream({
   text,
-  defaultOpen,
+  streaming,
 }: {
   text: string;
-  /** Open while streaming; collapse when the turn is done so replies stay primary. */
-  defaultOpen: boolean;
+  /** True while this turn is still streaming (live thinking). */
+  streaming: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const prevDefault = useRef(defaultOpen);
+  // Open while streaming so live reasoning is visible; collapse when settled.
+  const preferOpen = streaming;
+  const [open, setOpen] = useState(preferOpen);
+  const prevPrefer = useRef(preferOpen);
   useEffect(() => {
-    // Follow streaming → complete transition (collapse when turn settles).
-    if (prevDefault.current !== defaultOpen) {
-      setOpen(defaultOpen);
-      prevDefault.current = defaultOpen;
+    if (prevPrefer.current !== preferOpen) {
+      setOpen(preferOpen);
+      prevPrefer.current = preferOpen;
     }
-  }, [defaultOpen]);
+  }, [preferOpen]);
   if (!text.trim()) return null;
+  const label = streaming ? "Thinking…" : "Thought";
   return (
-    <div className={`thought-stream ${open ? "is-open" : "is-closed"}`}>
+    <div
+      className={`thought-stream ${open ? "is-open" : "is-closed"} ${streaming ? "is-streaming" : ""}`}
+    >
       <button
         type="button"
         className="thought-stream-toggle"
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
       >
         <Brain size={12} strokeWidth={1.75} className="thought-stream-icon" />
-        <span className="thought-stream-label">Thinking</span>
+        <span className="thought-stream-label">{label}</span>
+        {streaming && (
+          <Loader2 size={11} className="spin thought-stream-spinner" />
+        )}
         <span className="thought-stream-meta">
           {text.length.toLocaleString()} chars
         </span>
@@ -112,7 +124,7 @@ function ThoughtStream({
       </button>
       {open && (
         <div className="thought-stream-body">
-          <p className="thought-stream-text">{text}</p>
+          <Markdown className="thought-stream-md markdown">{text}</Markdown>
         </div>
       )}
     </div>
@@ -496,11 +508,16 @@ export function IntermediateWork({ turn }: { turn: Turn }) {
           return <AssistantMessage key={run.key} text={run.text} />;
         }
         if (run.kind === "thought") {
+          // A thought run is "live" only if the turn is streaming and no
+          // later message/work has sealed it (matches TUI finish_thinking).
+          const laterSealed = timeline
+            .slice(idx + 1)
+            .some((r) => r.kind === "message" || r.kind === "work");
           return (
             <ThoughtStream
               key={run.key}
               text={run.text}
-              defaultOpen={streaming}
+              streaming={streaming && !laterSealed}
             />
           );
         }
