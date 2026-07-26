@@ -1273,8 +1273,15 @@ fn open_thought_text(turn: &Turn) -> Option<&str> {
     None
 }
 
-/// Insert a separator when gluing ACP text deltas. The agent often streams bare
-/// tokens without leading spaces (`"change"` + `"I"` → must not become `"changeI"`).
+/// Insert a separator when gluing ACP text deltas.
+///
+/// The agent often streams pieces without leading spaces. Two cases collide:
+/// - **Word boundary:** `"change"` + `"I"` must become `"change I"` (not `changeI`)
+/// - **Subword / BPE piece:** `"min"` + `"ion"` must stay `"minion"` (not `min ion`)
+///
+/// Heuristic: insert a space only when the join looks like a real word break
+/// (case change, digit boundary, markdown opener) — never between two lowercase
+/// letters, which is the usual subword continuation shape.
 pub(crate) fn append_delta(existing: &mut String, text: &str) {
     if text.is_empty() {
         return;
@@ -1288,14 +1295,43 @@ pub(crate) fn append_delta(existing: &mut String, text: &str) {
     if !prev.is_whitespace() && !next.is_whitespace() {
         if matches!(prev, ':' | '.' | '!' | '?') {
             existing.push('\n');
-        } else if prev.is_alphanumeric()
-            && (next.is_alphanumeric()
-                || matches!(next, '*' | '#' | '`' | '[' | '_' | '"' | '\''))
-        {
+        } else if needs_glue_space(prev, next) {
             existing.push(' ');
         }
     }
     existing.push_str(text);
+}
+
+/// Whether to insert a single space between `prev` (end of buffer) and `next`
+/// (start of incoming chunk).
+fn needs_glue_space(prev: char, next: char) -> bool {
+    // Markdown / quote openers after a word: `see` + `**bold**`
+    if prev.is_alphanumeric() && matches!(next, '*' | '#' | '`' | '[' | '_' | '"' | '\'') {
+        return true;
+    }
+    if !prev.is_alphanumeric() || !next.is_alphanumeric() {
+        return false;
+    }
+    // Subword continuation: "min" + "ion", "work" + "space"
+    if prev.is_lowercase() && next.is_lowercase() {
+        return false;
+    }
+    // New capitalized word/token: "change" + "I", "fonts" + "Got"
+    if next.is_uppercase() {
+        return true;
+    }
+    // Pronoun / acronym end + continuation word: "I" + "found"
+    if prev.is_uppercase() && next.is_lowercase() {
+        return true;
+    }
+    // Letter↔digit boundaries: "step" + "1", "2" + "px"
+    if prev.is_ascii_alphabetic() && next.is_ascii_digit() {
+        return true;
+    }
+    if prev.is_ascii_digit() && next.is_ascii_alphabetic() {
+        return true;
+    }
+    false
 }
 
 /// Apply a thought chunk with glue fix + optional split of mid-stream status.
@@ -1543,6 +1579,31 @@ mod stream_tests {
         assert_eq!(s, "change I");
         append_delta(&mut s, " found");
         assert_eq!(s, "change I found");
+    }
+
+    #[test]
+    fn append_delta_does_not_split_subword_tokens() {
+        // BPE-style pieces of one word must not gain a space.
+        let mut s = String::from("min");
+        append_delta(&mut s, "ion");
+        assert_eq!(s, "minion");
+        append_delta(&mut s, "-local");
+        assert_eq!(s, "minion-local");
+        // "work" + "space" as lowercase pieces → "workspace"
+        let mut w = String::from("work");
+        append_delta(&mut w, "space");
+        assert_eq!(w, "workspace");
+    }
+
+    #[test]
+    fn append_delta_spaces_before_capitalized_words() {
+        let mut s = String::from("fonts");
+        append_delta(&mut s, "Got");
+        assert_eq!(s, "fonts Got");
+        // "I" + "found" (uppercase then lowercase word)
+        let mut t = String::from("I");
+        append_delta(&mut t, "found");
+        assert_eq!(t, "I found");
     }
 
     #[test]
