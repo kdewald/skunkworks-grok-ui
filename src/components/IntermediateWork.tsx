@@ -96,7 +96,8 @@ function ThoughtStream({
       prevPrefer.current = preferOpen;
     }
   }, [preferOpen]);
-  if (!text.trim()) return null;
+  // Hide only if there is no visible content at all (not if we merely have newlines).
+  if (!text) return null;
   const label = streaming ? "Thinking…" : "Thought";
   return (
     <div
@@ -124,7 +125,13 @@ function ThoughtStream({
       </button>
       {open && (
         <div className="thought-stream-body">
-          <Markdown className="thought-stream-md markdown">{text}</Markdown>
+          {/*
+            Prefer pre-wrap plain text for stream fidelity. CommonMark treats a
+            single newline as a soft break (often rendered as a space), which
+            turns model fragments like "min\\nion" into "min ion". Grok's wire
+            is opaque deltas — preserve them exactly here.
+          */}
+          <pre className="thought-stream-text">{text}</pre>
         </div>
       )}
     </div>
@@ -384,7 +391,8 @@ function buildTimeline(blocks: IntermediateBlock[]): TimelineRun[] {
     if (isSubagentRailTool(b)) continue;
 
     if (b.type === "message") {
-      if (!b.text.trim()) continue;
+      // Never .trim() — newlines/spaces are part of the ACP stream.
+      if (b.text.length === 0) continue;
       const last = runs[runs.length - 1];
       if (last?.kind === "message") {
         last.text += b.text;
@@ -394,7 +402,8 @@ function buildTimeline(blocks: IntermediateBlock[]): TimelineRun[] {
       continue;
     }
     if (b.type === "thought") {
-      if (!b.text.trim()) continue;
+      // Never .trim() — a "\n"-only chunk is real stream content.
+      if (b.text.length === 0) continue;
       const last = runs[runs.length - 1];
       if (last?.kind === "thought") {
         last.text += b.text;
