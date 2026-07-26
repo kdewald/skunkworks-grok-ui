@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.6.1] — 2026-07-25
+
+### Changed
+
+- Modularization: pure ACP transcript reducer (`chat::transcript`), session/history helpers (`chat::session`)
+- SSH utilities extracted from ACP connection code (`ssh.rs`)
+- Thin Tauri command modules for terminal, workspace FS, and LSP
+- Frontend state modules: turn lifecycle reducers, stream apply drain, send-slot helpers
+- Files open/save generation guards against stale async results
+
+### Added
+
+- Vitest unit tests for pure frontend state modules (`npm test`)
+- Expanded Rust unit tests for transcript apply and session rehydrate helpers
+
+### Packaging
+
+- Version bump to 0.6.1
+
 ## [0.6.0] — 2026-07-25
 
 ### Added
