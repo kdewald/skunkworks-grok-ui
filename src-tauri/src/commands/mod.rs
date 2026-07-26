@@ -27,6 +27,7 @@ use crate::store::{
 use crate::terminal::TerminalManager;
 use crate::lsp::LspHub;
 
+use crate::chat::session::{build_history_seed, is_unknown_session_error};
 use crate::chat::transcript::{
     apply_one_update, is_stream_chunk_kind, promote_subagent_tools_in_doc,
 };
@@ -1480,42 +1481,6 @@ fn patch_chat_session_id(
     mark_session_loaded(state, env_id, new_sid.to_string());
     sync_meta(state, &doc)?;
     Ok(doc)
-}
-
-fn is_unknown_session_error(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    // Prefer exact agent wording — avoid retrying on unrelated -32602 invalid params.
-    e.contains("unknown session id")
-        || e.contains("unknown session")
-        || e.contains("\"data\":\"unknown session id\"")
-}
-
-fn build_history_seed(doc: &ChatDocument, new_message: &str) -> String {
-    let mut parts = Vec::new();
-    parts.push(
-        "The previous agent session could not be restored, so this is a fresh ACP session \
-with the same project folder. Below is the conversation so far from the local transcript. \
-Continue naturally from that context.\n"
-            .to_string(),
-    );
-    for (i, turn) in doc.turns.iter().enumerate() {
-        if i + 1 == doc.turns.len()
-            && turn.status == "streaming"
-            && turn.user_message == new_message
-            && turn.assistant_message.is_empty()
-        {
-            continue;
-        }
-        parts.push(format!("User:\n{}\n", turn.user_message));
-        if !turn.assistant_message.trim().is_empty() {
-            parts.push(format!("Assistant:\n{}\n", turn.assistant_message));
-        }
-    }
-    parts.push(format!(
-        "---\nUser's new message (respond to this):\n{}",
-        new_message
-    ));
-    parts.join("\n")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
