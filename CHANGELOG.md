@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.2] — 2026-07-26
+
+### Fixed
+
+- ACP stream assembly matches Grok Build TUI: pure text concat (no space-glue heuristics)
+- `agent_thought_chunk` / `agent_message_chunk` kinds are trusted (no content-based re-routing of thoughts into messages)
+- Words like `minion` no longer split mid-stream (`min ion`)
+
+### Changed
+
+- Thinking UI: **Thinking…** while live, **Thought** when sealed; muted markdown body
+- Thought collapses after a later message/work seals it (TUI-style finish thinking)
+
+### Packaging
+
+- Version bump to 0.6.2
+
 ## [0.6.1] — 2026-07-25
 
 ### Changed
