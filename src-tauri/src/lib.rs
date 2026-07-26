@@ -1,4 +1,5 @@
 mod acp;
+mod chat;
 mod commands;
 mod lsp;
 mod store;
