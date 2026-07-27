@@ -5,6 +5,11 @@ import { IntermediateWork } from "./IntermediateWork";
 import { Composer } from "./Composer";
 import { SubagentPanel } from "./SubagentPanel";
 import { WorkspaceHeader } from "./WorkspaceHeader";
+import {
+  AGENT_BACKENDS,
+  agentBackendLabel,
+  normalizeAgentBackend,
+} from "../types";
 
 /** Distance from bottom (px) still counted as "pinned" for sticky follow. */
 const STICK_THRESHOLD = 80;
@@ -16,11 +21,15 @@ function distanceFromBottom(el: HTMLElement): number {
 export function ChatView() {
   const {
     activeChat,
+    activeBackend,
     activeProjectId,
     projects,
     busy,
     error,
     createChat,
+    setActiveBackend,
+    setChatModel,
+    setChatAccessMode,
     startEditTurn,
     composerEdit,
   } = useAppStore();
@@ -37,6 +46,13 @@ export function ChatView() {
   const stickToBottom = useRef(true);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
   const project = projects.find((p) => p.id === activeProjectId);
+  const backendLabel = agentBackendLabel(
+    normalizeAgentBackend(activeChat?.backend ?? activeBackend),
+  );
+  const agentConfig = activeChat?.agentConfig;
+  const modelLabel = agentConfig?.modelName ?? agentConfig?.modelId ?? "Default model";
+  const accessLabel =
+    agentConfig?.accessModeName ?? agentConfig?.accessModeId ?? "Agent default";
 
   const lastTurn = activeChat?.turns[activeChat.turns.length - 1];
   const streaming = lastTurn?.status === "streaming";
@@ -188,7 +204,7 @@ export function ChatView() {
           </p>
           <p>
             {isScratch
-              ? "General chat with Grok. Each scratch chat has its own hidden working folder."
+              ? `General chat with ${backendLabel}. Each scratch chat has its own hidden working folder.`
               : "No chat selected."}
           </p>
           <button
@@ -215,6 +231,11 @@ export function ChatView() {
         subtitle={
           <>
             <span>{project?.name}</span>
+            {activeChat.turns.length > 0 && (
+              <span className="agent-lock-summary">
+                · {backendLabel} · {modelLabel} · {accessLabel}
+              </span>
+            )}
             {activeChat.acpSessionId && (
               <span className="mono muted">
                 · {activeChat.acpSessionId.slice(0, 8)}…
@@ -230,9 +251,81 @@ export function ChatView() {
           <div className="messages-wrap">
             <div className="messages" ref={scrollerRef} tabIndex={-1}>
               {activeChat.turns.length === 0 && (
-                <div className="empty-hint center">
-                  Send a message to start. Grok can read and edit files in{" "}
-                  <code>{project?.path}</code>.
+                <div className="new-chat-setup">
+                  <div className="new-chat-setup-title">New chat</div>
+                  <div className="new-chat-selectors">
+                    <label className="new-chat-field">
+                      <span>Provider</span>
+                      <select
+                        value={normalizeAgentBackend(activeChat.backend)}
+                        disabled={busy}
+                        onChange={(event) =>
+                          void setActiveBackend(
+                            normalizeAgentBackend(event.target.value),
+                          )
+                        }
+                      >
+                        {AGENT_BACKENDS.map((backend) => (
+                          <option key={backend} value={backend}>
+                            {agentBackendLabel(backend)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="new-chat-field">
+                      <span>Model</span>
+                      <select
+                        value={agentConfig?.modelId ?? ""}
+                        disabled={
+                          busy || (agentConfig?.availableModels.length ?? 0) < 2
+                        }
+                        onChange={(event) =>
+                          void setChatModel(event.target.value).catch(() => {})
+                        }
+                      >
+                        {(agentConfig?.availableModels.length ?? 0) === 0 ? (
+                          <option value="">Agent default</option>
+                        ) : (
+                          agentConfig?.availableModels.map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.name}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+
+                    <label className="new-chat-field">
+                      <span>Access</span>
+                      <select
+                        value={agentConfig?.accessModeId ?? ""}
+                        disabled={
+                          busy ||
+                          (agentConfig?.availableAccessModes.length ?? 0) < 2
+                        }
+                        onChange={(event) =>
+                          void setChatAccessMode(event.target.value).catch(
+                            () => {},
+                          )
+                        }
+                      >
+                        {(agentConfig?.availableAccessModes.length ?? 0) === 0 ? (
+                          <option value="">Agent default</option>
+                        ) : (
+                          agentConfig?.availableAccessModes.map((mode) => (
+                            <option key={mode.id} value={mode.id}>
+                              {mode.name}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="new-chat-setup-hint">
+                    These settings lock after your first message. {backendLabel}{" "}
+                    will work in <code>{project?.path}</code>.
+                  </div>
                 </div>
               )}
               {activeChat.turns.map((turn) => {
@@ -299,7 +392,7 @@ export function ChatView() {
                       )}
                     </div>
                     <div className="agent-col">
-                      <div className="role">Grok</div>
+                      <div className="role">{backendLabel}</div>
                       {/* Parent tools / thinking / answers only — subagents are in the rail. */}
                       <IntermediateWork turn={turn} />
                       {turn.status === "streaming" &&

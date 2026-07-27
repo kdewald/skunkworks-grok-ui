@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.7.0] — 2026-07-27
+
+### Added
+
+- Interchangeable Grok, Codex, and Claude ACP backends, persisted per chat
+- Local and SSH agent runtimes scoped independently by environment and backend
+- New-chat Provider, Model, and Access selectors populated from each agent's
+  advertised ACP capabilities
+- Codex and Claude ACP adapter discovery using credentials from the existing
+  CLI login
+
+### Changed
+
+- Provider, model, and access settings lock after the first message and remain
+  visible in the chat header
+- Switching providers automatically connects the matching CLI and replaces an
+  unused draft so messages cannot route to the previous backend
+- New sessions default to Full Access: Grok `--always-approve`, Codex
+  `agent-full-access`, and Claude `bypassPermissions`
+- ACP adapter requirements are pinned and documented; the app never installs
+  software at runtime
+
+### Fixed
+
+- Recreated ACP sessions restore the chat's selected model and access mode
+- Session streams, permissions, connection state, and cancellation are routed
+  by both environment and backend to prevent cross-provider state leaks
+- Thought and message timelines preserve whitespace-only chunks and embedded
+  newlines exactly
+
+### Packaging
+
+- Version bump to 0.7.0
+
 ## [0.6.2] — 2026-07-26
 
 ### Fixed
@@ -245,6 +279,7 @@
 - License: Apache-2.0
 - Unofficial; not affiliated with xAI / SpaceX / SpaceXAI / X Corp.
 
+[0.7.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.7.0
 [0.4.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kdewald/skunkworks-grok-ui/releases/tag/v0.3.0

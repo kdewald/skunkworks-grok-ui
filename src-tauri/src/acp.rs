@@ -1,9 +1,10 @@
-//! ACP (Agent Client Protocol) client over `grok agent stdio`.
+//! ACP (Agent Client Protocol) client over a supported agent backend.
 //!
 //! Supports local process spawn and remote spawn via SSH
-//! (`ssh host -- bash -lc '… grok agent --no-leader stdio'`).
+//! (`ssh host -- bash -lc '… <agent> stdio'`).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +18,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
-use crate::ssh::{remote_agent_shell_command, resolve_grok_binary, ssh_remote_bash_lc};
+use crate::ssh::{remote_agent_shell_command, resolve_agent_binary, ssh_remote_bash_lc};
+use crate::store::AgentBackend;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +31,8 @@ pub struct PermissionRequestEvent {
     pub options: Value,
     #[serde(default)]
     pub environment_id: String,
+    #[serde(default)]
+    pub backend: AgentBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +42,8 @@ pub struct SessionUpdateEvent {
     pub update: Value,
     #[serde(default)]
     pub environment_id: String,
+    #[serde(default)]
+    pub backend: AgentBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,20 +54,33 @@ pub struct AgentStatusEvent {
     pub agent_info: Option<Value>,
     #[serde(default)]
     pub environment_id: String,
+    #[serde(default)]
+    pub backend: AgentBackend,
 }
 
-/// How to start the `grok agent stdio` process.
+/// How to start a backend's ACP process.
 #[derive(Debug, Clone)]
 pub enum AgentSpawnTarget {
     Local {
+        backend: AgentBackend,
+        /// Optional absolute path to Grok. Ignored by adapter backends.
         grok_path: Option<String>,
     },
     Ssh {
+        backend: AgentBackend,
         /// SSH config Host alias or `user@host`.
         host: String,
         /// Optional absolute path to `grok` on the remote host.
         remote_grok_path: Option<String>,
     },
+}
+
+impl AgentSpawnTarget {
+    pub fn backend(&self) -> AgentBackend {
+        match self {
+            Self::Local { backend, .. } | Self::Ssh { backend, .. } => *backend,
+        }
+    }
 }
 
 /// JSON-RPC request id (number or string — Grok uses both).
@@ -98,6 +117,7 @@ impl RpcId {
 
 pub struct AcpConnection {
     pub environment_id: String,
+    pub backend: AgentBackend,
     stdin: AsyncMutex<ChildStdin>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<RpcId, oneshot::Sender<Result<Value>>>>>,
@@ -122,25 +142,46 @@ impl AcpConnection {
         environment_id: String,
         target: AgentSpawnTarget,
     ) -> Result<Arc<Self>> {
+        let backend = target.backend();
         let mut child = match &target {
-            AgentSpawnTarget::Local { grok_path } => {
-                let binary = resolve_grok_binary(grok_path.clone())?;
-                Command::new(&binary)
-                    .args(["agent", "--no-leader", "stdio"])
+            AgentSpawnTarget::Local { grok_path, .. } => {
+                let binary = resolve_agent_binary(backend, grok_path.clone())?;
+                let mut command = Command::new(&binary);
+                if let Some(parent) = Path::new(&binary)
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                {
+                    let inherited = std::env::var_os("PATH").unwrap_or_default();
+                    let paths = std::iter::once(parent.to_path_buf())
+                        .chain(std::env::split_paths(&inherited));
+                    if let Ok(path) = std::env::join_paths(paths) {
+                        // npm adapter launchers use `#!/usr/bin/env node`; use
+                        // the Node beside the globally installed adapter.
+                        command.env("PATH", path);
+                    }
+                }
+                if backend == AgentBackend::Grok {
+                    command.args(["agent", "--no-leader", "--always-approve", "stdio"]);
+                }
+                command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true)
                     .spawn()
-                    .with_context(|| format!("failed to spawn `{binary} agent stdio`"))?
+                    .with_context(|| {
+                        format!("failed to spawn {} ACP agent `{binary}`", backend.as_str())
+                    })?
             }
             AgentSpawnTarget::Ssh {
                 host,
                 remote_grok_path,
+                ..
             } => {
                 // OpenSSH joins remote argv with spaces, so the login-shell command
                 // must be a *single* ssh argument (properly shell-quoted).
                 let remote_cmd = ssh_remote_bash_lc(&remote_agent_shell_command(
+                    backend,
                     remote_grok_path.as_deref(),
                 ));
                 Command::new("ssh")
@@ -164,7 +205,10 @@ impl AcpConnection {
                     .kill_on_drop(true)
                     .spawn()
                     .with_context(|| {
-                        format!("failed to spawn ssh to `{host}` for remote grok agent")
+                        format!(
+                            "failed to spawn ssh to `{host}` for remote {} ACP agent",
+                            backend.as_str()
+                        )
                     })?
             }
         };
@@ -183,6 +227,7 @@ impl AcpConnection {
 
         let conn = Arc::new(Self {
             environment_id: environment_id.clone(),
+            backend,
             stdin: AsyncMutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -198,6 +243,7 @@ impl AcpConnection {
         if let Some(stderr) = stderr {
             let app_err = app.clone();
             let env_id = environment_id.clone();
+            let stderr_backend = backend;
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -207,6 +253,7 @@ impl AcpConnection {
                             "level": "stderr",
                             "message": line,
                             "environmentId": env_id,
+                            "backend": stderr_backend,
                         }),
                     );
                 }
@@ -234,6 +281,7 @@ impl AcpConnection {
                                             "level": "error",
                                             "message": format!("ACP parse error: {err}; line={line}"),
                                             "environmentId": reader_conn.environment_id,
+                                            "backend": reader_conn.backend,
                                         }),
                                     );
                                 }
@@ -253,6 +301,7 @@ impl AcpConnection {
                                         message: "Agent process exited".into(),
                                         agent_info: None,
                                         environment_id: env_for_exit.clone(),
+                                        backend: reader_conn.backend,
                                     },
                                 );
                                 break;
@@ -268,6 +317,7 @@ impl AcpConnection {
                                         "level": "error",
                                         "message": format!("stdout read error: {err}"),
                                         "environmentId": reader_conn.environment_id,
+                                        "backend": reader_conn.backend,
                                     }),
                                 );
                                 let _ = reader_conn.app.emit(
@@ -277,6 +327,7 @@ impl AcpConnection {
                                         message: format!("Agent stdout error: {err}"),
                                         agent_info: None,
                                         environment_id: env_for_exit.clone(),
+                                        backend: reader_conn.backend,
                                     },
                                 );
                                 break;
@@ -321,6 +372,7 @@ impl AcpConnection {
                         "Failed {n} in-flight ACP request(s): {reason}"
                     ),
                     "environmentId": self.environment_id,
+                    "backend": self.backend,
                 }),
             );
         }
@@ -404,6 +456,7 @@ impl AcpConnection {
                         session_id,
                         update,
                         environment_id: self.environment_id.clone(),
+                        backend: self.backend,
                     },
                 );
             }
@@ -414,6 +467,7 @@ impl AcpConnection {
                         "method": other,
                         "params": params,
                         "environmentId": self.environment_id,
+                        "backend": self.backend,
                     }),
                 );
             }
@@ -447,6 +501,7 @@ impl AcpConnection {
                         tool_call,
                         options,
                         environment_id: self.environment_id.clone(),
+                        backend: self.backend,
                     },
                 );
             }
@@ -475,6 +530,7 @@ impl AcpConnection {
                         "level": "debug",
                         "message": format!("Ignoring unsupported agent→client method: {other}"),
                         "environmentId": self.environment_id,
+                        "backend": self.backend,
                     }),
                 );
                 self.write_response(id, Ok(json!({}))).await?;
@@ -492,11 +548,7 @@ impl AcpConnection {
         Ok(())
     }
 
-    async fn write_response(
-        &self,
-        id: RpcId,
-        result: Result<Value, (i32, String)>,
-    ) -> Result<()> {
+    async fn write_response(&self, id: RpcId, result: Result<Value, (i32, String)>) -> Result<()> {
         let id_val = id.to_value();
         let msg = match result {
             Ok(value) => json!({
@@ -579,7 +631,12 @@ impl AcpConnection {
                         "readTextFile": false,
                         "writeTextFile": false
                     },
-                    "terminal": false
+                    "terminal": false,
+                    "session": {
+                        "configOptions": {
+                            "boolean": {}
+                        }
+                    }
                 },
                 "clientInfo": {
                     "name": "skunkworks-grok-ui",
@@ -591,14 +648,27 @@ impl AcpConnection {
         .await
     }
 
-    /// Authenticate using initialize result: prefer cached_token, then defaultAuthMethodId.
-    pub async fn authenticate_from_init(&self, init: &Value) -> Result<Value> {
+    /// Apply Grok's initialize-time auth selection.
+    ///
+    /// Adapter backends own their authentication flow and must not use this helper.
+    pub async fn authenticate_grok_from_init(&self, init: &Value) -> Result<Value> {
+        if self.backend != AgentBackend::Grok {
+            anyhow::bail!(
+                "Grok authentication helper cannot authenticate the {} backend",
+                self.backend.as_str()
+            );
+        }
+
         let methods: Vec<String> = init
             .get("authMethods")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+                    .filter_map(|m| {
+                        m.get("id")
+                            .and_then(|id| id.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -635,11 +705,8 @@ impl AcpConnection {
             );
         }
 
-        self.request(
-            "authenticate",
-            json!({ "methodId": method_id }),
-        )
-        .await
+        self.request("authenticate", json!({ "methodId": method_id }))
+            .await
     }
 
     pub async fn session_new(&self, cwd: &str) -> Result<Value> {
@@ -660,6 +727,45 @@ impl AcpConnection {
                 "sessionId": session_id,
                 "cwd": cwd,
                 "mcpServers": []
+            }),
+        )
+        .await
+    }
+
+    pub async fn session_set_mode(&self, session_id: &str, mode_id: &str) -> Result<Value> {
+        self.request(
+            "session/set_mode",
+            json!({
+                "sessionId": session_id,
+                "modeId": mode_id
+            }),
+        )
+        .await
+    }
+
+    pub async fn session_set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: Value,
+    ) -> Result<Value> {
+        self.request(
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": value
+            }),
+        )
+        .await
+    }
+
+    pub async fn session_set_model(&self, session_id: &str, model_id: &str) -> Result<Value> {
+        self.request(
+            "session/set_model",
+            json!({
+                "sessionId": session_id,
+                "modelId": model_id
             }),
         )
         .await
@@ -709,6 +815,7 @@ impl AcpConnection {
                              so a queued follow-up cannot share a still-running session"
                         ),
                         "environmentId": this.environment_id,
+                        "backend": this.backend,
                     }),
                 );
                 this.shutdown(&format!(
@@ -722,6 +829,7 @@ impl AcpConnection {
                         message: "Agent killed after cancel timeout".into(),
                         agent_info: None,
                         environment_id: this.environment_id.clone(),
+                        backend: this.backend,
                     },
                 );
             });
@@ -759,11 +867,8 @@ impl AcpConnection {
             ids
         };
         for id in ids {
-            self.write_response(
-                id,
-                Ok(json!({ "outcome": { "outcome": "cancelled" } })),
-            )
-            .await?;
+            self.write_response(id, Ok(json!({ "outcome": { "outcome": "cancelled" } })))
+                .await?;
         }
         // Tell the UI to dismiss any permission modal.
         let _ = self.app.emit(
@@ -771,6 +876,7 @@ impl AcpConnection {
             json!({
                 "sessionId": session_id,
                 "environmentId": self.environment_id,
+                "backend": self.backend,
             }),
         );
         Ok(())

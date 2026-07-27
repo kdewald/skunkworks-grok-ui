@@ -1,8 +1,8 @@
 {
   "name": "skunkworks-grok-ui",
   "private": true,
-  "version": "0.6.2",
-  "description": "Unofficial skunkworks desktop UI for the Grok Build coding agent (ACP). Not affiliated with xAI.",
+  "version": "0.7.0",
+  "description": "Unofficial desktop ACP client for Grok, Codex, and Claude coding agents.",
   "author": "kdewald",
   "license": "Apache-2.0",
   "repository": {
@@ -16,6 +16,8 @@
   "keywords": [
     "grok",
     "grok-build",
+    "codex",
+    "claude",
     "acp",
     "agent-client-protocol",
     "tauri",

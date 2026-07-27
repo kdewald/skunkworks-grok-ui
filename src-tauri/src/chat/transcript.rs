@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 
 use crate::store::{new_id, ChatDocument, IntermediateBlock, PlanEntry, Turn};
 
-
 /// Older transcripts stored spawn_subagent as plain Tool blocks. Lift them into
 /// Subagent cards so the side rail populates for historical chats too.
 pub(crate) fn promote_subagent_tools_in_doc(doc: &mut ChatDocument) {
@@ -178,7 +177,12 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
         return None;
     }
     // error status: only allow late child terminal updates, not new parent text.
-    if turn.status == "error" && !matches!(kind.as_str(), "subagent_finished" | "task_completed" | "tool_call_update") {
+    if turn.status == "error"
+        && !matches!(
+            kind.as_str(),
+            "subagent_finished" | "task_completed" | "tool_call_update"
+        )
+    {
         return None;
     }
 
@@ -259,7 +263,9 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     raw_output: existing_output,
                     ..
                 }) = turn.intermediate.iter_mut().find(|b| match b {
-                    IntermediateBlock::Tool { tool_call_id: id, .. } => id == &tool_call_id,
+                    IntermediateBlock::Tool {
+                        tool_call_id: id, ..
+                    } => id == &tool_call_id,
                     _ => false,
                 }) {
                     if title.len() > existing_title.len() || existing_title == "Tool" {
@@ -342,9 +348,7 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     handled_as_subagent = true;
                 }
             }
-            if !handled_as_subagent
-                && looks_like_subagent_wait(raw_input.as_ref(), &title)
-            {
+            if !handled_as_subagent && looks_like_subagent_wait(raw_input.as_ref(), &title) {
                 // Only suppress normal tool handling when a real subagent matched.
                 handled_as_subagent =
                     apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
@@ -375,7 +379,9 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     kind,
                     ..
                 }) = turn.intermediate.iter_mut().find(|b| match b {
-                    IntermediateBlock::Tool { tool_call_id: id, .. } => id == tool_call_id,
+                    IntermediateBlock::Tool {
+                        tool_call_id: id, ..
+                    } => id == tool_call_id,
                     _ => false,
                 }) {
                     if let Some(s) = status {
@@ -425,9 +431,12 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                 .unwrap_or_default();
             if let Some(IntermediateBlock::Plan {
                 entries: existing, ..
-            }) = turn.intermediate.iter_mut().rev().find(|b| {
-                matches!(b, IntermediateBlock::Plan { .. })
-            }) {
+            }) = turn
+                .intermediate
+                .iter_mut()
+                .rev()
+                .find(|b| matches!(b, IntermediateBlock::Plan { .. }))
+            {
                 *existing = entries;
             } else {
                 turn.intermediate.push(IntermediateBlock::Plan {
@@ -448,7 +457,9 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
             if subagent_id.is_empty() {
                 // nothing
             } else if !turn.intermediate.iter().any(|b| match b {
-                IntermediateBlock::Subagent { subagent_id: id, .. } => id == &subagent_id,
+                IntermediateBlock::Subagent {
+                    subagent_id: id, ..
+                } => id == &subagent_id,
                 _ => false,
             }) {
                 let description = update
@@ -500,7 +511,9 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                 collapsed,
                 ..
             }) = turn.intermediate.iter_mut().find(|b| match b {
-                IntermediateBlock::Subagent { subagent_id: id, .. } => id == subagent_id,
+                IntermediateBlock::Subagent {
+                    subagent_id: id, ..
+                } => id == subagent_id,
                 _ => false,
             }) {
                 *st = status;
@@ -550,7 +563,9 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
             if let Some(ref tcid) = tool_call_id {
                 if let Some(IntermediateBlock::Tool { status, title, .. }) =
                     turn.intermediate.iter_mut().find(|b| match b {
-                        IntermediateBlock::Tool { tool_call_id: id, .. } => id == tcid,
+                        IntermediateBlock::Tool {
+                            tool_call_id: id, ..
+                        } => id == tcid,
                         _ => false,
                     })
                 {
@@ -631,7 +646,9 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     raw_output,
                     ..
                 }) = turn.intermediate.iter_mut().find(|b| match b {
-                    IntermediateBlock::Tool { tool_call_id: id, .. } => id == &tcid,
+                    IntermediateBlock::Tool {
+                        tool_call_id: id, ..
+                    } => id == &tcid,
                     _ => false,
                 }) {
                     *ts = status;
@@ -667,7 +684,6 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
     Some(kind)
 }
 
-
 /// Text from an ACP content chunk update (`agent_message_chunk` / `agent_thought_chunk`).
 fn extract_chunk_text(update: &Value) -> String {
     if let Some(text) = update.pointer("/content/text").and_then(|t| t.as_str()) {
@@ -687,16 +703,12 @@ fn extract_chunk_text(update: &Value) -> String {
     String::new()
 }
 
-
 /// Grok's spawn_subagent ACP surface: tool_call with variant Task / spawn_subagent.
 fn looks_like_subagent_spawn(raw_input: Option<&Value>, title: &str) -> bool {
     if title.eq_ignore_ascii_case("spawn_subagent") || title.contains("spawn_subagent") {
         // Avoid treating a Grep for the string "spawn_subagent" as a spawn.
         if let Some(v) = raw_input {
-            let variant = v
-                .get("variant")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let variant = v.get("variant").and_then(|x| x.as_str()).unwrap_or("");
             if variant.eq_ignore_ascii_case("Grep") || variant.eq_ignore_ascii_case("ReadFile") {
                 return false;
             }
@@ -747,7 +759,10 @@ fn looks_like_subagent_wait(raw_input: Option<&Value>, title: &str) -> bool {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if matches!(variant.as_str(), "taskoutput" | "task_output" | "await_task") {
+    if matches!(
+        variant.as_str(),
+        "taskoutput" | "task_output" | "await_task"
+    ) {
         return true;
     }
     v.get("task_ids").is_some() || v.get("taskIds").is_some()
@@ -867,7 +882,10 @@ fn upsert_subagent_from_spawn_tool(
             ..
         } if !tool_call_id.is_empty() && tid == tool_call_id => true,
         IntermediateBlock::Subagent { subagent_id, .. }
-            if parsed_id.as_ref().map(|p| p == subagent_id).unwrap_or(false)
+            if parsed_id
+                .as_ref()
+                .map(|p| p == subagent_id)
+                .unwrap_or(false)
                 || subagent_id == &provisional_id =>
         {
             true
@@ -955,10 +973,7 @@ fn apply_subagent_wait_output(
         })
     {
         for res in results {
-            let command = res
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let command = res.get("command").and_then(|c| c.as_str()).unwrap_or("");
             let output = res
                 .get("output")
                 .and_then(|o| o.as_str())
@@ -1047,7 +1062,8 @@ fn apply_subagent_wait_output(
                 if d.is_empty() && !parsed_desc.is_empty() {
                     *d = parsed_desc;
                 }
-                if !task_id.is_empty() && (subagent_id.is_empty() || subagent_id.starts_with("call-"))
+                if !task_id.is_empty()
+                    && (subagent_id.is_empty() || subagent_id.starts_with("call-"))
                 {
                     *subagent_id = task_id.to_string();
                 }
@@ -1102,12 +1118,14 @@ fn apply_subagent_wait_output(
         output: out,
         collapsed,
         ..
-    }) = turn.intermediate.iter_mut().find(|b| matches!(
-        b,
-        IntermediateBlock::Subagent { status, output, .. }
-            if (status == "running" || status == "pending" || status == "in_progress")
-                && output.is_empty()
-    )) {
+    }) = turn.intermediate.iter_mut().find(|b| {
+        matches!(
+            b,
+            IntermediateBlock::Subagent { status, output, .. }
+                if (status == "running" || status == "pending" || status == "in_progress")
+                    && output.is_empty()
+        )
+    }) {
         *st = "completed".into();
         *out = blob;
         *collapsed = false;
@@ -1127,10 +1145,7 @@ fn parse_subagent_command_label(command: &str) -> (String, String) {
     let command = command.trim();
     if let Some(rest) = command.strip_prefix("[subagent:") {
         if let Some((ty, desc)) = rest.split_once(']') {
-            return (
-                ty.trim().to_string(),
-                desc.trim().to_string(),
-            );
+            return (ty.trim().to_string(), desc.trim().to_string());
         }
     }
     if let Some(rest) = command.strip_prefix("[subagent]") {
@@ -1144,11 +1159,13 @@ fn parse_subagent_command_label(command: &str) -> (String, String) {
 fn count_open_subagents(turn: &Turn) -> usize {
     turn.intermediate
         .iter()
-        .filter(|b| matches!(
-            b,
-            IntermediateBlock::Subagent { status, .. }
-                if status == "running" || status == "in_progress" || status == "pending"
-        ))
+        .filter(|b| {
+            matches!(
+                b,
+                IntermediateBlock::Subagent { status, .. }
+                    if status == "running" || status == "in_progress" || status == "pending"
+            )
+        })
         .count()
 }
 
@@ -1302,7 +1319,6 @@ fn rebuild_assistant_message(turn: &mut Turn) {
     turn.assistant_message = parts.join("\n\n");
 }
 
-
 #[cfg(test)]
 mod stream_tests {
     use super::*;
@@ -1371,11 +1387,12 @@ mod stream_tests {
             &mut turn,
             "The user wants me to:\n1. Restore the old fonts\n",
         );
-        append_agent_thought(
-            &mut turn,
-            "Got it—I'll restore the original font classes.",
+        append_agent_thought(&mut turn, "Got it—I'll restore the original font classes.");
+        assert!(
+            message_text(&turn).is_empty(),
+            "msg={:?}",
+            message_text(&turn)
         );
-        assert!(message_text(&turn).is_empty(), "msg={:?}", message_text(&turn));
         let th = thought_text(&turn);
         assert!(th.contains("Restore the old fonts"), "{th:?}");
         assert!(th.contains("Got it"), "{th:?}");
@@ -1410,9 +1427,11 @@ mod stream_tests {
             id: "c1".into(),
             project_id: "p1".into(),
             title: "t".into(),
+            backend: crate::store::AgentBackend::Grok,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             acp_session_id: Some("s1".into()),
+            agent_config: Default::default(),
             turns: vec![empty_turn()],
         }
     }
@@ -1428,7 +1447,10 @@ mod stream_tests {
             }),
         );
         assert_eq!(kind.as_deref(), Some("agent_message_chunk"));
-        assert!(doc.turns[0].assistant_message.contains("Hello") || message_text(&doc.turns[0]).contains("Hello"));
+        assert!(
+            doc.turns[0].assistant_message.contains("Hello")
+                || message_text(&doc.turns[0]).contains("Hello")
+        );
     }
 
     #[test]
@@ -1458,7 +1480,10 @@ mod stream_tests {
             }),
         );
         assert_eq!(kind.as_deref(), Some("agent_message_chunk"));
-        assert!(message_text(&doc.turns[0]).contains("tail") || doc.turns[0].assistant_message.contains("tail"));
+        assert!(
+            message_text(&doc.turns[0]).contains("tail")
+                || doc.turns[0].assistant_message.contains("tail")
+        );
     }
 
     #[test]

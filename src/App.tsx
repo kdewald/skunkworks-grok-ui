@@ -13,7 +13,11 @@ import {
   markTurnsCancelled,
   reassertCancelledTurns,
 } from "./state/turns";
-import type { PermissionRequest } from "./types";
+import {
+  normalizeAgentBackend,
+  type AgentBackend,
+  type PermissionRequest,
+} from "./types";
 import "./App.css";
 
 function App() {
@@ -35,11 +39,16 @@ function App() {
       if (cancelled) return;
       // Bootstrap/selectChat may already have connected for the saved chat's env.
       const state = useAppStore.getState();
-      if (state.connectedEnvironments.includes(state.activeEnvironmentId)) {
+      if (
+        state.isRuntimeConnected(
+          state.activeEnvironmentId,
+          state.activeBackend,
+        )
+      ) {
         return;
       }
       try {
-        await connectAgent();
+        await connectAgent(state.activeEnvironmentId, state.activeBackend);
       } catch {
         // status pill shows the error
       }
@@ -61,11 +70,13 @@ function App() {
           sessionId: string;
           update: unknown;
           environmentId?: string;
+          backend?: AgentBackend;
         }>("session-update", (event) => {
           void applySessionUpdate(
             event.payload.sessionId,
             event.payload.update,
             event.payload.environmentId,
+            event.payload.backend,
           );
         }),
         listen<PermissionRequest>("permission-request", (event) => {
@@ -83,46 +94,58 @@ function App() {
             toolCall: p.toolCall as PermissionRequest["toolCall"],
             options: (p.options ?? []) as PermissionRequest["options"],
             environmentId: p.environmentId,
+            backend: normalizeAgentBackend(p.backend),
           });
         }),
         listen<{
           connected: boolean;
           message: string;
           environmentId?: string;
+          backend?: AgentBackend;
         }>("agent-status", (event) => {
           setAgentStatus({
             connected: event.payload.connected,
             message: event.payload.message,
             environmentId: event.payload.environmentId,
+            backend: normalizeAgentBackend(event.payload.backend),
           });
           // Scope disconnect to the environment owning the inflight chat —
           // an SSH agent death must not abort a healthy local turn.
           if (!event.payload.connected) {
             const state = useAppStore.getState();
-            const deadEnv = event.payload.environmentId;
+            const deadEnv =
+              event.payload.environmentId ?? state.activeEnvironmentId;
+            const deadBackend = normalizeAgentBackend(event.payload.backend);
             const inflightId = state.inflightChatId;
-            let inflightOnDeadEnv = !deadEnv;
-            if (deadEnv && inflightId) {
+            let inflightOnDeadEnv = false;
+            if (inflightId) {
               const meta = state.chats.find((c) => c.id === inflightId);
               const project = state.projects.find(
                 (p) => p.id === (meta?.projectId ?? state.activeChat?.projectId),
               );
               const chatEnv = project?.environmentId || state.activeEnvironmentId;
-              inflightOnDeadEnv = chatEnv === deadEnv;
+              const chatBackend = normalizeAgentBackend(
+                meta?.backend ??
+                  (state.activeChat?.id === inflightId
+                    ? state.activeChat.backend
+                    : undefined),
+              );
+              inflightOnDeadEnv =
+                chatEnv === deadEnv && chatBackend === deadBackend;
             }
             if (!inflightOnDeadEnv) {
               return;
             }
             const active = state.activeChat;
             const activeOnDeadEnv =
-              !deadEnv ||
               (() => {
                 const project = state.projects.find(
                   (p) => p.id === active?.projectId,
                 );
                 return (
                   (project?.environmentId || state.activeEnvironmentId) ===
-                  deadEnv
+                    deadEnv &&
+                  normalizeAgentBackend(active?.backend) === deadBackend
                 );
               })();
             if (
@@ -314,8 +337,23 @@ function App() {
             }
           })();
         }),
-        listen("permission-cleared", () => {
-          useAppStore.setState({ permission: null });
+        listen<{
+          environmentId?: string;
+          backend?: AgentBackend;
+        }>("permission-cleared", (event) => {
+          const state = useAppStore.getState();
+          const permission = state.permission;
+          if (!permission) return;
+          const sameEnvironment =
+            !event.payload?.environmentId ||
+            permission.environmentId === event.payload.environmentId;
+          const sameBackend =
+            !event.payload?.backend ||
+            normalizeAgentBackend(permission.backend) ===
+              normalizeAgentBackend(event.payload.backend);
+          if (sameEnvironment && sameBackend) {
+            useAppStore.setState({ permission: null });
+          }
         }),
         listen<{ chatId: string; turnId?: string | null }>(
           "cancel-started",

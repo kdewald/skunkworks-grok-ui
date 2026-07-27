@@ -14,6 +14,25 @@ pub const SCRATCH_PROJECT_ID: &str = "scratch";
 /// Built-in local environment id.
 pub const LOCAL_ENV_ID: &str = "local";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentBackend {
+    #[default]
+    Grok,
+    Codex,
+    Claude,
+}
+
+impl AgentBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grok => "grok",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
 fn default_local_env() -> String {
     LOCAL_ENV_ID.to_string()
 }
@@ -104,10 +123,42 @@ pub struct ChatMeta {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    #[serde(default)]
+    pub backend: AgentBackend,
     pub acp_session_id: Option<String>,
     pub preview: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionConfig {
+    /// ACP config option id used to change the selected model. Older agents
+    /// expose only the legacy `session/set_model` method, so this may be absent.
+    #[serde(default)]
+    pub model_config_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub available_models: Vec<AgentSessionOption>,
+    #[serde(default)]
+    pub access_mode_id: Option<String>,
+    #[serde(default)]
+    pub access_mode_name: Option<String>,
+    #[serde(default)]
+    pub available_access_modes: Vec<AgentSessionOption>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +312,11 @@ pub struct ChatDocument {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    #[serde(default)]
+    pub backend: AgentBackend,
     pub acp_session_id: Option<String>,
+    #[serde(default)]
+    pub agent_config: AgentSessionConfig,
     #[serde(default)]
     pub turns: Vec<Turn>,
     pub created_at: DateTime<Utc>,
@@ -280,6 +335,8 @@ pub struct AppData {
     pub environments: Vec<Environment>,
     #[serde(default)]
     pub active_environment_id: Option<String>,
+    #[serde(default)]
+    pub active_backend: AgentBackend,
 }
 
 #[derive(Clone)]
@@ -322,8 +379,8 @@ impl Store {
 
     pub fn load_chat(&self, chat_id: &str) -> Result<ChatDocument> {
         let path = self.chat_path(chat_id);
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("read chat {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("read chat {}", path.display()))?;
         Ok(serde_json::from_str(&raw)?)
     }
 
@@ -374,8 +431,7 @@ pub fn scratch_root_path() -> PathBuf {
 /// Parent folder shown in the UI / project index (not a shared agent cwd).
 pub fn ensure_scratch_root() -> Result<PathBuf> {
     let path = scratch_root_path();
-    fs::create_dir_all(&path)
-        .with_context(|| format!("create scratch root {}", path.display()))?;
+    fs::create_dir_all(&path).with_context(|| format!("create scratch root {}", path.display()))?;
     let readme = path.join("README.txt");
     if !readme.exists() {
         let _ = fs::write(
@@ -393,7 +449,10 @@ pub fn ensure_scratch_root() -> Result<PathBuf> {
 pub fn ensure_scratch_chat_dir(chat_id: &str) -> Result<PathBuf> {
     let root = ensure_scratch_root()?;
     // Sanitize: chat ids are UUIDs; still refuse path separators.
-    if chat_id.is_empty() || chat_id.contains('/') || chat_id.contains('\\') || chat_id.contains("..")
+    if chat_id.is_empty()
+        || chat_id.contains('/')
+        || chat_id.contains('\\')
+        || chat_id.contains("..")
     {
         anyhow::bail!("invalid scratch chat id");
     }

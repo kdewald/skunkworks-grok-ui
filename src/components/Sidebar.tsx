@@ -14,7 +14,11 @@ import {
   X,
 } from "lucide-react";
 import { chatsForProject, projectsForEnv, useAppStore } from "../store";
-import { LOCAL_ENV_ID, SCRATCH_PROJECT_ID, type Project } from "../types";
+import {
+  LOCAL_ENV_ID,
+  SCRATCH_PROJECT_ID,
+  type Project,
+} from "../types";
 import { ConnectionsPanel } from "./ConnectionsPanel";
 import { RemoteFolderBrowser } from "./RemoteFolderBrowser";
 
@@ -61,7 +65,8 @@ export function Sidebar() {
     busy,
     environments,
     activeEnvironmentId,
-    connectedEnvironments,
+    activeBackend,
+    isRuntimeConnected,
     selectProject,
     createChat,
     selectChat,
@@ -141,7 +146,10 @@ export function Sidebar() {
   const envProjects = projectsForEnv(projects, activeEnvironmentId);
   const activeEnv = environments.find((e) => e.id === activeEnvironmentId);
   const isRemote = activeEnvironmentId !== LOCAL_ENV_ID;
-  const envConnected = connectedEnvironments.includes(activeEnvironmentId);
+  const envConnected = isRuntimeConnected(
+    activeEnvironmentId,
+    activeBackend,
+  );
 
   // Scratch first, then the rest in existing order.
   const orderedProjects = useMemo(() => {
@@ -225,7 +233,7 @@ export function Sidebar() {
         </div>
         <button
           className={`status-pill ${envConnected ? "ok" : "bad"}`}
-          onClick={() => connectAgent(activeEnvironmentId)}
+          onClick={() => connectAgent(activeEnvironmentId, activeBackend)}
           title={agent.message}
           disabled={busy}
         >
@@ -252,7 +260,7 @@ export function Sidebar() {
           disabled={busy}
         >
           {environments.map((env) => {
-            const on = connectedEnvironments.includes(env.id);
+            const on = isRuntimeConnected(env.id, activeBackend);
             return (
               <option key={env.id} value={env.id}>
                 {on ? "● " : "○ "}

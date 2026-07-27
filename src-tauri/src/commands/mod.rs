@@ -1,7 +1,7 @@
 //! Tauri commands bridging the frontend to ACP + local store.
 //!
-//! Supports multiple environments (local + SSH hosts). Each environment can
-//! hold its own `grok agent stdio` connection; chat transcripts stay local.
+//! Supports multiple environments (local + SSH hosts) and ACP backends.
+//! Chat transcripts stay local and retain their selected backend.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,19 +13,19 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::acp::{AcpConnection, AgentSpawnTarget};
+use crate::lsp::LspHub;
 use crate::ssh::{
-    ensure_remote_scratch_dir, list_remote_directory, list_ssh_config_hosts, probe_ssh_host,
+    ensure_remote_scratch_dir, list_remote_directory, list_ssh_config_hosts, probe_ssh_backend,
     resolve_remote_project_path, RemoteDirListing,
 };
 use crate::store::{
     ensure_scratch_root, local_env_display_name, migrate_app_data, new_id, now,
     project_name_from_path, remote_scratch_display_path, remove_scratch_chat_dir,
-    resolve_local_session_cwd, scratch_project_id_for_env, AppData, ChatDocument, ChatMeta,
-    Environment, FileAttachment, IntermediateBlock, Project, Store, Turn,
-    LOCAL_ENV_ID, SCRATCH_PROJECT_ID,
+    resolve_local_session_cwd, scratch_project_id_for_env, AgentBackend, AgentSessionConfig,
+    AgentSessionOption, AppData, ChatDocument, ChatMeta, Environment, FileAttachment,
+    IntermediateBlock, Project, Store, Turn, LOCAL_ENV_ID, SCRATCH_PROJECT_ID,
 };
 use crate::terminal::TerminalManager;
-use crate::lsp::LspHub;
 
 use crate::chat::session::{build_history_seed, is_unknown_session_error};
 use crate::chat::transcript::{
@@ -35,13 +35,13 @@ use crate::chat::transcript::{
 pub struct AppState {
     pub store: Store,
     pub data: Mutex<AppData>,
-    /// ACP connections keyed by environment id.
-    pub agents: Mutex<HashMap<String, Arc<AcpConnection>>>,
+    /// ACP connections keyed by (environment id, backend).
+    pub agents: Mutex<HashMap<RuntimeKey, Arc<AcpConnection>>>,
     pub grok_path: Mutex<Option<String>>,
     /// Serialize chat read-modify-write so concurrent stream chunks don't clobber each other.
     pub chat_write: Arc<Mutex<()>>,
-    /// ACP session IDs already loaded per environment (agent process).
-    pub loaded_sessions: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// ACP session IDs already loaded per environment/backend agent process.
+    pub loaded_sessions: Arc<Mutex<HashMap<RuntimeKey, HashSet<String>>>>,
     /// Sessions currently replaying history via session/load — ignore stream applies.
     pub replaying_sessions: Mutex<HashSet<String>>,
     /// Sessions that were recreated locally (old ACP id gone); next prompt should rehydrate context.
@@ -57,14 +57,20 @@ pub struct AppState {
     /// Backend authority for in-flight prompts: chat_id → turn_id.
     /// Rejects concurrent send_message for the same chat until the prompt future settles.
     pub inflight_prompts: Arc<Mutex<HashMap<String, String>>>,
-    /// Environments currently mid-connect (single-flight).
-    pub connecting_envs: Mutex<HashSet<String>>,
+    /// Environment/backend runtimes currently mid-connect (single-flight).
+    pub connecting_envs: Mutex<HashSet<RuntimeKey>>,
     /// Chats currently mid ensure_session (single-flight).
     pub ensuring_chats: Mutex<HashSet<String>>,
     /// Interactive project terminals (local PTY / SSH).
     pub terminals: TerminalManager,
     /// Local language servers (stdio LSP).
     pub lsp: Arc<LspHub>,
+}
+
+type RuntimeKey = (String, AgentBackend);
+
+fn runtime_key(environment_id: &str, backend: AgentBackend) -> RuntimeKey {
+    (environment_id.to_string(), backend)
 }
 
 impl AppState {
@@ -108,7 +114,10 @@ fn load_chat_doc(state: &AppState, chat_id: &str) -> Result<ChatDocument, String
     let mut doc = state.store.load_chat(chat_id).map_err(|e| e.to_string())?;
     promote_subagent_tools_in_doc(&mut doc);
     // Keep promoted form warm so subsequent stream applies see Subagent cards.
-    state.live_chats.lock().insert(chat_id.to_string(), doc.clone());
+    state
+        .live_chats
+        .lock()
+        .insert(chat_id.to_string(), doc.clone());
     Ok(doc)
 }
 
@@ -128,9 +137,7 @@ fn should_flush_disk(state: &AppState, chat_id: &str, kind: &str) -> bool {
     // High-churn stream kinds: debounce disk. Structural events flush immediately.
     let is_chunk = matches!(
         kind,
-        "agent_message_chunk"
-            | "agent_thought_chunk"
-            | "tool_call_update" // status/content thrash during long tools
+        "agent_message_chunk" | "agent_thought_chunk" | "tool_call_update" // status/content thrash during long tools
     );
     if !is_chunk {
         return true;
@@ -199,7 +206,11 @@ fn ensure_scratch_in_index(
 
     // Local scratch stays first among projects when active env is local.
     if is_local {
-        if let Some(idx) = data.projects.iter().position(|p| p.id == SCRATCH_PROJECT_ID) {
+        if let Some(idx) = data
+            .projects
+            .iter()
+            .position(|p| p.id == SCRATCH_PROJECT_ID)
+        {
             if idx != 0 {
                 let p = data.projects.remove(idx);
                 data.projects.insert(0, p);
@@ -222,43 +233,70 @@ fn env_from_data(data: &AppData, environment_id: &str) -> Result<Environment, St
         .ok_or_else(|| format!("unknown environment: {environment_id}"))
 }
 
-fn agent_for_env(state: &AppState, environment_id: &str) -> Result<Arc<AcpConnection>, String> {
+fn agent_for_runtime(
+    state: &AppState,
+    environment_id: &str,
+    backend: AgentBackend,
+) -> Result<Arc<AcpConnection>, String> {
     state
         .agents
         .lock()
-        .get(environment_id)
+        .get(&runtime_key(environment_id, backend))
         .cloned()
         .ok_or_else(|| {
             format!(
-                "agent not connected for environment `{environment_id}` — connect first"
+                "{} agent not connected for environment `{environment_id}` — connect first",
+                backend.as_str()
             )
         })
 }
 
-fn clear_loaded_for_env(state: &AppState, environment_id: &str) {
-    state.loaded_sessions.lock().remove(environment_id);
-}
-
-fn mark_session_loaded(state: &AppState, environment_id: &str, session_id: String) {
+fn clear_loaded_for_runtime(state: &AppState, environment_id: &str, backend: AgentBackend) {
     state
         .loaded_sessions
         .lock()
-        .entry(environment_id.to_string())
+        .remove(&runtime_key(environment_id, backend));
+}
+
+fn mark_session_loaded(
+    state: &AppState,
+    environment_id: &str,
+    backend: AgentBackend,
+    session_id: String,
+) {
+    state
+        .loaded_sessions
+        .lock()
+        .entry(runtime_key(environment_id, backend))
         .or_default()
         .insert(session_id);
 }
 
-fn unmark_session_loaded(state: &AppState, environment_id: &str, session_id: &str) {
-    if let Some(set) = state.loaded_sessions.lock().get_mut(environment_id) {
+fn unmark_session_loaded(
+    state: &AppState,
+    environment_id: &str,
+    backend: AgentBackend,
+    session_id: &str,
+) {
+    if let Some(set) = state
+        .loaded_sessions
+        .lock()
+        .get_mut(&runtime_key(environment_id, backend))
+    {
         set.remove(session_id);
     }
 }
 
-fn is_session_loaded(state: &AppState, environment_id: &str, session_id: &str) -> bool {
+fn is_session_loaded(
+    state: &AppState,
+    environment_id: &str,
+    backend: AgentBackend,
+    session_id: &str,
+) -> bool {
     state
         .loaded_sessions
         .lock()
-        .get(environment_id)
+        .get(&runtime_key(environment_id, backend))
         .map(|s| s.contains(session_id))
         .unwrap_or(false)
 }
@@ -306,7 +344,6 @@ pub struct EnsureSessionResult {
     pub message: String,
 }
 
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapResponse {
@@ -314,8 +351,17 @@ pub struct BootstrapResponse {
     pub data_dir: String,
     pub agent_connected: bool,
     pub connected_environments: Vec<String>,
+    pub connected_runtimes: Vec<ConnectedRuntime>,
     pub active_environment_id: String,
+    pub active_backend: AgentBackend,
     pub ssh_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectedRuntime {
+    pub environment_id: String,
+    pub backend: AgentBackend,
 }
 
 /// True when the chat never received a user/agent turn.
@@ -330,9 +376,7 @@ fn purge_chat(state: &AppState, chat_id: &str) -> Result<(), String> {
         // so a late apply cannot resurrect a ghost between steps.
         let _guard = state.chat_write.lock();
         if state.inflight_prompts.lock().contains_key(chat_id) {
-            return Err(
-                "chat has an in-flight prompt; cancel it before deleting".into(),
-            );
+            return Err("chat has an in-flight prompt; cancel it before deleting".into());
         }
 
         state.live_chats.lock().remove(chat_id);
@@ -406,18 +450,37 @@ pub fn get_bootstrap(state: State<'_, AppState>) -> Result<BootstrapResponse, St
     let _ = prune_all_empty_chats(&state);
 
     let data = state.data.lock().clone();
-    let connected: Vec<String> = state.agents.lock().keys().cloned().collect();
+    let connected_runtimes: Vec<ConnectedRuntime> = state
+        .agents
+        .lock()
+        .keys()
+        .map(|(environment_id, backend)| ConnectedRuntime {
+            environment_id: environment_id.clone(),
+            backend: *backend,
+        })
+        .collect();
+    let mut connected: Vec<String> = connected_runtimes
+        .iter()
+        .map(|runtime| runtime.environment_id.clone())
+        .collect();
+    connected.sort();
+    connected.dedup();
     let active = data
         .active_environment_id
         .clone()
         .unwrap_or_else(|| LOCAL_ENV_ID.to_string());
-    let agent_connected = connected.iter().any(|id| id == &active);
+    let active_backend = data.active_backend;
+    let agent_connected = connected_runtimes
+        .iter()
+        .any(|runtime| runtime.environment_id == active && runtime.backend == active_backend);
     Ok(BootstrapResponse {
         data,
         data_dir: state.store.data_dir().display().to_string(),
         agent_connected,
         connected_environments: connected,
+        connected_runtimes,
         active_environment_id: active,
+        active_backend,
         ssh_hosts: list_ssh_config_hosts(),
     })
 }
@@ -431,22 +494,27 @@ pub fn list_ssh_hosts() -> Result<Vec<String>, String> {
 pub async fn probe_environment(
     state: State<'_, AppState>,
     environment_id: String,
+    backend: Option<AgentBackend>,
 ) -> Result<Value, String> {
-    let env = {
+    let (env, backend) = {
         let data = state.data.lock();
-        env_from_data(&data, &environment_id)?
+        (
+            env_from_data(&data, &environment_id)?,
+            backend.unwrap_or(data.active_backend),
+        )
     };
     if env.is_local() {
         return Ok(json!({
             "environmentId": LOCAL_ENV_ID,
             "ok": true,
             "kind": "local",
+            "backend": backend,
         }));
     }
     let host = env
         .ssh_host
         .ok_or_else(|| "SSH environment missing host".to_string())?;
-    probe_ssh_host(&host, env.remote_grok_path.as_deref())
+    probe_ssh_backend(&host, backend, env.remote_grok_path.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -457,6 +525,7 @@ pub async fn add_ssh_environment(
     host: String,
     name: Option<String>,
     remote_grok_path: Option<String>,
+    backend: Option<AgentBackend>,
 ) -> Result<Environment, String> {
     let host = host.trim().to_string();
     if host.is_empty() {
@@ -466,17 +535,23 @@ pub async fn add_ssh_environment(
         return Err("invalid SSH host alias".into());
     }
 
+    let backend = backend.unwrap_or_else(|| state.data.lock().active_backend);
+
     // Probe before saving so we fail fast.
-    let probe = probe_ssh_host(&host, remote_grok_path.as_deref())
+    let probe = probe_ssh_backend(&host, backend, remote_grok_path.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-    let discovered_grok = probe
-        .get("grokPath")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let remote_path = remote_grok_path
-        .filter(|s| !s.trim().is_empty())
-        .or(discovered_grok);
+    let remote_path = if backend == AgentBackend::Grok {
+        let discovered_grok = probe
+            .get("grokPath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        remote_grok_path
+            .filter(|s| !s.trim().is_empty())
+            .or(discovered_grok)
+    } else {
+        None
+    };
 
     let mut env = Environment::ssh(&host, name, remote_path);
     env.name = if env.name == host {
@@ -490,7 +565,9 @@ pub async fn add_ssh_environment(
         let mut data = state.data.lock();
         if let Some(existing) = data.environments.iter_mut().find(|e| e.id == env.id) {
             existing.name = env.name.clone();
-            existing.remote_grok_path = env.remote_grok_path.clone();
+            if backend == AgentBackend::Grok {
+                existing.remote_grok_path = env.remote_grok_path.clone();
+            }
             existing.updated_at = now();
             env = existing.clone();
         } else {
@@ -541,13 +618,26 @@ pub async fn remove_environment(
         }
     }
 
-    // Drop live agent with explicit shutdown (kill child + fail pending).
-    let old = { state.agents.lock().remove(&environment_id) };
-    if let Some(conn) = old {
+    // Drop every backend runtime on this host with explicit shutdown.
+    let old: Vec<Arc<AcpConnection>> = {
+        let mut agents = state.agents.lock();
+        let keys: Vec<RuntimeKey> = agents
+            .keys()
+            .filter(|(env_id, _)| env_id == &environment_id)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| agents.remove(&key))
+            .collect()
+    };
+    for conn in old {
         conn.shutdown(&format!("Environment {environment_id} removed"))
             .await;
     }
-    clear_loaded_for_env(&state, &environment_id);
+    state
+        .loaded_sessions
+        .lock()
+        .retain(|(env_id, _), _| env_id != &environment_id);
 
     for id in &chat_ids {
         purge_chat(&state, id)?;
@@ -555,8 +645,7 @@ pub async fn remove_environment(
 
     let mut data = state.data.lock();
     data.environments.retain(|e| e.id != environment_id);
-    data.projects
-        .retain(|p| p.environment_id != environment_id);
+    data.projects.retain(|p| p.environment_id != environment_id);
     data.chats
         .retain(|c| !chat_ids.iter().any(|id| id == &c.id));
 
@@ -611,29 +700,38 @@ pub fn set_active_environment(
 }
 
 #[tauri::command]
+pub fn set_active_backend(state: State<'_, AppState>, backend: AgentBackend) -> Result<(), String> {
+    let mut data = state.data.lock();
+    data.active_backend = backend;
+    state.store.save_index(&data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn connect_agent(
     app: AppHandle,
     state: State<'_, AppState>,
     environment_id: Option<String>,
+    backend: Option<AgentBackend>,
 ) -> Result<Value, String> {
-    let env_id = environment_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            state
-                .data
-                .lock()
-                .active_environment_id
-                .clone()
-                .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
-        });
+    let (env_id, backend) = {
+        let data = state.data.lock();
+        (
+            environment_id
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| data.active_environment_id.clone())
+                .unwrap_or_else(|| LOCAL_ENV_ID.to_string()),
+            backend.unwrap_or(data.active_backend),
+        )
+    };
+    let key = runtime_key(&env_id, backend);
 
-    // Single-flight: concurrent connectAgent calls (bootstrap + selectChat) share one spawn.
+    // Single-flight: concurrent connects for the same host/backend share one spawn.
     let claimed = {
         let mut connecting = state.connecting_envs.lock();
-        if connecting.contains(&env_id) {
+        if connecting.contains(&key) {
             false
         } else {
-            connecting.insert(env_id.clone());
+            connecting.insert(key.clone());
             true
         }
     };
@@ -642,27 +740,28 @@ pub async fn connect_agent(
         // Wait briefly for the in-progress connect to finish, then return current state.
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if !state.connecting_envs.lock().contains(&env_id) {
+            if !state.connecting_envs.lock().contains(&key) {
                 break;
             }
         }
-        if state.agents.lock().contains_key(&env_id) {
+        if state.agents.lock().contains_key(&key) {
             return Ok(json!({
                 "environmentId": env_id,
+                "backend": backend,
                 "message": "Already connecting/connected",
                 "alreadyConnected": true,
             }));
         }
         // Other attempt failed — claim and try ourselves.
         let mut connecting = state.connecting_envs.lock();
-        if connecting.contains(&env_id) {
+        if connecting.contains(&key) {
             return Err("connect already in progress".into());
         }
-        connecting.insert(env_id.clone());
+        connecting.insert(key.clone());
     }
 
-    let connect_result = connect_agent_inner(&app, &state, &env_id).await;
-    state.connecting_envs.lock().remove(&env_id);
+    let connect_result = connect_agent_inner(&app, &state, &env_id, backend).await;
+    state.connecting_envs.lock().remove(&key);
     connect_result
 }
 
@@ -670,15 +769,17 @@ async fn connect_agent_inner(
     app: &AppHandle,
     state: &State<'_, AppState>,
     env_id: &str,
+    backend: AgentBackend,
 ) -> Result<Value, String> {
     // Already connected and alive — no second process. Stale (dead) entries
     // are replaced below so EOF disconnects can recover.
     {
         let agents = state.agents.lock();
-        if let Some(conn) = agents.get(env_id) {
+        if let Some(conn) = agents.get(&runtime_key(env_id, backend)) {
             if conn.is_alive() {
                 return Ok(json!({
                     "environmentId": env_id,
+                    "backend": backend,
                     "message": "Already connected",
                     "alreadyConnected": true,
                 }));
@@ -693,17 +794,20 @@ async fn connect_agent_inner(
         env_from_data(&data, env_id)?
     };
 
-    // Drop existing connection for this environment — fail + kill so the child
-    // and reader task do not leak across reconnect.
-    let old = { state.agents.lock().remove(env_id) };
+    // Drop only the stale connection for this exact runtime.
+    let old = { state.agents.lock().remove(&runtime_key(env_id, backend)) };
     if let Some(old) = old {
-        old.shutdown(&format!("Agent for {env_id} was replaced (reconnect)"))
-            .await;
+        old.shutdown(&format!(
+            "{} agent for {env_id} was replaced (reconnect)",
+            backend.as_str()
+        ))
+        .await;
     }
-    clear_loaded_for_env(state, env_id);
+    clear_loaded_for_runtime(state, env_id, backend);
 
     let target = if env.is_local() {
         AgentSpawnTarget::Local {
+            backend,
             grok_path: state.grok_path.lock().clone(),
         }
     } else {
@@ -712,6 +816,7 @@ async fn connect_agent_inner(
             .clone()
             .ok_or_else(|| "SSH environment missing host".to_string())?;
         AgentSpawnTarget::Ssh {
+            backend,
             host,
             remote_grok_path: env.remote_grok_path.clone(),
         }
@@ -734,27 +839,29 @@ async fn connect_agent_inner(
             return Err(format!("initialize on {label} failed: {e}"));
         }
     };
-    let auth = match conn.authenticate_from_init(&init).await {
-        Ok(v) => v,
-        Err(e) => {
-            conn.shutdown(&format!("authenticate failed: {e}")).await;
-            return Err(format!("authenticate on {label} failed: {e}"));
+    // Codex and Claude adapters consume the credentials already established by
+    // their CLIs. Grok's ACP server still requires selecting cached_token.
+    let auth = if backend == AgentBackend::Grok {
+        match conn.authenticate_grok_from_init(&init).await {
+            Ok(v) => v,
+            Err(e) => {
+                conn.shutdown(&format!("authenticate failed: {e}")).await;
+                return Err(format!("authenticate on {label} failed: {e}"));
+            }
         }
+    } else {
+        json!({ "status": "using-existing-cli-credentials" })
     };
 
-    state.agents.lock().insert(env_id.to_string(), conn);
-
-    // Remember active environment
-    {
-        let mut data = state.data.lock();
-        data.active_environment_id = Some(env_id.to_string());
-        let _ = state.store.save_index(&data);
-    }
+    state
+        .agents
+        .lock()
+        .insert(runtime_key(env_id, backend), conn);
 
     let message = if env.is_local() {
-        "Connected to local Grok agent".into()
+        format!("Connected to local {} agent", backend.as_str())
     } else {
-        format!("Connected to Grok on {}", env.name)
+        format!("Connected to {} on {}", backend.as_str(), env.name)
     };
 
     let _ = app.emit(
@@ -765,6 +872,7 @@ async fn connect_agent_inner(
             "agentInfo": init,
             "auth": auth,
             "environmentId": env_id,
+            "backend": backend,
         }),
     );
 
@@ -772,6 +880,7 @@ async fn connect_agent_inner(
         "initialize": init,
         "auth": auth,
         "environmentId": env_id,
+        "backend": backend,
         "message": message,
     }))
 }
@@ -781,33 +890,38 @@ pub async fn disconnect_agent(
     app: AppHandle,
     state: State<'_, AppState>,
     environment_id: Option<String>,
+    backend: Option<AgentBackend>,
 ) -> Result<(), String> {
-    let env_id = environment_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            state
-                .data
-                .lock()
-                .active_environment_id
-                .clone()
-                .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
-        });
+    let (env_id, backend) = {
+        let data = state.data.lock();
+        (
+            environment_id
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| data.active_environment_id.clone())
+                .unwrap_or_else(|| LOCAL_ENV_ID.to_string()),
+            backend.unwrap_or(data.active_backend),
+        )
+    };
 
     // Fail in-flight prompts and kill the child before dropping the connection.
     // Take Arc out of the map before awaiting so we never hold a parking_lot guard.
-    let old = { state.agents.lock().remove(&env_id) };
+    let old = { state.agents.lock().remove(&runtime_key(&env_id, backend)) };
     if let Some(conn) = old {
-        conn.shutdown(&format!("Disconnected agent ({env_id})"))
-            .await;
+        conn.shutdown(&format!(
+            "Disconnected {} agent ({env_id})",
+            backend.as_str()
+        ))
+        .await;
     }
-    clear_loaded_for_env(&state, &env_id);
+    clear_loaded_for_runtime(&state, &env_id, backend);
 
     let _ = app.emit(
         "agent-status",
         json!({
             "connected": false,
-            "message": format!("Disconnected ({env_id})"),
+            "message": format!("Disconnected {} ({env_id})", backend.as_str()),
             "environmentId": env_id,
+            "backend": backend,
         }),
     );
     Ok(())
@@ -1009,10 +1123,7 @@ pub fn set_active_project(
 }
 
 #[tauri::command]
-pub fn list_chats(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<Vec<ChatMeta>, String> {
+pub fn list_chats(state: State<'_, AppState>, project_id: String) -> Result<Vec<ChatMeta>, String> {
     let data = state.data.lock();
     Ok(data
         .chats
@@ -1022,12 +1133,269 @@ pub fn list_chats(
         .collect())
 }
 
+fn select_options(value: &Value) -> Vec<AgentSessionOption> {
+    let Some(items) = value.get("options").and_then(Value::as_array) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .flat_map(|item| {
+            item.get("options")
+                .and_then(Value::as_array)
+                .map(|nested| nested.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![item])
+        })
+        .filter_map(|item| {
+            let id = item.get("value")?.as_str()?.to_string();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            Some(AgentSessionOption {
+                id,
+                name,
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn selected_name(options: &[AgentSessionOption], id: Option<&str>) -> Option<String> {
+    let id = id?;
+    options
+        .iter()
+        .find(|option| option.id == id)
+        .map(|option| option.name.clone())
+        .or_else(|| Some(id.to_string()))
+}
+
+fn parse_agent_session_config(result: &Value) -> AgentSessionConfig {
+    let config_options = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let model_config = config_options.iter().find(|option| {
+        option.get("type").and_then(Value::as_str) == Some("select")
+            && (option.get("category").and_then(Value::as_str) == Some("model")
+                || option.get("id").and_then(Value::as_str) == Some("model"))
+    });
+
+    let (model_config_id, model_id, available_models) = if let Some(option) = model_config {
+        (
+            option.get("id").and_then(Value::as_str).map(str::to_string),
+            option
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            select_options(option),
+        )
+    } else {
+        let models = result.get("models");
+        let available = models
+            .and_then(|value| value.get("availableModels"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let id = item.get("modelId")?.as_str()?.to_string();
+                        Some(AgentSessionOption {
+                            name: item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&id)
+                                .to_string(),
+                            id,
+                            description: item
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            None,
+            models
+                .and_then(|value| value.get("currentModelId"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            available,
+        )
+    };
+
+    let mode_state = result.get("modes");
+    let mut available_access_modes: Vec<AgentSessionOption> = mode_state
+        .and_then(|value| value.get("availableModes"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_str()?.to_string();
+                    Some(AgentSessionOption {
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&id)
+                            .to_string(),
+                        id,
+                        description: item
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut access_mode_id = mode_state
+        .and_then(|value| value.get("currentModeId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // Some agents expose modes only through the stabilized config-option API.
+    if available_access_modes.is_empty() {
+        if let Some(option) = config_options.iter().find(|option| {
+            option.get("type").and_then(Value::as_str) == Some("select")
+                && option.get("category").and_then(Value::as_str) == Some("mode")
+        }) {
+            available_access_modes = select_options(option);
+            access_mode_id = option
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+
+    AgentSessionConfig {
+        model_config_id,
+        model_name: selected_name(&available_models, model_id.as_deref()),
+        model_id,
+        available_models,
+        access_mode_name: selected_name(&available_access_modes, access_mode_id.as_deref()),
+        access_mode_id,
+        available_access_modes,
+    }
+}
+
+fn full_access_option(
+    backend: AgentBackend,
+    options: &[AgentSessionOption],
+) -> Option<&AgentSessionOption> {
+    let preferred_id = match backend {
+        AgentBackend::Codex => "agent-full-access",
+        AgentBackend::Claude => "bypassPermissions",
+        AgentBackend::Grok => return None,
+    };
+    options
+        .iter()
+        .find(|option| option.id == preferred_id)
+        .or_else(|| {
+            options.iter().find(|option| {
+                let value = format!("{} {}", option.id, option.name).to_lowercase();
+                value.contains("full access") || value.contains("bypass permission")
+            })
+        })
+}
+
+fn mark_grok_full_access(config: &mut AgentSessionConfig) {
+    let option = AgentSessionOption {
+        id: "full-access".into(),
+        name: "Full Access".into(),
+        description: Some("Tool executions are approved automatically.".into()),
+    };
+    config.access_mode_id = Some(option.id.clone());
+    config.access_mode_name = Some(option.name.clone());
+    config.available_access_modes = vec![option];
+}
+
+fn merge_reported_agent_config(current: &mut AgentSessionConfig, reported: AgentSessionConfig) {
+    if !reported.available_models.is_empty() {
+        current.model_config_id = reported.model_config_id;
+        current.model_id = reported.model_id;
+        current.model_name = reported.model_name;
+        current.available_models = reported.available_models;
+    }
+    if !reported.available_access_modes.is_empty() {
+        current.access_mode_id = reported.access_mode_id;
+        current.access_mode_name = reported.access_mode_name;
+        current.available_access_modes = reported.available_access_modes;
+    }
+}
+
+async fn default_to_full_access(
+    agent: &AcpConnection,
+    backend: AgentBackend,
+    session_id: &str,
+    config: &mut AgentSessionConfig,
+) -> Result<(), String> {
+    if backend == AgentBackend::Grok {
+        // Grok has no ACP session modes. Its process is launched with
+        // `--always-approve`, so expose that effective state to the UI.
+        mark_grok_full_access(config);
+        return Ok(());
+    }
+
+    let Some(option) = full_access_option(backend, &config.available_access_modes).cloned() else {
+        return Ok(());
+    };
+    if config.access_mode_id.as_deref() != Some(option.id.as_str()) {
+        agent
+            .session_set_mode(session_id, &option.id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    config.access_mode_id = Some(option.id);
+    config.access_mode_name = Some(option.name);
+    Ok(())
+}
+
+async fn restore_agent_session_config(
+    agent: &AcpConnection,
+    backend: AgentBackend,
+    session_id: &str,
+    config: &AgentSessionConfig,
+) -> Result<(), String> {
+    if let Some(model_id) = config.model_id.as_deref() {
+        if let Some(config_id) = config.model_config_id.as_deref() {
+            agent
+                .session_set_config_option(session_id, config_id, json!(model_id))
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            agent
+                .session_set_model(session_id, model_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if backend != AgentBackend::Grok {
+        if let Some(mode_id) = config.access_mode_id.as_deref() {
+            agent
+                .session_set_mode(session_id, mode_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn create_chat(
     state: State<'_, AppState>,
     project_id: Option<String>,
     title: Option<String>,
+    backend: Option<AgentBackend>,
 ) -> Result<ChatDocument, String> {
+    let backend = backend.unwrap_or_else(|| state.data.lock().active_backend);
     let project_id = project_id
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| {
@@ -1061,11 +1429,12 @@ pub async fn create_chat(
     let prev_active = state.data.lock().active_chat_id.clone();
     if let Some(ref aid) = prev_active {
         if let Ok(doc) = state.store.load_chat(aid) {
-            if doc.project_id == project_id && chat_has_no_turns(&doc) {
+            if doc.project_id == project_id && doc.backend == backend && chat_has_no_turns(&doc) {
                 let mut data = state.data.lock();
                 data.active_chat_id = Some(doc.id.clone());
                 data.active_project_id = Some(doc.project_id.clone());
                 data.active_environment_id = Some(env_id);
+                data.active_backend = backend;
                 state.store.save_index(&data).map_err(|e| e.to_string())?;
                 return Ok(doc);
             }
@@ -1075,7 +1444,7 @@ pub async fn create_chat(
     let chat_id = new_id();
     let session_cwd = resolve_session_cwd(&state, &project, &chat_id).await?;
 
-    let agent = agent_for_env(&state, &env_id)?;
+    let agent = agent_for_runtime(&state, &env_id, backend)?;
 
     let result = agent
         .session_new(&session_cwd)
@@ -1086,7 +1455,9 @@ pub async fn create_chat(
         .and_then(|s| s.as_str())
         .ok_or_else(|| format!("session/new missing sessionId: {result}"))?
         .to_string();
-    mark_session_loaded(&state, &env_id, acp_session_id.clone());
+    let mut agent_config = parse_agent_session_config(&result);
+    default_to_full_access(&agent, backend, &acp_session_id, &mut agent_config).await?;
+    mark_session_loaded(&state, &env_id, backend, acp_session_id.clone());
 
     let ts = now();
     let title = title.unwrap_or_else(|| "New chat".to_string());
@@ -1095,7 +1466,9 @@ pub async fn create_chat(
         id: chat_id.clone(),
         project_id: project_id.clone(),
         title: title.clone(),
+        backend,
         acp_session_id: Some(acp_session_id),
+        agent_config,
         turns: vec![],
         created_at: ts,
         updated_at: ts,
@@ -1108,6 +1481,7 @@ pub async fn create_chat(
         id: chat_id,
         project_id,
         title,
+        backend,
         acp_session_id: doc.acp_session_id.clone(),
         preview: None,
         created_at: ts,
@@ -1120,6 +1494,7 @@ pub async fn create_chat(
         data.active_chat_id = Some(doc.id.clone());
         data.active_project_id = Some(doc.project_id.clone());
         data.active_environment_id = Some(env_id);
+        data.active_backend = backend;
         state.store.save_index(&data).map_err(|e| e.to_string())?;
     }
 
@@ -1133,16 +1508,147 @@ pub async fn create_chat(
     Ok(doc)
 }
 
+fn agent_for_chat(state: &AppState, doc: &ChatDocument) -> Result<Arc<AcpConnection>, String> {
+    let env_id = {
+        let data = state.data.lock();
+        data.projects
+            .iter()
+            .find(|project| project.id == doc.project_id)
+            .map(|project| {
+                if project.environment_id.is_empty() {
+                    LOCAL_ENV_ID.to_string()
+                } else {
+                    project.environment_id.clone()
+                }
+            })
+            .ok_or_else(|| "project not found".to_string())?
+    };
+    agent_for_runtime(state, &env_id, doc.backend)
+}
+
+#[tauri::command]
+pub async fn set_chat_model(
+    state: State<'_, AppState>,
+    chat_id: String,
+    model_id: String,
+) -> Result<ChatDocument, String> {
+    let snapshot = load_chat_doc(&state, &chat_id)?;
+    if !chat_has_no_turns(&snapshot) {
+        return Err("The model is locked after the first message.".into());
+    }
+    let model = snapshot
+        .agent_config
+        .available_models
+        .iter()
+        .find(|option| option.id == model_id)
+        .cloned()
+        .ok_or_else(|| format!("model `{model_id}` is not offered by this agent"))?;
+    let session_id = snapshot
+        .acp_session_id
+        .as_deref()
+        .ok_or_else(|| "chat has no ACP session".to_string())?;
+    let agent = agent_for_chat(&state, &snapshot)?;
+
+    if let Some(config_id) = snapshot.agent_config.model_config_id.as_deref() {
+        agent
+            .session_set_config_option(session_id, config_id, json!(model_id))
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        agent
+            .session_set_model(session_id, &model_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    let doc = {
+        let _guard = state.chat_write.lock();
+        let mut doc = state
+            .live_chats
+            .lock()
+            .get(&chat_id)
+            .cloned()
+            .or_else(|| state.store.load_chat(&chat_id).ok())
+            .ok_or_else(|| "chat not found".to_string())?;
+        if !chat_has_no_turns(&doc) || doc.acp_session_id != snapshot.acp_session_id {
+            return Err("The chat started while its model was changing.".into());
+        }
+        doc.agent_config.model_id = Some(model.id);
+        doc.agent_config.model_name = Some(model.name);
+        doc.updated_at = now();
+        state.live_chats.lock().insert(chat_id.clone(), doc.clone());
+        state
+            .store
+            .save_chat(&doc)
+            .map_err(|error| error.to_string())?;
+        doc
+    };
+    sync_meta(&state, &doc)?;
+    Ok(doc)
+}
+
+#[tauri::command]
+pub async fn set_chat_access_mode(
+    state: State<'_, AppState>,
+    chat_id: String,
+    mode_id: String,
+) -> Result<ChatDocument, String> {
+    let snapshot = load_chat_doc(&state, &chat_id)?;
+    if !chat_has_no_turns(&snapshot) {
+        return Err("Access is locked after the first message.".into());
+    }
+    let mode = snapshot
+        .agent_config
+        .available_access_modes
+        .iter()
+        .find(|option| option.id == mode_id)
+        .cloned()
+        .ok_or_else(|| format!("access mode `{mode_id}` is not offered by this agent"))?;
+    let session_id = snapshot
+        .acp_session_id
+        .as_deref()
+        .ok_or_else(|| "chat has no ACP session".to_string())?;
+
+    if snapshot.backend != AgentBackend::Grok {
+        agent_for_chat(&state, &snapshot)?
+            .session_set_mode(session_id, &mode_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    let doc = {
+        let _guard = state.chat_write.lock();
+        let mut doc = state
+            .live_chats
+            .lock()
+            .get(&chat_id)
+            .cloned()
+            .or_else(|| state.store.load_chat(&chat_id).ok())
+            .ok_or_else(|| "chat not found".to_string())?;
+        if !chat_has_no_turns(&doc) || doc.acp_session_id != snapshot.acp_session_id {
+            return Err("The chat started while its access mode was changing.".into());
+        }
+        doc.agent_config.access_mode_id = Some(mode.id);
+        doc.agent_config.access_mode_name = Some(mode.name);
+        doc.updated_at = now();
+        state.live_chats.lock().insert(chat_id.clone(), doc.clone());
+        state
+            .store
+            .save_chat(&doc)
+            .map_err(|error| error.to_string())?;
+        doc
+    };
+    sync_meta(&state, &doc)?;
+    Ok(doc)
+}
+
 #[tauri::command]
 pub fn get_chat(state: State<'_, AppState>, chat_id: String) -> Result<ChatDocument, String> {
     load_chat_doc(&state, &chat_id)
 }
 
 #[tauri::command]
-pub fn save_chat_document(
-    state: State<'_, AppState>,
-    chat: ChatDocument,
-) -> Result<(), String> {
+pub fn save_chat_document(state: State<'_, AppState>, chat: ChatDocument) -> Result<(), String> {
     let mut updated = chat;
     updated.updated_at = now();
     state.store.save_chat(&updated).map_err(|e| e.to_string())?;
@@ -1151,6 +1657,7 @@ pub fn save_chat_document(
     if let Some(meta) = data.chats.iter_mut().find(|c| c.id == updated.id) {
         meta.title = updated.title.clone();
         meta.acp_session_id = updated.acp_session_id.clone();
+        meta.backend = updated.backend;
         meta.updated_at = updated.updated_at;
         meta.preview = updated.turns.last().map(|t| {
             let preview = if !t.assistant_message.is_empty() {
@@ -1212,13 +1719,14 @@ pub fn set_active_chat(
         let prev = data.active_chat_id.clone();
         data.active_chat_id = chat_id.clone();
         if let Some(ref id) = chat_id {
-            let project_id = data
+            let chat = data
                 .chats
                 .iter()
                 .find(|c| c.id == *id)
-                .map(|c| c.project_id.clone());
-            if let Some(project_id) = project_id {
+                .map(|c| (c.project_id.clone(), c.backend));
+            if let Some((project_id, backend)) = chat {
                 data.active_project_id = Some(project_id.clone());
+                data.active_backend = backend;
                 let env_id = data
                     .projects
                     .iter()
@@ -1312,14 +1820,15 @@ async fn ensure_session_work(
     } else {
         project.environment_id.clone()
     };
+    let backend = doc.backend;
 
     let session_cwd = resolve_session_cwd(state, &project, chat_id).await?;
-    let agent = agent_for_env(state, &env_id)?;
+    let agent = agent_for_runtime(state, &env_id, backend)?;
 
     // Already live in this agent process — re-read live so we never return a
     // pre-await clone that would clobber a concurrent send's turn.
     if let Some(sid) = doc.acp_session_id.clone() {
-        if is_session_loaded(state, &env_id, &sid) {
+        if is_session_loaded(state, &env_id, backend, &sid) {
             let live = load_chat_doc(state, chat_id).unwrap_or(doc);
             return Ok(EnsureSessionResult {
                 chat: live,
@@ -1340,6 +1849,7 @@ async fn ensure_session_work(
                     "Loading ACP session {sid} for chat {chat_id} (cwd={session_cwd}, env={env_id})"
                 ),
                 "environmentId": env_id,
+                "backend": backend,
             }),
         );
 
@@ -1347,15 +1857,42 @@ async fn ensure_session_work(
         state.replaying_sessions.lock().remove(&sid);
 
         match load_result {
-            Ok(_) => {
-                mark_session_loaded(state, &env_id, sid);
+            Ok(load_result) => {
+                mark_session_loaded(state, &env_id, backend, sid);
                 state.needs_history_seed.lock().remove(chat_id);
+                let mut reported_config = parse_agent_session_config(&load_result);
+                if backend == AgentBackend::Grok {
+                    mark_grok_full_access(&mut reported_config);
+                }
+                let refreshed = {
+                    let _guard = state.chat_write.lock();
+                    let mut current = state
+                        .live_chats
+                        .lock()
+                        .get(chat_id)
+                        .cloned()
+                        .or_else(|| state.store.load_chat(chat_id).ok());
+                    if let Some(ref mut current) = current {
+                        merge_reported_agent_config(&mut current.agent_config, reported_config);
+                        let _ = state.store.save_chat(current);
+                        state
+                            .live_chats
+                            .lock()
+                            .insert(chat_id.to_string(), current.clone());
+                    }
+                    current
+                };
+                if let Some(ref refreshed) = refreshed {
+                    let _ = sync_meta(state, refreshed);
+                }
                 let _ = app.emit(
                     "session-ready",
-                    json!({ "chatId": chat_id, "status": "loaded", "cwd": session_cwd, "environmentId": env_id }),
+                    json!({ "chatId": chat_id, "status": "loaded", "cwd": session_cwd, "environmentId": env_id, "backend": backend }),
                 );
                 // Always return the *current* live doc, not the pre-await clone.
-                let live = load_chat_doc(state, chat_id).unwrap_or(doc);
+                let live = refreshed
+                    .or_else(|| load_chat_doc(state, chat_id).ok())
+                    .unwrap_or(doc);
                 return Ok(EnsureSessionResult {
                     chat: live,
                     status: "loaded".into(),
@@ -1370,6 +1907,7 @@ async fn ensure_session_work(
                         "level": "warn",
                         "message": format!("session/load failed for {sid}: {msg}; creating new session"),
                         "environmentId": env_id,
+                        "backend": backend,
                     }),
                 );
             }
@@ -1394,10 +1932,18 @@ async fn ensure_session_work(
         .and_then(|s| s.as_str())
         .ok_or_else(|| "session/new missing sessionId".to_string())?
         .to_string();
+    restore_agent_session_config(&agent, backend, &new_sid, &doc.agent_config).await?;
 
     // Re-load under the write lock and ONLY patch session id — never write back
     // the pre-await clone (stream applies may have advanced live_chats).
-    let doc = patch_chat_session_id(state, chat_id, &env_id, old_sid.as_deref(), &new_sid)?;
+    let doc = patch_chat_session_id(
+        state,
+        chat_id,
+        &env_id,
+        backend,
+        old_sid.as_deref(),
+        &new_sid,
+    )?;
 
     if had_history {
         state.needs_history_seed.lock().insert(chat_id.to_string());
@@ -1409,6 +1955,7 @@ async fn ensure_session_work(
             "chatId": chat_id,
             "status": status,
             "environmentId": env_id,
+            "backend": backend,
             "sessionId": new_sid,
         }),
     );
@@ -1435,6 +1982,7 @@ fn patch_chat_session_id(
     state: &AppState,
     chat_id: &str,
     env_id: &str,
+    backend: AgentBackend,
     old_sid: Option<&str>,
     new_sid: &str,
 ) -> Result<ChatDocument, String> {
@@ -1459,7 +2007,7 @@ fn patch_chat_session_id(
     }
 
     if let Some(old) = old_sid {
-        unmark_session_loaded(state, env_id, old);
+        unmark_session_loaded(state, env_id, backend, old);
         state.cancelling_sessions.lock().remove(old);
     }
     doc.acp_session_id = Some(new_sid.to_string());
@@ -1468,17 +2016,14 @@ fn patch_chat_session_id(
         .live_chats
         .lock()
         .insert(chat_id.to_string(), doc.clone());
-    state
-        .store
-        .save_chat(&doc)
-        .map_err(|e| e.to_string())?;
+    state.store.save_chat(&doc).map_err(|e| e.to_string())?;
     state
         .last_disk_save
         .lock()
         .insert(chat_id.to_string(), Instant::now());
     drop(_guard);
 
-    mark_session_loaded(state, env_id, new_sid.to_string());
+    mark_session_loaded(state, env_id, backend, new_sid.to_string());
     sync_meta(state, &doc)?;
     Ok(doc)
 }
@@ -1631,8 +2176,8 @@ fn build_prompt_blocks(
     }
     for att in attachments {
         let abs = data_dir.join(&att.path);
-        let bytes = std::fs::read(&abs)
-            .map_err(|e| format!("read attachment {}: {e}", abs.display()))?;
+        let bytes =
+            std::fs::read(&abs).map_err(|e| format!("read attachment {}: {e}", abs.display()))?;
         if att.kind == "text" {
             let content = String::from_utf8_lossy(&bytes).to_string();
             blocks.push(json!({
@@ -1723,7 +2268,11 @@ pub async fn rollback_to_turn(
                 let mut map = state.inflight_prompts.lock();
                 if let Some(tid) = map.get(&chat_id).cloned() {
                     let still_there = load_chat_doc(&state, &chat_id)
-                        .map(|d| d.turns.iter().any(|t| t.id == tid && t.status == "streaming"))
+                        .map(|d| {
+                            d.turns
+                                .iter()
+                                .any(|t| t.id == tid && t.status == "streaming")
+                        })
                         .unwrap_or(false);
                     if !still_there {
                         map.remove(&chat_id);
@@ -1735,7 +2284,7 @@ pub async fn rollback_to_turn(
 
     let data_dir = state.store.data_dir().to_path_buf();
 
-    let (doc, draft_text, attachments, removed_count, old_sid, env_id) = {
+    let (doc, draft_text, attachments, removed_count, old_sid, env_id, backend) = {
         let _guard = state.chat_write.lock();
         let mut doc = load_chat_doc(&state, &chat_id)?;
         let idx = doc
@@ -1781,9 +2330,10 @@ pub async fn rollback_to_turn(
                 .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
         };
         // Drop ACP session so the agent does not keep the rolled-back turns.
+        let backend = doc.backend;
         let old_sid = doc.acp_session_id.take();
         if let Some(ref sid) = old_sid {
-            unmark_session_loaded(&state, &env_id, sid);
+            unmark_session_loaded(&state, &env_id, backend, sid);
             state.cancelling_sessions.lock().remove(sid);
         }
         // Next send creates a fresh session; rehydrate only if prior turns remain.
@@ -1796,12 +2346,20 @@ pub async fn rollback_to_turn(
         doc.updated_at = now();
         put_chat_doc(&state, doc.clone(), true)?;
         sync_meta(&state, &doc)?;
-        (doc, draft_text, attachments, removed_count, old_sid, env_id)
+        (
+            doc,
+            draft_text,
+            attachments,
+            removed_count,
+            old_sid,
+            env_id,
+            backend,
+        )
     };
 
     // Outside the write lock — cancel may await the agent.
     if let Some(sid) = old_sid {
-        if let Ok(agent) = agent_for_env(&state, &env_id) {
+        if let Ok(agent) = agent_for_runtime(&state, &env_id, backend) {
             let _ = agent.session_cancel(&sid).await;
         }
     }
@@ -1862,7 +2420,7 @@ pub async fn send_message(
 
     // Append turn + claim inflight under the write lock so concurrent sends
     // cannot load/append/save racing copies of the same document.
-    let (doc, turn_id, acp_session_id, env_id, agent) = {
+    let (doc, turn_id, acp_session_id, env_id, backend, agent) = {
         let _guard = state.chat_write.lock();
         if state.inflight_prompts.lock().contains_key(&args.chat_id) {
             return Err("chat already has an in-flight prompt; wait or cancel".into());
@@ -1888,7 +2446,8 @@ pub async fn send_message(
                 .unwrap_or_else(|| LOCAL_ENV_ID.to_string())
         };
 
-        let agent = agent_for_env(&state, &env_id)?;
+        let backend = doc.backend;
+        let agent = agent_for_runtime(&state, &env_id, backend)?;
 
         let acp_session_id = doc
             .acp_session_id
@@ -1897,9 +2456,7 @@ pub async fn send_message(
 
         // Do not start a new prompt while this session is still in the cancel gate.
         if state.cancelling_sessions.lock().contains(&acp_session_id) {
-            return Err(
-                "session is still settling after cancel; try again in a moment".into(),
-            );
+            return Err("session is still settling after cancel; try again in a moment".into());
         }
 
         if doc.turns.is_empty() && doc.title == "New chat" {
@@ -1937,7 +2494,7 @@ pub async fn send_message(
             .inflight_prompts
             .lock()
             .insert(args.chat_id.clone(), turn_id.clone());
-        (doc, turn_id, acp_session_id, env_id, agent)
+        (doc, turn_id, acp_session_id, env_id, backend, agent)
     };
 
     let mut prompt_text = text.clone();
@@ -1950,7 +2507,11 @@ pub async fn send_message(
         Err(e) => {
             // Release claim so the chat is not permanently locked.
             let mut map = state.inflight_prompts.lock();
-            if map.get(&args.chat_id).map(|t| t == &turn_id).unwrap_or(false) {
+            if map
+                .get(&args.chat_id)
+                .map(|t| t == &turn_id)
+                .unwrap_or(false)
+            {
                 map.remove(&args.chat_id);
             }
             return Err(e);
@@ -1973,7 +2534,11 @@ pub async fn send_message(
         Some(p) => p,
         None => {
             let mut map = state.inflight_prompts.lock();
-            if map.get(&args.chat_id).map(|t| t == &turn_id).unwrap_or(false) {
+            if map
+                .get(&args.chat_id)
+                .map(|t| t == &turn_id)
+                .unwrap_or(false)
+            {
                 map.remove(&args.chat_id);
             }
             return Err("project not found".into());
@@ -1983,7 +2548,11 @@ pub async fn send_message(
         Ok(c) => c,
         Err(e) => {
             let mut map = state.inflight_prompts.lock();
-            if map.get(&args.chat_id).map(|t| t == &turn_id).unwrap_or(false) {
+            if map
+                .get(&args.chat_id)
+                .map(|t| t == &turn_id)
+                .unwrap_or(false)
+            {
                 map.remove(&args.chat_id);
             }
             return Err(e);
@@ -2006,11 +2575,15 @@ pub async fn send_message(
     let data_dir2 = data_dir.clone();
     let attachments2 = attachments.clone();
     let env_id2 = env_id.clone();
+    let backend2 = backend;
+    let agent_config2 = doc.agent_config.clone();
     // Clone index path machinery via store for meta sync after recreate.
     tokio::spawn(async move {
         let mut session_id = session_id_initial.clone();
         let mut blocks = blocks_initial;
-        let mut result = agent2.session_prompt_blocks(&session_id, blocks.clone()).await;
+        let mut result = agent2
+            .session_prompt_blocks(&session_id, blocks.clone())
+            .await;
 
         // Stale session after agent restart: recreate once, re-seed history, retry.
         if let Err(err) = &result {
@@ -2024,6 +2597,7 @@ pub async fn send_message(
                             "session/prompt unknown session {session_id}; recreating and retrying"
                         ),
                         "environmentId": env_id2,
+                        "backend": backend2,
                     }),
                 );
                 match agent2.session_new(&session_cwd).await {
@@ -2033,69 +2607,93 @@ pub async fn send_message(
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string())
                         {
-                            // Patch live under write lock — only session id, keep stream state.
-                            let patched = {
-                                let _guard = chat_write.lock();
-                                let mut chat = live_chats
-                                    .lock()
-                                    .get(&chat_id)
-                                    .cloned()
-                                    .or_else(|| store.load_chat(&chat_id).ok());
-                                if let Some(ref mut chat) = chat {
-                                    let old = chat.acp_session_id.clone();
-                                    if let Some(ref o) = old {
-                                        if let Some(set) =
-                                            loaded_sessions.lock().get_mut(&env_id2)
-                                        {
-                                            set.remove(o);
-                                        }
-                                        cancelling.lock().remove(o);
-                                    }
-                                    chat.acp_session_id = Some(new_sid.clone());
-                                    chat.updated_at = now();
-                                    let _ = store.save_chat(chat);
-                                    live_chats.lock().insert(chat_id.clone(), chat.clone());
-                                    // Bookkeeping for ensure_session later.
-                                    loaded_sessions
+                            let restore_error = restore_agent_session_config(
+                                &agent2,
+                                backend2,
+                                &new_sid,
+                                &agent_config2,
+                            )
+                            .await
+                            .err();
+                            if let Some(error) = restore_error {
+                                result = Err(anyhow::Error::msg(format!(
+                                    "failed to restore model/access settings: {error}"
+                                )));
+                                let _ = app2.emit(
+                                    "agent-log",
+                                    json!({
+                                        "level": "error",
+                                        "message": result.as_ref().err().map(ToString::to_string),
+                                        "environmentId": env_id2,
+                                        "backend": backend2,
+                                    }),
+                                );
+                            } else {
+                                // Patch live under write lock — only session id, keep stream state.
+                                let patched = {
+                                    let _guard = chat_write.lock();
+                                    let mut chat = live_chats
                                         .lock()
-                                        .entry(env_id2.clone())
-                                        .or_default()
-                                        .insert(new_sid.clone());
-                                    // Best-effort index meta so frontend session maps stay correct.
-                                    if let Ok(mut data) = store.load_index() {
-                                        if let Some(meta) =
-                                            data.chats.iter_mut().find(|c| c.id == chat_id)
-                                        {
-                                            meta.acp_session_id = Some(new_sid.clone());
-                                            meta.updated_at = chat.updated_at;
+                                        .get(&chat_id)
+                                        .cloned()
+                                        .or_else(|| store.load_chat(&chat_id).ok());
+                                    if let Some(ref mut chat) = chat {
+                                        let old = chat.acp_session_id.clone();
+                                        if let Some(ref o) = old {
+                                            let runtime = runtime_key(&env_id2, backend2);
+                                            if let Some(set) =
+                                                loaded_sessions.lock().get_mut(&runtime)
+                                            {
+                                                set.remove(o);
+                                            }
+                                            cancelling.lock().remove(o);
                                         }
-                                        let _ = store.save_index(&data);
+                                        chat.acp_session_id = Some(new_sid.clone());
+                                        chat.updated_at = now();
+                                        let _ = store.save_chat(chat);
+                                        live_chats.lock().insert(chat_id.clone(), chat.clone());
+                                        // Bookkeeping for ensure_session later.
+                                        loaded_sessions
+                                            .lock()
+                                            .entry(runtime_key(&env_id2, backend2))
+                                            .or_default()
+                                            .insert(new_sid.clone());
+                                        // Best-effort index meta so frontend session maps stay correct.
+                                        if let Ok(mut data) = store.load_index() {
+                                            if let Some(meta) =
+                                                data.chats.iter_mut().find(|c| c.id == chat_id)
+                                            {
+                                                meta.acp_session_id = Some(new_sid.clone());
+                                                meta.updated_at = chat.updated_at;
+                                            }
+                                            let _ = store.save_index(&data);
+                                        }
+                                        Some(chat.clone())
+                                    } else {
+                                        None
                                     }
-                                    Some(chat.clone())
-                                } else {
-                                    None
+                                };
+                                let _ = app2.emit(
+                                    "chat-updated",
+                                    json!({
+                                        "chatId": chat_id,
+                                        "sessionId": new_sid,
+                                        "sessionRecreated": true,
+                                    }),
+                                );
+                                // Rebuild prompt with full transcript seed for the empty session.
+                                let seed_doc = patched.or_else(|| store.load_chat(&chat_id).ok());
+                                if let Some(seed_doc) = seed_doc {
+                                    let seeded = build_history_seed(&seed_doc, &user_text);
+                                    if let Ok(seeded_blocks) =
+                                        build_prompt_blocks(&data_dir2, &seeded, &attachments2)
+                                    {
+                                        blocks = seeded_blocks;
+                                    }
                                 }
-                            };
-                            let _ = app2.emit(
-                                "chat-updated",
-                                json!({
-                                    "chatId": chat_id,
-                                    "sessionId": new_sid,
-                                    "sessionRecreated": true,
-                                }),
-                            );
-                            // Rebuild prompt with full transcript seed for the empty session.
-                            let seed_doc = patched.or_else(|| store.load_chat(&chat_id).ok());
-                            if let Some(seed_doc) = seed_doc {
-                                let seeded = build_history_seed(&seed_doc, &user_text);
-                                if let Ok(seeded_blocks) =
-                                    build_prompt_blocks(&data_dir2, &seeded, &attachments2)
-                                {
-                                    blocks = seeded_blocks;
-                                }
+                                session_id = new_sid;
+                                result = agent2.session_prompt_blocks(&session_id, blocks).await;
                             }
-                            session_id = new_sid;
-                            result = agent2.session_prompt_blocks(&session_id, blocks).await;
                         }
                     }
                     Err(e) => {
@@ -2105,6 +2703,7 @@ pub async fn send_message(
                                 "level": "error",
                                 "message": format!("session/new after unknown session failed: {e}"),
                                 "environmentId": env_id2,
+                                "backend": backend2,
                             }),
                         );
                     }
@@ -2245,6 +2844,7 @@ fn sync_meta(state: &AppState, doc: &ChatDocument) -> Result<(), String> {
     if let Some(meta) = data.chats.iter_mut().find(|c| c.id == doc.id) {
         meta.title = doc.title.clone();
         meta.acp_session_id = doc.acp_session_id.clone();
+        meta.backend = doc.backend;
         meta.updated_at = doc.updated_at;
         meta.preview = doc
             .turns
@@ -2297,7 +2897,7 @@ pub async fn cancel_prompt(
     let had_inflight = state.inflight_prompts.lock().contains_key(&chat_id);
     if !had_inflight {
         // Best-effort cancel notify; never poison the gate.
-        if let Ok(agent) = agent_for_env(&state, &env_id) {
+        if let Ok(agent) = agent_for_runtime(&state, &env_id, doc.backend) {
             let _ = agent.session_cancel(&sid).await;
         }
         // Still paint cancelled if UI shows streaming (stale).
@@ -2322,6 +2922,7 @@ pub async fn cancel_prompt(
                 "chatId": chat_id,
                 "sessionId": sid,
                 "turnId": cancelled_turn_id,
+                "backend": doc.backend,
             }),
         );
         return Ok(());
@@ -2351,10 +2952,7 @@ pub async fn cancel_prompt(
                 t.intermediate_collapsed = true;
                 for b in t.intermediate.iter_mut() {
                     if let IntermediateBlock::Tool { status, .. } = b {
-                        if status == "pending"
-                            || status == "in_progress"
-                            || status == "running"
-                        {
+                        if status == "pending" || status == "in_progress" || status == "running" {
                             *status = "cancelled".into();
                         }
                     }
@@ -2380,7 +2978,7 @@ pub async fn cancel_prompt(
         state.cancelling_sessions.lock().insert(sid.clone());
     }
 
-    let agent = agent_for_env(&state, &env_id)?;
+    let agent = agent_for_runtime(&state, &env_id, doc.backend)?;
     agent
         .session_cancel(&live_sid)
         .await
@@ -2428,9 +3026,7 @@ pub async fn cancel_prompt(
                         }
                         chat.updated_at = now();
                         let _ = store.save_chat(chat);
-                        live_chats
-                            .lock()
-                            .insert(chat_id_bg.clone(), chat.clone());
+                        live_chats.lock().insert(chat_id_bg.clone(), chat.clone());
                         saved = true;
                     } else {
                         // Already cancelled on live — still flush disk.
@@ -2460,6 +3056,7 @@ pub async fn cancel_prompt(
             "chatId": chat_id,
             "sessionId": live_sid,
             "turnId": cancelled_turn_id,
+            "backend": doc.backend,
         }),
     );
     Ok(())
@@ -2471,16 +3068,34 @@ pub async fn respond_permission(
     request_id: Value,
     option_id: Option<String>,
     cancelled: bool,
+    environment_id: Option<String>,
+    backend: Option<AgentBackend>,
 ) -> Result<(), String> {
-    // Find whichever agent is waiting on this permission id.
+    // Prefer the exact runtime supplied by the event. Fall back to searching
+    // pending requests for older frontends that do not send routing fields.
     let agent = {
         let agents = state.agents.lock();
-        agents
-            .values()
-            .find(|a| a.has_pending_permission(&request_id))
-            .cloned()
-            .or_else(|| agents.values().next().cloned())
-            .ok_or_else(|| "agent not connected".to_string())?
+        if let (Some(environment_id), Some(backend)) = (environment_id.as_deref(), backend) {
+            let agent = agents
+                .get(&runtime_key(environment_id, backend))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "{} agent not connected for environment `{environment_id}`",
+                        backend.as_str()
+                    )
+                })?;
+            if !agent.has_pending_permission(&request_id) {
+                return Err("permission request is no longer pending".into());
+            }
+            agent
+        } else {
+            agents
+                .values()
+                .find(|agent| agent.has_pending_permission(&request_id))
+                .cloned()
+                .ok_or_else(|| "permission request is no longer pending".to_string())?
+        }
     };
     agent
         .respond_permission(request_id, option_id, cancelled)
@@ -2541,9 +3156,7 @@ fn apply_updates_inner(
     // Re-check session after lock (rollback may have recreated mid-flight).
     if let Some(expected) = expected_session_id {
         if doc.acp_session_id.as_deref() != Some(expected) {
-            return Err(format!(
-                "session id mismatch for chat {chat_id} after lock"
-            ));
+            return Err(format!("session id mismatch for chat {chat_id} after lock"));
         }
     }
     if updates.is_empty() {
@@ -2627,13 +3240,21 @@ pub fn set_block_collapsed(
     if let Some(t) = doc.turns.iter_mut().find(|t| t.id == turn_id) {
         for b in &mut t.intermediate {
             match b {
-                IntermediateBlock::Thought { id, collapsed: c, .. }
-                | IntermediateBlock::Tool { id, collapsed: c, .. }
-                | IntermediateBlock::Plan { id, collapsed: c, .. }
-                | IntermediateBlock::Subagent { id, collapsed: c, .. }
-                | IntermediateBlock::Task { id, collapsed: c, .. }
-                    if id == &block_id =>
-                {
+                IntermediateBlock::Thought {
+                    id, collapsed: c, ..
+                }
+                | IntermediateBlock::Tool {
+                    id, collapsed: c, ..
+                }
+                | IntermediateBlock::Plan {
+                    id, collapsed: c, ..
+                }
+                | IntermediateBlock::Subagent {
+                    id, collapsed: c, ..
+                }
+                | IntermediateBlock::Task {
+                    id, collapsed: c, ..
+                } if id == &block_id => {
                     *c = collapsed;
                 }
                 _ => {}

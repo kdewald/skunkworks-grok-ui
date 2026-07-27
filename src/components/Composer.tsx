@@ -28,6 +28,7 @@ import {
   uid,
 } from "../attachments";
 import { chipLabel } from "../contextChips";
+import { agentBackendLabel, normalizeAgentBackend } from "../types";
 
 type Props = {
   onSend?: () => void;
@@ -46,6 +47,7 @@ export function Composer({ onSend }: Props) {
     busy,
     activeChat,
     activeChatId,
+    activeBackend,
     agent,
     messageQueue,
     removeQueuedMessage,
@@ -67,6 +69,9 @@ export function Composer({ onSend }: Props) {
   const chatQueue = messageQueue.filter((m) => m.chatId === activeChatId);
   const editing =
     composerEdit?.chatId === activeChatId ? composerEdit : null;
+  const backendLabel = agentBackendLabel(
+    normalizeAgentBackend(activeChat?.backend ?? activeBackend),
+  );
 
   useEffect(() => {
     taRef.current?.focus();
@@ -585,7 +590,7 @@ export function Composer({ onSend }: Props) {
                 ? "Connect to agent, then type a message…"
                 : streaming || busy
                   ? "Queue a follow-up… (Stop to interrupt the current turn)"
-                  : "Message Grok…"
+                  : `Message ${backendLabel}…`
           }
           rows={1}
         />

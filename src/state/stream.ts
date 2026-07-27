@@ -4,12 +4,19 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ChatDocument, ChatMeta, Project } from "../types";
-import { LOCAL_ENV_ID } from "../types";
+import {
+  LOCAL_ENV_ID,
+  normalizeAgentBackend,
+  type AgentBackend,
+  type ChatDocument,
+  type ChatMeta,
+  type Project,
+} from "../types";
 
 type PendingBatch = {
   sessionId: string;
   environmentId?: string;
+  backend: AgentBackend;
   updates: unknown[];
 };
 
@@ -85,27 +92,38 @@ function chatEnvId(get: GetFn, chatId: string): string | null {
   return project?.environmentId || LOCAL_ENV_ID;
 }
 
+function chatBackend(get: GetFn, chatId: string): AgentBackend {
+  const meta = get().chats.find((c) => c.id === chatId);
+  const document =
+    get().activeChat?.id === chatId ? get().activeChat : null;
+  return normalizeAgentBackend(meta?.backend ?? document?.backend);
+}
+
 export function resolveChatIdForSession(
   get: GetFn,
   sessionId: string,
   environmentId?: string | null,
+  backend?: AgentBackend | null,
 ): string | null {
+  const targetBackend = normalizeAgentBackend(backend);
   const envMatches = (chatId: string) => {
     if (!environmentId) return true;
     const chatEnv = chatEnvId(get, chatId);
     return !chatEnv || chatEnv === environmentId;
   };
+  const runtimeMatches = (chatId: string) =>
+    envMatches(chatId) && chatBackend(get, chatId) === targetBackend;
 
   const bySession = get().chats.find(
-    (c) => c.acpSessionId === sessionId && envMatches(c.id),
+    (c) => c.acpSessionId === sessionId && runtimeMatches(c.id),
   );
   if (bySession) return bySession.id;
   const active = get().activeChat;
-  if (active?.acpSessionId === sessionId && envMatches(active.id)) {
+  if (active?.acpSessionId === sessionId && runtimeMatches(active.id)) {
     return active.id;
   }
   const inflight = get().inflightChatId;
-  if (inflight && envMatches(inflight)) {
+  if (inflight && runtimeMatches(inflight)) {
     const meta = get().chats.find((c) => c.id === inflight);
     const live = get().activeChat?.id === inflight ? get().activeChat : null;
     const known = live?.acpSessionId ?? meta?.acpSessionId ?? null;
@@ -125,17 +143,25 @@ export function enqueueSessionUpdate(
   sessionId: string,
   update: unknown,
   environmentId?: string,
+  backend?: AgentBackend,
 ) {
+  const normalizedBackend = normalizeAgentBackend(backend);
   const last = pendingBatches[pendingBatches.length - 1];
   if (
     last &&
     last.sessionId === sessionId &&
-    (last.environmentId ?? "") === (environmentId ?? "")
+    (last.environmentId ?? "") === (environmentId ?? "") &&
+    last.backend === normalizedBackend
   ) {
     last.updates.push(update);
     return;
   }
-  pendingBatches.push({ sessionId, environmentId, updates: [update] });
+  pendingBatches.push({
+    sessionId,
+    environmentId,
+    backend: normalizedBackend,
+    updates: [update],
+  });
 }
 
 export function drainSessionApplies(set: SetFn, get: GetFn): Promise<void> {
@@ -148,7 +174,9 @@ export function drainSessionApplies(set: SetFn, get: GetFn): Promise<void> {
         while (
           pendingBatches.length > 0 &&
           pendingBatches[0].sessionId === batch.sessionId &&
-          (pendingBatches[0].environmentId ?? "") === (batch.environmentId ?? "")
+          (pendingBatches[0].environmentId ?? "") ===
+            (batch.environmentId ?? "") &&
+          pendingBatches[0].backend === batch.backend
         ) {
           batch.updates.push(...pendingBatches.shift()!.updates);
         }
@@ -158,15 +186,22 @@ export function drainSessionApplies(set: SetFn, get: GetFn): Promise<void> {
           get,
           batch.sessionId,
           batch.environmentId,
+          batch.backend,
         );
         if (!targetId) continue;
 
         try {
-          const updated = await invoke<ChatDocument>("apply_session_updates", {
+          const rawUpdated = await invoke<ChatDocument>("apply_session_updates", {
             chatId: targetId,
             updates: batch.updates,
             sessionId: batch.sessionId,
           });
+          const updated = {
+            ...rawUpdated,
+            backend: normalizeAgentBackend(
+              rawUpdated.backend ?? batch.backend,
+            ),
+          };
           if (get().activeChatId !== updated.id) continue;
 
           const urgent = batch.updates.some((u) =>

@@ -45,7 +45,7 @@ Continue naturally from that context.\n"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Turn;
+    use crate::store::{AgentBackend, Turn};
     use chrono::Utc;
 
     fn empty_doc(turns: Vec<Turn>) -> ChatDocument {
@@ -53,7 +53,9 @@ mod tests {
             id: "c1".into(),
             project_id: "p1".into(),
             title: "t".into(),
+            backend: AgentBackend::Grok,
             acp_session_id: Some("s1".into()),
+            agent_config: Default::default(),
             turns,
             created_at: Utc::now(),
             updated_at: Utc::now(),

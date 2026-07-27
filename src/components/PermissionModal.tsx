@@ -1,4 +1,5 @@
 import { useAppStore } from "../store";
+import { agentBackendLabel, normalizeAgentBackend } from "../types";
 
 export function PermissionModal() {
   const permission = useAppStore((s) => s.permission);
@@ -10,12 +11,15 @@ export function PermissionModal() {
     permission.toolCall?.title ||
     permission.toolCall?.toolCallId ||
     "Tool permission";
+  const backendLabel = agentBackendLabel(
+    normalizeAgentBackend(permission.backend),
+  );
 
   return (
     <div className="modal-backdrop">
       <div className="modal">
         <h2>Permission required</h2>
-        <p className="modal-sub">Grok wants to run a tool:</p>
+        <p className="modal-sub">{backendLabel} wants to run a tool:</p>
         <div className="modal-tool">
           <div className="modal-tool-title">{title}</div>
           {permission.toolCall?.kind && (

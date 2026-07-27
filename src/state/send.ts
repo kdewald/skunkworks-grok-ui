@@ -3,7 +3,14 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ChatDocument, ChatMeta, Project } from "../types";
+import {
+  normalizeAgentBackend,
+  type AgentBackend,
+  type AgentRuntime,
+  type ChatDocument,
+  type ChatMeta,
+  type Project,
+} from "../types";
 
 export type QueuedAttachment = {
   kind: string;
@@ -25,8 +32,16 @@ export type SendStoreSlice = {
   activeProjectId: string | null;
   activeEnvironmentId: string;
   connectedEnvironments: string[];
+  connectedRuntimes: AgentRuntime[];
   error: string | null;
-  connectAgent: (environmentId?: string) => Promise<void>;
+  connectAgent: (
+    environmentId?: string,
+    backend?: AgentBackend,
+  ) => Promise<void>;
+  isRuntimeConnected: (
+    environmentId: string,
+    backend: AgentBackend,
+  ) => boolean;
 };
 
 type Get = () => SendStoreSlice;
@@ -104,11 +119,15 @@ export async function dispatchSend(
         get().activeProjectId),
   );
   const envId = project?.environmentId || get().activeEnvironmentId;
+  const backend = normalizeAgentBackend(
+    targetMeta?.backend ??
+      (get().activeChat?.id === chatId ? get().activeChat?.backend : null),
+  );
   try {
-    if (!get().connectedEnvironments.includes(envId)) {
-      await get().connectAgent(envId);
+    if (!get().isRuntimeConnected(envId, backend)) {
+      await get().connectAgent(envId, backend);
     }
-    const chat = await invoke<ChatDocument>("send_message", {
+    const rawChat = await invoke<ChatDocument>("send_message", {
       args: {
         chatId,
         text,
@@ -122,6 +141,10 @@ export async function dispatchSend(
         images: [],
       },
     });
+    const chat = {
+      ...rawChat,
+      backend: normalizeAgentBackend(rawChat.backend ?? backend),
+    };
     const streamingTurn = [...chat.turns]
       .reverse()
       .find((t) => t.status === "streaming");
@@ -144,6 +167,7 @@ export async function dispatchSend(
               updatedAt: chat.updatedAt,
               preview: (text || "Attachment").slice(0, 120),
               acpSessionId: chat.acpSessionId,
+              backend: chat.backend,
             }
           : c,
       ),

@@ -1,13 +1,18 @@
-//! SSH helpers: config hosts, remote exec, directory browse, grok probe.
+//! SSH helpers: config hosts, remote exec, directory browse, agent probe.
 //!
 //! Kept separate from the ACP JSON-RPC connection so protocol code stays dense.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
+
+use crate::store::AgentBackend;
+
+const REMOTE_PATH_EXPORT: &str = r#"export PATH="$HOME/.local/bin:$HOME/.grok/bin:$HOME/.volta/bin:$HOME/.asdf/shims:$HOME/.local/share/mise/shims:$HOME/.local/share/fnm/aliases/default/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; for agent_bin_dir in "$HOME"/.nvm/versions/node/*/bin; do if [ -d "$agent_bin_dir" ]; then PATH="$agent_bin_dir:$PATH"; fi; done; export PATH"#;
 
 /// Quote for a single remote shell argument (OpenSSH concatenates argv with spaces).
 pub(crate) fn shell_single_quote(s: &str) -> String {
@@ -20,28 +25,40 @@ pub(crate) fn ssh_remote_bash_lc(inner: &str) -> String {
 }
 
 /// Shell command run on the remote host under `bash -lc`.
-pub(crate) fn remote_agent_shell_command(remote_grok_path: Option<&str>) -> String {
-    // Ensure common install locations are on PATH for non-interactive login shells.
-    let path_export =
-        r#"export PATH="$HOME/.local/bin:$HOME/.grok/bin:/usr/local/bin:/opt/homebrew/bin:$PATH""#;
-    let binary = remote_grok_path
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("grok");
-    if binary == "grok" {
-        format!("{path_export}; exec grok agent --no-leader stdio")
-    } else {
-        let escaped = binary.replace('\'', "'\\''");
-        format!("{path_export}; exec '{escaped}' agent --no-leader stdio")
-    }
+pub(crate) fn remote_agent_shell_command(
+    backend: AgentBackend,
+    remote_grok_path: Option<&str>,
+) -> String {
+    let invocation = match backend {
+        AgentBackend::Grok => {
+            let binary = remote_grok_path
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("grok");
+            if binary == "grok" {
+                "grok agent --no-leader --always-approve stdio".to_string()
+            } else {
+                format!(
+                    "{} agent --no-leader --always-approve stdio",
+                    shell_single_quote(binary)
+                )
+            }
+        }
+        AgentBackend::Codex => "codex-acp".to_string(),
+        AgentBackend::Claude => "claude-agent-acp".to_string(),
+    };
+
+    // Non-interactive SSH sessions need common user install locations explicitly.
+    // ACP adapters must not try to open a browser on the remote host.
+    format!("{REMOTE_PATH_EXPORT}; export NO_BROWSER=1; exec {invocation}")
 }
 
 pub(crate) fn resolve_grok_binary(explicit: Option<String>) -> Result<String> {
-    if let Some(path) = explicit {
+    if let Some(path) = explicit.filter(|path| !path.trim().is_empty()) {
         return Ok(path);
     }
     if let Ok(path) = std::env::var("GROK_PATH") {
-        if !path.is_empty() {
+        if !path.trim().is_empty() {
             return Ok(path);
         }
     }
@@ -61,6 +78,67 @@ pub(crate) fn resolve_grok_binary(explicit: Option<String>) -> Result<String> {
     which::which("grok")
         .map(|p| p.to_string_lossy().to_string())
         .context("could not find `grok` on PATH; set GROK_PATH or install Grok Build")
+}
+
+/// Resolve the selected local ACP executable without installing anything at runtime.
+pub(crate) fn resolve_agent_binary(
+    backend: AgentBackend,
+    explicit_grok_path: Option<String>,
+) -> Result<String> {
+    match backend {
+        AgentBackend::Grok => resolve_grok_binary(explicit_grok_path),
+        AgentBackend::Codex => resolve_adapter_binary(
+            "CODEX_ACP_PATH",
+            "codex-acp",
+            "@agentclientprotocol/codex-acp@1.1.4",
+        ),
+        AgentBackend::Claude => resolve_adapter_binary(
+            "CLAUDE_ACP_PATH",
+            "claude-agent-acp",
+            "@agentclientprotocol/claude-agent-acp@0.59.0",
+        ),
+    }
+}
+
+fn resolve_adapter_binary(env_var: &str, binary: &str, package: &str) -> Result<String> {
+    if let Ok(path) = std::env::var(env_var) {
+        if !path.trim().is_empty() {
+            return Ok(path);
+        }
+    }
+    if let Ok(path) = which::which(binary) {
+        return Ok(path.to_string_lossy().to_string());
+    }
+    let mut candidates = vec![
+        PathBuf::from(format!("/opt/homebrew/bin/{binary}")),
+        PathBuf::from(format!("/usr/local/bin/{binary}")),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.splice(
+            0..0,
+            [
+                home.join(".local/bin").join(binary),
+                home.join(".volta/bin").join(binary),
+                home.join(".asdf/shims").join(binary),
+                home.join(".local/share/mise/shims").join(binary),
+                home.join(".local/share/fnm/aliases/default/bin")
+                    .join(binary),
+            ],
+        );
+        if let Ok(versions) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            candidates.extend(
+                versions
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path().join("bin").join(binary)),
+            );
+        }
+    }
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return Ok(path.to_string_lossy().to_string());
+    }
+    anyhow::bail!(
+        "could not find `{binary}`; set {env_var} or run `npm install --global {package}`"
+    )
 }
 
 /// Best-effort parse of `~/.ssh/config` Host aliases (concrete names only).
@@ -334,62 +412,109 @@ printf 'END_ENTRIES\n'"#
     })
 }
 
-/// Probe remote host: PATH-visible grok + home directory.
-pub async fn probe_ssh_host(host: &str, remote_grok_path: Option<&str>) -> Result<Value> {
-    let which_cmd = match remote_grok_path.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => {
-            let escaped = p.replace('\'', "'\\''");
+/// Probe a remote host for the selected ACP executable and its home directory.
+///
+/// Only Grok accepts an explicit remote path. Codex and Claude adapters are
+/// deliberately resolved from the remote login shell's PATH.
+pub async fn probe_ssh_backend(
+    host: &str,
+    backend: AgentBackend,
+    remote_grok_path: Option<&str>,
+) -> Result<Value> {
+    let explicit_grok_path = if backend == AgentBackend::Grok {
+        remote_grok_path
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    } else {
+        None
+    };
+    let binary_name = match backend {
+        AgentBackend::Grok => "grok",
+        AgentBackend::Codex => "codex-acp",
+        AgentBackend::Claude => "claude-agent-acp",
+    };
+    let which_cmd = match explicit_grok_path {
+        Some(path) => {
+            let quoted = shell_single_quote(path);
             format!(
-                "if [ -x '{escaped}' ]; then echo GROK='{escaped}'; else echo GROK=; fi; echo HOME=\"$HOME\""
+                "{REMOTE_PATH_EXPORT}; \
+                 if [ -x {quoted} ]; then printf 'AGENT=%s\\n' {quoted}; \
+                 else printf 'AGENT=\\n'; fi; \
+                 printf 'HOME=%s\\n' \"$HOME\""
             )
         }
-        None => {
-            "command -v grok || true; echo HOME=\"$HOME\"".into()
-        }
+        None => format!(
+            "{REMOTE_PATH_EXPORT}; \
+             agent_path=$(command -v {binary_name} 2>/dev/null || true); \
+             printf 'AGENT=%s\\n' \"$agent_path\"; \
+             printf 'HOME=%s\\n' \"$HOME\""
+        ),
     };
     let out = ssh_exec(host, &which_cmd).await?;
-    let mut grok = String::new();
+    let mut agent_path = String::new();
     let mut home = String::new();
     for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("GROK=") {
-            grok = rest.to_string();
+        if let Some(rest) = line.strip_prefix("AGENT=") {
+            agent_path = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("HOME=") {
             home = rest.to_string();
-        } else if grok.is_empty() && line.contains('/') && !line.starts_with("HOME=") {
-            // `command -v grok` prints a path alone
-            grok = line.trim().to_string();
         }
     }
-    if remote_grok_path.is_none() && grok.is_empty() {
-        // Second try: common install locations
-        let fallback = ssh_exec(
-            host,
-            "for c in \"$HOME/.local/bin/grok\" \"$HOME/.grok/bin/grok\" /usr/local/bin/grok; do \
-             if [ -x \"$c\" ]; then echo \"$c\"; break; fi; done; echo HOME=\"$HOME\"",
-        )
-        .await
-        .unwrap_or_default();
-        for line in fallback.lines() {
-            if let Some(rest) = line.strip_prefix("HOME=") {
-                if home.is_empty() {
-                    home = rest.to_string();
-                }
-            } else if grok.is_empty() && line.contains("grok") {
-                grok = line.trim().to_string();
+    if agent_path.is_empty() {
+        let hint = match backend {
+            AgentBackend::Grok if explicit_grok_path.is_some() => {
+                "check the configured remote Grok path"
             }
-        }
+            AgentBackend::Grok => "install Grok Build or set a remote Grok path",
+            AgentBackend::Codex => {
+                "run `npm install --global @agentclientprotocol/codex-acp@1.1.4` on the remote host"
+            }
+            AgentBackend::Claude => {
+                "run `npm install --global @agentclientprotocol/claude-agent-acp@0.59.0` on the remote host"
+            }
+        };
+        anyhow::bail!("could not find `{binary_name}` on `{host}` (login shell PATH); {hint}");
     }
-    if grok.is_empty() {
-        anyhow::bail!(
-            "could not find `grok` on `{host}` (login shell PATH). Install Grok Build on the remote host or set a remote grok path."
-        );
-    }
-    Ok(json!({
+
+    let mut result = json!({
         "host": host,
-        "grokPath": grok,
+        "backend": backend,
+        "agentPath": agent_path,
         "home": home,
         "environmentId": format!("ssh:{host}"),
         "ok": true,
-    }))
+    });
+    if backend == AgentBackend::Grok {
+        result["grokPath"] = result["agentPath"].clone();
+    }
+    Ok(result)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_grok_command_keeps_arguments_and_quotes_explicit_path() {
+        let command =
+            remote_agent_shell_command(AgentBackend::Grok, Some("/opt/it's grok/bin/grok"));
+
+        assert!(command.contains("export NO_BROWSER=1"));
+        assert!(command.contains(
+            "exec '/opt/it'\\''s grok/bin/grok' agent --no-leader --always-approve stdio"
+        ));
+    }
+
+    #[test]
+    fn remote_adapter_commands_have_no_arguments_or_runtime_installer() {
+        let codex = remote_agent_shell_command(AgentBackend::Codex, Some("/ignored/grok"));
+        let claude = remote_agent_shell_command(AgentBackend::Claude, Some("/ignored/grok"));
+
+        assert!(codex.ends_with("exec codex-acp"));
+        assert!(claude.ends_with("exec claude-agent-acp"));
+        assert!(!codex.contains("npx"));
+        assert!(!claude.contains("npx"));
+        assert!(!codex.contains("/ignored/grok"));
+        assert!(!claude.contains("/ignored/grok"));
+    }
+}

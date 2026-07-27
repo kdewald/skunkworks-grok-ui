@@ -24,8 +24,13 @@ function doc(turns: Turn[]): ChatDocument {
   return {
     id: "c1",
     projectId: "p1",
+    backend: "grok",
     title: "t",
     acpSessionId: "s1",
+    agentConfig: {
+      availableModels: [],
+      availableAccessModes: [],
+    },
     turns,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),

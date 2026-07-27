@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Server, Trash2, X, Plug, Unplug, Plus } from "lucide-react";
 import { useAppStore } from "../store";
-import { LOCAL_ENV_ID } from "../types";
+import { LOCAL_ENV_ID, agentBackendLabel } from "../types";
 
 export function ConnectionsPanel() {
   const {
@@ -9,7 +9,8 @@ export function ConnectionsPanel() {
     setConnectionsOpen,
     environments,
     activeEnvironmentId,
-    connectedEnvironments,
+    activeBackend,
+    isRuntimeConnected,
     sshHosts,
     busy,
     error,
@@ -39,7 +40,9 @@ export function ConnectionsPanel() {
       await addSshEnvironment(
         host.trim(),
         undefined,
-        remoteGrokPath.trim() || undefined,
+        activeBackend === "grok"
+          ? remoteGrokPath.trim() || undefined
+          : undefined,
       );
       setHostInput("");
       setRemoteGrokPath("");
@@ -76,13 +79,14 @@ export function ConnectionsPanel() {
         </div>
 
         <p className="connections-blurb">
-          Run Grok on a remote machine over SSH (Codex-style). The agent and
-          project files live on the remote host; this window is the client.
+          Run {agentBackendLabel(activeBackend)} on a remote machine over SSH.
+          The agent and project files live on the remote host; this window is
+          the client.
         </p>
 
         <div className="connections-list">
           {environments.map((env) => {
-            const connected = connectedEnvironments.includes(env.id);
+            const connected = isRuntimeConnected(env.id, activeBackend);
             const active = env.id === activeEnvironmentId;
             return (
               <div
@@ -112,11 +116,13 @@ export function ConnectionsPanel() {
                     {env.kind === "local"
                       ? "Local agent"
                       : `SSH · ${env.sshHost ?? env.id}`}
-                    {env.remoteGrokPath
-                      ? ` · ${env.remoteGrokPath}`
-                      : env.kind === "ssh"
-                        ? " · grok on PATH"
-                        : ""}
+                    {activeBackend === "grok"
+                      ? env.remoteGrokPath
+                        ? ` · ${env.remoteGrokPath}`
+                        : env.kind === "ssh"
+                          ? " · grok on PATH"
+                          : ""
+                      : ""}
                   </div>
                 </button>
                 <div className="connection-actions">
@@ -126,7 +132,9 @@ export function ConnectionsPanel() {
                       className="ghost-btn compact"
                       disabled={busy}
                       title="Disconnect"
-                      onClick={() => void disconnectAgent(env.id)}
+                      onClick={() =>
+                        void disconnectAgent(env.id, activeBackend)
+                      }
                     >
                       <Unplug size={14} strokeWidth={1.75} />
                     </button>
@@ -136,7 +144,7 @@ export function ConnectionsPanel() {
                       className="ghost-btn compact"
                       disabled={busy}
                       title="Connect"
-                      onClick={() => void connectAgent(env.id)}
+                      onClick={() => void connectAgent(env.id, activeBackend)}
                     >
                       <Plug size={14} strokeWidth={1.75} />
                     </button>
@@ -203,13 +211,15 @@ export function ConnectionsPanel() {
               }}
               disabled={busy}
             />
-            <input
-              className="text-input"
-              placeholder="Remote grok path (optional)"
-              value={remoteGrokPath}
-              onChange={(e) => setRemoteGrokPath(e.target.value)}
-              disabled={busy}
-            />
+            {activeBackend === "grok" && (
+              <input
+                className="text-input"
+                placeholder="Remote grok path (optional)"
+                value={remoteGrokPath}
+                onChange={(e) => setRemoteGrokPath(e.target.value)}
+                disabled={busy}
+              />
+            )}
             <button
               type="button"
               className="primary-btn"
@@ -221,8 +231,8 @@ export function ConnectionsPanel() {
             </button>
           </div>
           <p className="connections-hint">
-            Requires passwordless SSH (BatchMode) and <code>grok</code> on the
-            remote login-shell PATH. Auth tokens stay on the remote host.
+            Requires passwordless SSH (BatchMode) and the selected agent CLI on
+            the remote login-shell PATH. Auth tokens stay on the remote host.
           </p>
           {(localError || error) && (
             <div className="connections-error">{localError || error}</div>

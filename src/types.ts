@@ -24,6 +24,31 @@ export type Project = {
 export const SCRATCH_PROJECT_ID = "scratch";
 export const LOCAL_ENV_ID = "local";
 
+export const AGENT_BACKENDS = ["grok", "codex", "claude"] as const;
+export type AgentBackend = (typeof AGENT_BACKENDS)[number];
+
+export type AgentRuntime = {
+  environmentId: string;
+  backend: AgentBackend;
+};
+
+export function normalizeAgentBackend(value: unknown): AgentBackend {
+  return AGENT_BACKENDS.includes(value as AgentBackend)
+    ? (value as AgentBackend)
+    : "grok";
+}
+
+export function agentBackendLabel(backend: AgentBackend): string {
+  switch (backend) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+    default:
+      return "Grok";
+  }
+}
+
 export function scratchProjectIdForEnv(environmentId: string): string {
   if (!environmentId || environmentId === LOCAL_ENV_ID) return SCRATCH_PROJECT_ID;
   return `scratch:${environmentId}`;
@@ -32,11 +57,28 @@ export function scratchProjectIdForEnv(environmentId: string): string {
 export type ChatMeta = {
   id: string;
   projectId: string;
+  backend: AgentBackend;
   title: string;
   acpSessionId?: string | null;
   preview?: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type AgentSessionOption = {
+  id: string;
+  name: string;
+  description?: string | null;
+};
+
+export type AgentSessionConfig = {
+  modelConfigId?: string | null;
+  modelId?: string | null;
+  modelName?: string | null;
+  availableModels: AgentSessionOption[];
+  accessModeId?: string | null;
+  accessModeName?: string | null;
+  availableAccessModes: AgentSessionOption[];
 };
 
 export type PlanEntry = {
@@ -130,8 +172,10 @@ export type Turn = {
 export type ChatDocument = {
   id: string;
   projectId: string;
+  backend: AgentBackend;
   title: string;
   acpSessionId?: string | null;
+  agentConfig: AgentSessionConfig;
   turns: Turn[];
   createdAt: string;
   updatedAt: string;
@@ -144,6 +188,7 @@ export type AppData = {
   activeChatId?: string | null;
   environments?: Environment[];
   activeEnvironmentId?: string | null;
+  activeBackend?: AgentBackend | null;
 };
 
 export type PermissionRequest = {
@@ -163,6 +208,7 @@ export type PermissionRequest = {
     kind: string;
   }>;
   environmentId?: string;
+  backend?: AgentBackend;
 };
 
 export type AgentStatus = {
@@ -170,6 +216,7 @@ export type AgentStatus = {
   message: string;
   agentInfo?: unknown;
   environmentId?: string;
+  backend?: AgentBackend;
 };
 
 /** Directory entry from SSH folder browser. */

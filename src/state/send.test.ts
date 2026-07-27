@@ -75,7 +75,12 @@ describe("isActivelyStreaming", () => {
         activeChat: {
           id: "c",
           projectId: "p",
+          backend: "grok",
           title: "t",
+          agentConfig: {
+            availableModels: [],
+            availableAccessModes: [],
+          },
           turns: [
             {
               id: "t1",
