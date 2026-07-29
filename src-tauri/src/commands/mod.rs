@@ -29,7 +29,8 @@ use crate::terminal::TerminalManager;
 
 use crate::chat::session::{build_history_seed, is_unknown_session_error};
 use crate::chat::transcript::{
-    apply_one_update, is_stream_chunk_kind, promote_subagent_tools_in_doc,
+    apply_one_update, apply_subagent_session_update, is_stream_chunk_kind,
+    promote_subagent_tools_in_doc, rebuild_chat_from_replay,
 };
 
 pub struct AppState {
@@ -42,8 +43,6 @@ pub struct AppState {
     pub chat_write: Arc<Mutex<()>>,
     /// ACP session IDs already loaded per environment/backend agent process.
     pub loaded_sessions: Arc<Mutex<HashMap<RuntimeKey, HashSet<String>>>>,
-    /// Sessions currently replaying history via session/load — ignore stream applies.
-    pub replaying_sessions: Mutex<HashSet<String>>,
     /// Sessions that were recreated locally (old ACP id gone); next prompt should rehydrate context.
     pub needs_history_seed: Mutex<HashSet<String>>,
     /// Sessions the user cancelled — drop further stream applies so cancel isn't blocked
@@ -61,6 +60,8 @@ pub struct AppState {
     pub connecting_envs: Mutex<HashSet<RuntimeKey>>,
     /// Chats currently mid ensure_session (single-flight).
     pub ensuring_chats: Mutex<HashSet<String>>,
+    /// Child sessions currently being loaded/subscribed (single-flight).
+    pub watching_subagent_sessions: Mutex<HashSet<String>>,
     /// Interactive project terminals (local PTY / SSH).
     pub terminals: TerminalManager,
     /// Local language servers (stdio LSP).
@@ -88,7 +89,6 @@ impl AppState {
             grok_path: Mutex::new(None),
             chat_write: Arc::new(Mutex::new(())),
             loaded_sessions: Arc::new(Mutex::new(HashMap::new())),
-            replaying_sessions: Mutex::new(HashSet::new()),
             needs_history_seed: Mutex::new(HashSet::new()),
             cancelling_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_chats: Arc::new(Mutex::new(HashMap::new())),
@@ -96,6 +96,7 @@ impl AppState {
             inflight_prompts: Arc::new(Mutex::new(HashMap::new())),
             connecting_envs: Mutex::new(HashSet::new()),
             ensuring_chats: Mutex::new(HashSet::new()),
+            watching_subagent_sessions: Mutex::new(HashSet::new()),
             terminals: TerminalManager::default(),
             lsp: Arc::new(LspHub::new()),
         })
@@ -1283,6 +1284,7 @@ fn parse_agent_session_config(result: &Value) -> AgentSessionConfig {
         access_mode_name: selected_name(&available_access_modes, access_mode_id.as_deref()),
         access_mode_id,
         available_access_modes,
+        access_mode_explicit: false,
     }
 }
 
@@ -1319,15 +1321,36 @@ fn mark_grok_full_access(config: &mut AgentSessionConfig) {
 
 fn merge_reported_agent_config(current: &mut AgentSessionConfig, reported: AgentSessionConfig) {
     if !reported.available_models.is_empty() {
+        let selected_id = current
+            .model_id
+            .clone()
+            .filter(|id| {
+                reported
+                    .available_models
+                    .iter()
+                    .any(|option| &option.id == id)
+            })
+            .or_else(|| reported.model_id.clone());
         current.model_config_id = reported.model_config_id;
-        current.model_id = reported.model_id;
-        current.model_name = reported.model_name;
         current.available_models = reported.available_models;
+        current.model_name = selected_name(&current.available_models, selected_id.as_deref());
+        current.model_id = selected_id;
     }
     if !reported.available_access_modes.is_empty() {
-        current.access_mode_id = reported.access_mode_id;
-        current.access_mode_name = reported.access_mode_name;
+        let selected_id = current
+            .access_mode_id
+            .clone()
+            .filter(|id| {
+                reported
+                    .available_access_modes
+                    .iter()
+                    .any(|option| &option.id == id)
+            })
+            .or_else(|| reported.access_mode_id.clone());
         current.available_access_modes = reported.available_access_modes;
+        current.access_mode_name =
+            selected_name(&current.available_access_modes, selected_id.as_deref());
+        current.access_mode_id = selected_id;
     }
 }
 
@@ -1347,12 +1370,13 @@ async fn default_to_full_access(
     let Some(option) = full_access_option(backend, &config.available_access_modes).cloned() else {
         return Ok(());
     };
-    if config.access_mode_id.as_deref() != Some(option.id.as_str()) {
-        agent
-            .session_set_mode(session_id, &option.id)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
+    // The persisted config is the user's preference, not proof of the live
+    // adapter state. In particular, codex-acp restores a loaded session in its
+    // default `agent` mode, so always reassert Full Access on the wire.
+    agent
+        .session_set_mode(session_id, &option.id)
+        .await
+        .map_err(|error| error.to_string())?;
     config.access_mode_id = Some(option.id);
     config.access_mode_name = Some(option.name);
     Ok(())
@@ -1386,6 +1410,25 @@ async fn restore_agent_session_config(
         }
     }
     Ok(())
+}
+
+/// Restore a loaded adapter session without letting the adapter's default mode
+/// overwrite the app's Full Access default or an explicit user choice.
+async fn restore_loaded_agent_session_config(
+    agent: &AcpConnection,
+    backend: AgentBackend,
+    session_id: &str,
+    mut config: AgentSessionConfig,
+) -> Result<AgentSessionConfig, String> {
+    if config.access_mode_explicit {
+        restore_agent_session_config(agent, backend, session_id, &config).await?;
+    } else {
+        let mut model_only = config.clone();
+        model_only.access_mode_id = None;
+        restore_agent_session_config(agent, backend, session_id, &model_only).await?;
+        default_to_full_access(agent, backend, session_id, &mut config).await?;
+    }
+    Ok(config)
 }
 
 #[tauri::command]
@@ -1630,6 +1673,7 @@ pub async fn set_chat_access_mode(
         }
         doc.agent_config.access_mode_id = Some(mode.id);
         doc.agent_config.access_mode_name = Some(mode.name);
+        doc.agent_config.access_mode_explicit = true;
         doc.updated_at = now();
         state.live_chats.lock().insert(chat_id.clone(), doc.clone());
         state
@@ -1761,6 +1805,74 @@ pub async fn ensure_chat_session(
     ensure_session_inner(&app, &state, &chat_id).await
 }
 
+/// Force the next ensure through `session/load` so the transcript is rebuilt
+/// from the adapter's current ACP replay instead of the in-process projection.
+#[tauri::command]
+pub async fn reload_chat_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<EnsureSessionResult, String> {
+    // Let a background select-chat ensure settle before invalidating its result.
+    for _ in 0..100 {
+        if !state.ensuring_chats.lock().contains(&chat_id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if state.ensuring_chats.lock().contains(&chat_id) {
+        return Err("Conversation session is still connecting; try reload again".into());
+    }
+
+    let doc = load_chat_doc(&state, &chat_id)?;
+    if state.inflight_prompts.lock().contains_key(&chat_id)
+        || doc
+            .turns
+            .iter()
+            .any(|turn| turn.status == "streaming" || turn.status == "cancelling")
+    {
+        return Err("Cannot reload a conversation while a response is running".into());
+    }
+
+    let project = {
+        let data = state.data.lock();
+        data.projects
+            .iter()
+            .find(|project| project.id == doc.project_id)
+            .cloned()
+            .ok_or_else(|| "project not found".to_string())?
+    };
+    let env_id = if project.environment_id.is_empty() {
+        LOCAL_ENV_ID
+    } else {
+        project.environment_id.as_str()
+    };
+
+    if let Some(session_id) = doc.acp_session_id.as_deref() {
+        unmark_session_loaded(&state, env_id, doc.backend, session_id);
+    }
+    for subagent_id in doc.turns.iter().flat_map(|turn| {
+        turn.intermediate.iter().filter_map(|block| match block {
+            IntermediateBlock::Subagent { subagent_id, .. } => Some(subagent_id.as_str()),
+            _ => None,
+        })
+    }) {
+        unmark_session_loaded(&state, env_id, doc.backend, subagent_id);
+    }
+
+    let result = ensure_session_inner(&app, &state, &chat_id).await?;
+    let _ = app.emit(
+        "agent-log",
+        json!({
+            "level": "info",
+            "message": format!("Forced ACP replay for chat {chat_id}"),
+            "environmentId": env_id,
+            "backend": doc.backend,
+        }),
+    );
+    Ok(result)
+}
+
 async fn ensure_session_inner(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -1838,9 +1950,8 @@ async fn ensure_session_work(
         }
     }
 
-    // Try session/load for persisted Grok sessions
+    // Try session/load for a persisted backend session.
     if let Some(sid) = doc.acp_session_id.clone() {
-        state.replaying_sessions.lock().insert(sid.clone());
         let _ = app.emit(
             "agent-log",
             json!({
@@ -1853,17 +1964,22 @@ async fn ensure_session_work(
             }),
         );
 
-        let load_result = agent.session_load(&sid, &session_cwd).await;
-        state.replaying_sessions.lock().remove(&sid);
+        let load_result = agent.session_load_with_replay(&sid, &session_cwd).await;
 
         match load_result {
-            Ok(load_result) => {
-                mark_session_loaded(state, &env_id, backend, sid);
-                state.needs_history_seed.lock().remove(chat_id);
+            Ok((load_result, replay_updates)) => {
+                let mut restored_config = doc.agent_config.clone();
                 let mut reported_config = parse_agent_session_config(&load_result);
                 if backend == AgentBackend::Grok {
                     mark_grok_full_access(&mut reported_config);
                 }
+                merge_reported_agent_config(&mut restored_config, reported_config);
+                restored_config =
+                    restore_loaded_agent_session_config(&agent, backend, &sid, restored_config)
+                        .await?;
+                mark_session_loaded(state, &env_id, backend, sid);
+                state.needs_history_seed.lock().remove(chat_id);
+                let has_live_prompt = state.inflight_prompts.lock().contains_key(chat_id);
                 let refreshed = {
                     let _guard = state.chat_write.lock();
                     let mut current = state
@@ -1873,7 +1989,32 @@ async fn ensure_session_work(
                         .cloned()
                         .or_else(|| state.store.load_chat(chat_id).ok());
                     if let Some(ref mut current) = current {
-                        merge_reported_agent_config(&mut current.agent_config, reported_config);
+                        if let Some(rebuilt) = rebuild_chat_from_replay(current, &replay_updates) {
+                            *current = rebuilt;
+                        }
+                        current.agent_config = restored_config;
+                        if !has_live_prompt {
+                            for turn in &mut current.turns {
+                                if turn.status != "streaming" && turn.status != "cancelling" {
+                                    continue;
+                                }
+                                turn.status = "cancelled".into();
+                                turn.intermediate_collapsed = true;
+                                for block in &mut turn.intermediate {
+                                    match block {
+                                        IntermediateBlock::Tool { status, .. }
+                                        | IntermediateBlock::Subagent { status, .. }
+                                            if status == "pending"
+                                                || status == "in_progress"
+                                                || status == "running" =>
+                                        {
+                                            *status = "cancelled".into();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                         let _ = state.store.save_chat(current);
                         state
                             .live_chats
@@ -1889,6 +2030,9 @@ async fn ensure_session_work(
                     "session-ready",
                     json!({ "chatId": chat_id, "status": "loaded", "cwd": session_cwd, "environmentId": env_id, "backend": backend }),
                 );
+                if refreshed.is_some() {
+                    let _ = app.emit("chat-updated", json!({ "chatId": chat_id }));
+                }
                 // Always return the *current* live doc, not the pre-await clone.
                 let live = refreshed
                     .or_else(|| load_chat_doc(state, chat_id).ok())
@@ -1973,6 +2117,191 @@ async fn ensure_session_work(
             "Created new ACP session".into()
         },
     })
+}
+
+/// Subscribe to a Codex child thread and replay its history into the parent
+/// Subagent card. The frontend calls this for known cards; loaded_sessions
+/// keeps the operation idempotent.
+#[tauri::command]
+pub async fn watch_subagent_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+    subagent_id: String,
+) -> Result<(), String> {
+    let doc = load_chat_doc(&state, &chat_id)?;
+    if doc.backend != AgentBackend::Codex {
+        return Ok(());
+    }
+    let belongs_to_chat = doc.turns.iter().any(|turn| {
+        turn.intermediate.iter().any(|block| {
+            matches!(
+                block,
+                IntermediateBlock::Subagent { subagent_id: id, .. } if id == &subagent_id
+            )
+        })
+    });
+    if !belongs_to_chat {
+        return Err(format!(
+            "subagent session `{subagent_id}` does not belong to chat `{chat_id}`"
+        ));
+    }
+
+    let project = {
+        let data = state.data.lock();
+        data.projects
+            .iter()
+            .find(|project| project.id == doc.project_id)
+            .cloned()
+            .ok_or_else(|| "project not found".to_string())?
+    };
+    let env_id = if project.environment_id.is_empty() {
+        LOCAL_ENV_ID.to_string()
+    } else {
+        project.environment_id.clone()
+    };
+    if is_session_loaded(&state, &env_id, doc.backend, &subagent_id) {
+        return Ok(());
+    }
+
+    let claimed = state
+        .watching_subagent_sessions
+        .lock()
+        .insert(subagent_id.clone());
+    if !claimed {
+        return Ok(());
+    }
+
+    let result = async {
+        let cwd = resolve_session_cwd(&state, &project, &chat_id).await?;
+        let agent = agent_for_runtime(&state, &env_id, doc.backend)?;
+        let (load_result, replay_updates) = agent
+            .session_load_with_replay(&subagent_id, &cwd)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let last_user = replay_updates
+            .iter()
+            .rposition(|update| {
+                update
+                    .get("sessionUpdate")
+                    .or_else(|| update.get("session_update"))
+                    .and_then(Value::as_str)
+                    == Some("user_message_chunk")
+            })
+            .unwrap_or(0);
+        let child_replay = &replay_updates[last_user..];
+        let has_child_work = child_replay.iter().any(|update| {
+            matches!(
+                update
+                    .get("sessionUpdate")
+                    .or_else(|| update.get("session_update"))
+                    .and_then(Value::as_str),
+                Some(
+                    "agent_message_chunk"
+                        | "agent_thought_chunk"
+                        | "tool_call"
+                        | "session_info_update"
+                        | "turn_completed"
+                )
+            )
+        });
+        if has_child_work {
+            let _guard = state.chat_write.lock();
+            let current = state
+                .live_chats
+                .lock()
+                .get(&chat_id)
+                .cloned()
+                .or_else(|| state.store.load_chat(&chat_id).ok())
+                .ok_or_else(|| "chat not found".to_string())?;
+            let (cached_status, cached_output, cached_progress) = current
+                .turns
+                .iter()
+                .flat_map(|turn| &turn.intermediate)
+                .find_map(|block| match block {
+                    IntermediateBlock::Subagent {
+                        subagent_id: id,
+                        status,
+                        output,
+                        progress,
+                        ..
+                    } if id == &subagent_id => {
+                        Some((status.clone(), output.clone(), progress.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut rebuilt = current.clone();
+            for block in rebuilt
+                .turns
+                .iter_mut()
+                .flat_map(|turn| turn.intermediate.iter_mut())
+            {
+                if let IntermediateBlock::Subagent {
+                    subagent_id: id,
+                    output,
+                    progress,
+                    ..
+                } = block
+                {
+                    if id == &subagent_id {
+                        output.clear();
+                        progress.clear();
+                        break;
+                    }
+                }
+            }
+            for update in child_replay {
+                apply_subagent_session_update(&mut rebuilt, &subagent_id, update);
+            }
+            let rebuilt_has_output = rebuilt
+                .turns
+                .iter_mut()
+                .flat_map(|turn| &mut turn.intermediate)
+                .find_map(|block| match block {
+                    IntermediateBlock::Subagent {
+                        subagent_id: id,
+                        status,
+                        output,
+                        progress,
+                        ..
+                    } if id == &subagent_id => {
+                        if progress.is_empty() {
+                            *progress = cached_progress.clone();
+                        }
+                        if matches!(status.as_str(), "pending" | "in_progress" | "running")
+                            && matches!(
+                                cached_status.as_str(),
+                                "completed" | "failed" | "cancelled"
+                            )
+                        {
+                            *status = cached_status.clone();
+                        }
+                        Some(!output.is_empty())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false);
+            if cached_output.is_empty() || rebuilt_has_output {
+                state
+                    .store
+                    .save_chat(&rebuilt)
+                    .map_err(|error| error.to_string())?;
+                state.live_chats.lock().insert(chat_id.clone(), rebuilt);
+                let _ = app.emit("chat-updated", json!({ "chatId": chat_id }));
+            }
+        }
+        let mut config = doc.agent_config.clone();
+        merge_reported_agent_config(&mut config, parse_agent_session_config(&load_result));
+        restore_loaded_agent_session_config(&agent, doc.backend, &subagent_id, config).await?;
+        mark_session_loaded(&state, &env_id, doc.backend, subagent_id.clone());
+        Ok(())
+    }
+    .await;
+
+    state.watching_subagent_sessions.lock().remove(&subagent_id);
+    result
 }
 
 /// Patch only `acp_session_id` on the current live (or disk) doc under lock.
@@ -2756,9 +3085,22 @@ pub async fn send_message(
                                 }
                             } else {
                                 t.status = "complete".to_string();
-                                // Leave running children as-is. Late subagent_finished /
-                                // task_completed / tool terminal updates still apply after
-                                // parent complete (see apply_one_update late-allow list).
+                                // Codex owns child lifecycle under the parent turn. If a
+                                // worker stopped without a final message (for example an
+                                // aborted child), the successful parent completion is the
+                                // terminal fallback. Child replay can still add its report.
+                                if backend2 == AgentBackend::Codex {
+                                    for block in &mut t.intermediate {
+                                        if let IntermediateBlock::Subagent { status, .. } = block {
+                                            if status == "pending"
+                                                || status == "in_progress"
+                                                || status == "running"
+                                            {
+                                                *status = "completed".into();
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             t.intermediate_collapsed = true;
                         }
@@ -3123,25 +3465,24 @@ fn apply_updates_inner(
         if let Some(doc) = doc_peek {
             // Reject batches from an invalidated session (post-rollback recreate).
             if let Some(expected) = expected_session_id {
-                match doc.acp_session_id.as_deref() {
-                    Some(current) if current == expected => {}
-                    Some(_) => {
-                        return Err(format!(
-                            "session id mismatch for chat {chat_id}: batch={expected}, doc={}",
-                            doc.acp_session_id.as_deref().unwrap_or("none")
-                        ));
-                    }
-                    None => {
-                        return Err(format!(
-                            "session id mismatch for chat {chat_id}: batch={expected}, doc=none"
-                        ));
-                    }
+                let is_parent = doc.acp_session_id.as_deref() == Some(expected);
+                let is_child = doc.turns.iter().any(|turn| {
+                    turn.intermediate.iter().any(|block| {
+                        matches!(
+                            block,
+                            IntermediateBlock::Subagent { subagent_id, .. }
+                                if subagent_id == expected
+                        )
+                    })
+                });
+                if !is_parent && !is_child {
+                    return Err(format!(
+                        "session id mismatch for chat {chat_id}: batch={expected}, doc={}",
+                        doc.acp_session_id.as_deref().unwrap_or("none")
+                    ));
                 }
             }
             if let Some(sid) = doc.acp_session_id.as_ref() {
-                if state.replaying_sessions.lock().contains(sid) {
-                    return Ok(doc);
-                }
                 // User hit Stop — ignore further tool output so we don't thrash the
                 // write lock (and so cancel_prompt / UI stay responsive).
                 if state.cancelling_sessions.lock().contains(sid) {
@@ -3154,9 +3495,23 @@ fn apply_updates_inner(
     let _guard = state.chat_write.lock();
     let mut doc = load_chat_doc(state, chat_id)?;
     // Re-check session after lock (rollback may have recreated mid-flight).
+    let mut child_session_id = None;
     if let Some(expected) = expected_session_id {
-        if doc.acp_session_id.as_deref() != Some(expected) {
+        let is_parent = doc.acp_session_id.as_deref() == Some(expected);
+        let is_child = doc.turns.iter().any(|turn| {
+            turn.intermediate.iter().any(|block| {
+                matches!(
+                    block,
+                    IntermediateBlock::Subagent { subagent_id, .. }
+                        if subagent_id == expected
+                )
+            })
+        });
+        if !is_parent && !is_child {
             return Err(format!("session id mismatch for chat {chat_id} after lock"));
+        }
+        if is_child {
+            child_session_id = Some(expected);
         }
     }
     if updates.is_empty() {
@@ -3166,7 +3521,17 @@ fn apply_updates_inner(
     let mut force_disk = false;
     let mut saw_chunk = false;
     for update in updates {
-        if let Some(kind) = apply_one_update(&mut doc, update) {
+        if let Some(child_id) = child_session_id {
+            if let Some((kind, terminal)) =
+                apply_subagent_session_update(&mut doc, child_id, update)
+            {
+                if terminal || !is_stream_chunk_kind(&kind) {
+                    force_disk = true;
+                } else {
+                    saw_chunk = true;
+                }
+            }
+        } else if let Some(kind) = apply_one_update(&mut doc, update) {
             if is_stream_chunk_kind(&kind) {
                 saw_chunk = true;
             } else {

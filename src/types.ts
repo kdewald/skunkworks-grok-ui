@@ -79,6 +79,7 @@ export type AgentSessionConfig = {
   accessModeId?: string | null;
   accessModeName?: string | null;
   availableAccessModes: AgentSessionOption[];
+  accessModeExplicit?: boolean;
 };
 
 export type PlanEntry = {
@@ -128,6 +129,7 @@ export type IntermediateBlock =
       model?: string | null;
       subagentType?: string | null;
       output: string;
+      progress?: string;
       collapsed: boolean;
     }
   | {

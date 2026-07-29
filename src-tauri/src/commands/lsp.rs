@@ -74,4 +74,3 @@ pub fn lsp_file_uri(
     }
     Ok(rel_to_uri(std::path::Path::new(&root), &path))
 }
-

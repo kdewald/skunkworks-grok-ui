@@ -141,4 +141,3 @@ pub fn git_workspace_status(
         .ok_or_else(|| "SSH host missing".to_string())?;
     Ok(git_status_remote(host, &root))
 }
-

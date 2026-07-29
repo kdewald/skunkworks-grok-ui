@@ -159,6 +159,10 @@ pub struct AgentSessionConfig {
     pub access_mode_name: Option<String>,
     #[serde(default)]
     pub available_access_modes: Vec<AgentSessionOption>,
+    /// Whether the user explicitly chose the access mode. Older chats and
+    /// untouched drafts follow the app's Full Access default on reload.
+    #[serde(default)]
+    pub access_mode_explicit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,8 +218,8 @@ pub enum IntermediateBlock {
         message_id: Option<String>,
         text: String,
     },
-    /// Parallel subagent run (spawn_subagent / ACP `variant: "Task"`).
-    /// Grok surfaces these as tool_calls, not dedicated sessionUpdate kinds.
+    /// Parallel subagent run. ACP backends surface these as tool calls rather
+    /// than dedicated sessionUpdate kinds.
     #[serde(rename = "subagent")]
     Subagent {
         id: String,
@@ -235,6 +239,9 @@ pub enum IntermediateBlock {
         /// Final report from wait tool MultiResult / subagent_finished.output.
         #[serde(default)]
         output: String,
+        /// Live child-session activity shown while the subagent is running.
+        #[serde(default)]
+        progress: String,
         #[serde(default = "default_true")]
         collapsed: bool,
     },

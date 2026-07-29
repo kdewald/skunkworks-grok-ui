@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.0] — 2026-07-28
+
+### Added
+
+- Reload conversation from the agent session (workspace menu) and re-attach Codex subagent watches
+- Subagent progress streaming on the side rail (`progress` field on subagent cards)
+- Deeper Codex subagent activity promotion into the transcript / rail
+
+### Fixed
+
+- Tool work strip row overlap: fixed-height single-line tool headers, one-line hints, no auto-open of large payloads
+- Stream apply scheduling improvements and session update batching
+- Access mode explicit flag preserved on chat agent config
+
+### Changed
+
+- Denser sidebar project/chat tree spacing
+- Workspace header menu for conversation actions
+- Thought markdown handles consecutive bold status fragments (`****` boundaries)
+
+### Packaging
+
+- Version bump to 0.8.0
+
 ## [0.7.0] — 2026-07-27
 
 ### Added

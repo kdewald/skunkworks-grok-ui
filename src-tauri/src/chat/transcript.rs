@@ -3,12 +3,15 @@
 //! No Tauri, no AppState, no disk, no process I/O. `commands` owns locking,
 //! session validation, and persistence; this module only mutates `ChatDocument`.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use crate::store::{new_id, ChatDocument, IntermediateBlock, PlanEntry, Turn};
 
-/// Older transcripts stored spawn_subagent as plain Tool blocks. Lift them into
-/// Subagent cards so the side rail populates for historical chats too.
+/// Older transcripts stored backend-specific subagent activity as plain Tool
+/// blocks. Lift them into Subagent cards so the side rail populates for
+/// historical chats too.
 pub(crate) fn promote_subagent_tools_in_doc(doc: &mut ChatDocument) {
     for turn in &mut doc.turns {
         // Snapshot tool indices first — we may remove some.
@@ -36,7 +39,10 @@ pub(crate) fn promote_subagent_tools_in_doc(doc: &mut ChatDocument) {
             else {
                 continue;
             };
-            if looks_like_subagent_spawn(raw_input.as_ref(), &title) {
+            if codex_subagent_activity(raw_input.as_ref()).is_some() {
+                upsert_codex_subagent_activity(turn, &tool_call_id, &status, raw_input.as_ref());
+                remove_idxs.push(idx);
+            } else if looks_like_subagent_spawn(raw_input.as_ref(), &title) {
                 upsert_subagent_from_spawn_tool(
                     turn,
                     &tool_call_id,
@@ -56,12 +62,22 @@ pub(crate) fn promote_subagent_tools_in_doc(doc: &mut ChatDocument) {
         remove_idxs.sort_unstable();
         remove_idxs.dedup();
         for idx in remove_idxs.into_iter().rev() {
-            if idx < turn.intermediate.len() {
-                if matches!(turn.intermediate[idx], IntermediateBlock::Tool { .. }) {
-                    turn.intermediate.remove(idx);
-                }
+            if idx < turn.intermediate.len()
+                && matches!(turn.intermediate[idx], IntermediateBlock::Tool { .. })
+            {
+                turn.intermediate.remove(idx);
             }
         }
+    }
+
+    // A previously misrouted history replay could leave the same child card on
+    // multiple turns. Keep its original owning turn.
+    let mut seen = HashSet::new();
+    for turn in &mut doc.turns {
+        turn.intermediate.retain(|block| match block {
+            IntermediateBlock::Subagent { subagent_id, .. } => seen.insert(subagent_id.clone()),
+            _ => true,
+        });
     }
 }
 
@@ -153,12 +169,17 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     .and_then(|v| v.as_str())
             })
             .unwrap_or("");
+        let codex_child_id = json_val(update, "rawInput", "raw_input")
+            .and_then(|input| json_str(input, "agentThreadId", "agent_thread_id"))
+            .unwrap_or("");
         let id = if !child_id.is_empty() {
             child_id
         } else {
             child_from_snap
         };
-        if let Some(idx) = find_turn_for_child_id(doc, id) {
+        if let Some(idx) =
+            find_turn_for_child_id(doc, id).or_else(|| find_turn_for_child_id(doc, codex_child_id))
+        {
             turn_idx = idx;
         }
     }
@@ -213,7 +234,7 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
             }
         }
         "tool_call" => {
-            let tool_call_id = json_str(&update, "toolCallId", "tool_call_id")
+            let tool_call_id = json_str(update, "toolCallId", "tool_call_id")
                 .unwrap_or("")
                 .to_string();
             let title = update
@@ -230,13 +251,15 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                 .and_then(|s| s.as_str())
                 .unwrap_or("pending")
                 .to_string();
-            let raw_input = json_val(&update, "rawInput", "raw_input").cloned();
+            let raw_input = json_val(update, "rawInput", "raw_input").cloned();
             let content = update.get("content").cloned();
-            let raw_output = json_val(&update, "rawOutput", "raw_output").cloned();
+            let raw_output = json_val(update, "rawOutput", "raw_output").cloned();
 
-            // Grok emits spawn_subagent as a normal tool_call with variant "Task"
-            // (not a dedicated sessionUpdate). Park it on the Subagent rail.
-            if looks_like_subagent_spawn(raw_input.as_ref(), &title) {
+            // Backends surface subagents as normal tool calls rather than a
+            // dedicated sessionUpdate. Park those on the Subagent rail.
+            if codex_subagent_activity(raw_input.as_ref()).is_some() {
+                upsert_codex_subagent_activity(turn, &tool_call_id, &status, raw_input.as_ref());
+            } else if looks_like_subagent_spawn(raw_input.as_ref(), &title) {
                 upsert_subagent_from_spawn_tool(
                     turn,
                     &tool_call_id,
@@ -312,7 +335,7 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
             }
         }
         "tool_call_update" => {
-            let tool_call_id = json_str(&update, "toolCallId", "tool_call_id").unwrap_or("");
+            let tool_call_id = json_str(update, "toolCallId", "tool_call_id").unwrap_or("");
             let title = update
                 .get("title")
                 .and_then(|s| s.as_str())
@@ -322,31 +345,44 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                 .get("status")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
-            let raw_input = json_val(&update, "rawInput", "raw_input").cloned();
+            let raw_input = json_val(update, "rawInput", "raw_input").cloned();
             let content = update.get("content").cloned();
-            let raw_output = json_val(&update, "rawOutput", "raw_output").cloned();
+            let raw_output = json_val(update, "rawOutput", "raw_output").cloned();
 
-            // Prefer matching a Subagent card created from a Task spawn.
-            let mut handled_as_subagent = false;
-            if !tool_call_id.is_empty() {
-                if turn.intermediate.iter().any(|b| match b {
+            // Codex includes the child thread identity on every activity update.
+            let mut handled_as_subagent = if codex_subagent_activity(raw_input.as_ref()).is_some() {
+                upsert_codex_subagent_activity(
+                    turn,
+                    tool_call_id,
+                    status.as_deref().unwrap_or("running"),
+                    raw_input.as_ref(),
+                );
+                true
+            } else {
+                false
+            };
+
+            // Prefer matching a Subagent card created from a Grok Task spawn.
+            if !handled_as_subagent
+                && !tool_call_id.is_empty()
+                && turn.intermediate.iter().any(|b| match b {
                     IntermediateBlock::Subagent {
                         tool_call_id: Some(id),
                         ..
                     } => id == tool_call_id,
                     _ => false,
-                }) {
-                    upsert_subagent_from_spawn_tool(
-                        turn,
-                        tool_call_id,
-                        &title,
-                        status.as_deref().unwrap_or("running"),
-                        raw_input.as_ref(),
-                        content.as_ref(),
-                        raw_output.as_ref(),
-                    );
-                    handled_as_subagent = true;
-                }
+                })
+            {
+                upsert_subagent_from_spawn_tool(
+                    turn,
+                    tool_call_id,
+                    &title,
+                    status.as_deref().unwrap_or("running"),
+                    raw_input.as_ref(),
+                    content.as_ref(),
+                    raw_output.as_ref(),
+                );
+                handled_as_subagent = true;
             }
             if !handled_as_subagent && looks_like_subagent_wait(raw_input.as_ref(), &title) {
                 // Only suppress normal tool handling when a real subagent matched.
@@ -355,15 +391,15 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
             }
             // MultiResult may mix shell rows and subagent rows — only suppress
             // the tool card when at least one subagent result was applied.
-            if !handled_as_subagent && (raw_output.is_some() || content.is_some()) {
-                if raw_output
+            if !handled_as_subagent
+                && (raw_output.is_some() || content.is_some())
+                && raw_output
                     .as_ref()
                     .map(|v| v.get("MultiResult").is_some())
                     .unwrap_or(false)
-                {
-                    handled_as_subagent =
-                        apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
-                }
+            {
+                handled_as_subagent =
+                    apply_subagent_wait_output(turn, content.as_ref(), raw_output.as_ref());
             }
 
             // Do not blanket-swallow tool updates while subagents run — parent
@@ -485,6 +521,7 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     model,
                     subagent_type,
                     output: String::new(),
+                    progress: String::new(),
                     collapsed: true,
                 });
             }
@@ -533,6 +570,7 @@ pub(crate) fn apply_one_update(doc: &mut ChatDocument, update: &Value) -> Option
                     model: None,
                     subagent_type: None,
                     output,
+                    progress: String::new(),
                     collapsed: true,
                 });
             }
@@ -701,6 +739,476 @@ fn extract_chunk_text(update: &Value) -> String {
         return text.to_string();
     }
     String::new()
+}
+
+/// Rebuild the persisted transcript from a complete `session/load` replay.
+///
+/// The rebuild is all-or-nothing: if the replay does not contain every locally
+/// known user turn, the caller keeps the cached document. Local-only UI state
+/// is overlaid after reducing the latest ACP shapes.
+pub(crate) fn rebuild_chat_from_replay(
+    existing: &ChatDocument,
+    updates: &[Value],
+) -> Option<ChatDocument> {
+    let mut rebuilt = existing.clone();
+    rebuilt.turns.clear();
+    let mut current_user_message_id: Option<String> = None;
+    let mut explicit_finals: Vec<bool> = Vec::new();
+
+    for update in updates {
+        let kind = update
+            .get("sessionUpdate")
+            .or_else(|| update.get("session_update"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        if kind == "user_message_chunk" {
+            let message_id = update
+                .get("messageId")
+                .or_else(|| update.get("message_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let starts_new_turn = match rebuilt.turns.last() {
+                None => true,
+                Some(turn) => match (&current_user_message_id, &message_id) {
+                    (Some(current), Some(next)) => current != next,
+                    (None, None) => {
+                        !turn.assistant_message.is_empty() || !turn.intermediate.is_empty()
+                    }
+                    _ => true,
+                },
+            };
+
+            if starts_new_turn {
+                if let Some(turn) = rebuilt.turns.last_mut() {
+                    finish_replayed_turn(turn, true);
+                }
+                rebuilt.turns.push(Turn {
+                    id: message_id.clone().unwrap_or_else(new_id),
+                    user_message: String::new(),
+                    intermediate: Vec::new(),
+                    assistant_message: String::new(),
+                    status: "streaming".into(),
+                    intermediate_collapsed: false,
+                    attachments: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                });
+                explicit_finals.push(false);
+                current_user_message_id = message_id;
+            }
+
+            if let Some(turn) = rebuilt.turns.last_mut() {
+                append_delta(&mut turn.user_message, &extract_chunk_text(update));
+            }
+            continue;
+        }
+
+        if rebuilt.turns.is_empty() {
+            continue;
+        }
+        let is_explicit_final = kind == "turn_completed"
+            || (kind == "agent_message_chunk"
+                && update.pointer("/_meta/codex/phase").and_then(Value::as_str)
+                    == Some("final_answer"));
+        if is_explicit_final {
+            if let Some(final_seen) = explicit_finals.last_mut() {
+                *final_seen = true;
+            }
+        }
+        apply_one_update(&mut rebuilt, update);
+    }
+
+    if let Some(turn) = rebuilt.turns.last_mut() {
+        finish_replayed_turn(turn, false);
+    }
+    if rebuilt.turns.is_empty() || rebuilt.turns.len() != existing.turns.len() {
+        return None;
+    }
+    if existing
+        .turns
+        .iter()
+        .zip(&rebuilt.turns)
+        .any(|(cached, replayed)| cached.user_message.trim() != replayed.user_message.trim())
+    {
+        return None;
+    }
+    if existing
+        .turns
+        .iter()
+        .zip(&rebuilt.turns)
+        .any(|(cached, replayed)| {
+            (!cached.assistant_message.is_empty() || !cached.intermediate.is_empty())
+                && replayed.assistant_message.is_empty()
+                && replayed.intermediate.is_empty()
+        })
+    {
+        return None;
+    }
+
+    for (index, replayed) in rebuilt.turns.iter_mut().enumerate() {
+        let Some(cached) = existing.turns.get(index) else {
+            continue;
+        };
+        replayed.id = cached.id.clone();
+        replayed.created_at = cached.created_at;
+        replayed.attachments = cached.attachments.clone();
+        replayed.intermediate_collapsed = cached.intermediate_collapsed;
+
+        let explicit_final = explicit_finals.get(index).copied().unwrap_or(false);
+        if replayed.assistant_message.is_empty() && !cached.assistant_message.is_empty() {
+            replayed.assistant_message = cached.assistant_message.clone();
+        }
+        if cached.status == "cancelled"
+            || (!explicit_final
+                && matches!(cached.status.as_str(), "streaming" | "cancelling" | "error"))
+        {
+            replayed.status = cached.status.clone();
+        }
+        overlay_block_collapsed_state(&mut replayed.intermediate, &cached.intermediate);
+    }
+
+    promote_subagent_tools_in_doc(&mut rebuilt);
+    Some(rebuilt)
+}
+
+fn finish_replayed_turn(turn: &mut Turn, followed_by_user_turn: bool) {
+    if turn.status != "streaming" && turn.status != "cancelling" {
+        return;
+    }
+    turn.status = if followed_by_user_turn
+        || !turn.assistant_message.is_empty()
+        || !turn.intermediate.is_empty()
+    {
+        "complete"
+    } else {
+        "cancelled"
+    }
+    .into();
+}
+
+fn overlay_block_collapsed_state(replayed: &mut [IntermediateBlock], cached: &[IntermediateBlock]) {
+    let mut thought_index = 0usize;
+    let mut plan_index = 0usize;
+    for block in replayed {
+        match block {
+            IntermediateBlock::Thought { collapsed, .. } => {
+                if let Some(IntermediateBlock::Thought {
+                    collapsed: cached_collapsed,
+                    ..
+                }) = cached
+                    .iter()
+                    .filter(|block| matches!(block, IntermediateBlock::Thought { .. }))
+                    .nth(thought_index)
+                {
+                    *collapsed = *cached_collapsed;
+                }
+                thought_index += 1;
+            }
+            IntermediateBlock::Plan { collapsed, .. } => {
+                if let Some(IntermediateBlock::Plan {
+                    collapsed: cached_collapsed,
+                    ..
+                }) = cached
+                    .iter()
+                    .filter(|block| matches!(block, IntermediateBlock::Plan { .. }))
+                    .nth(plan_index)
+                {
+                    *collapsed = *cached_collapsed;
+                }
+                plan_index += 1;
+            }
+            IntermediateBlock::Tool {
+                tool_call_id,
+                collapsed,
+                ..
+            } => {
+                if let Some(IntermediateBlock::Tool {
+                    collapsed: cached_collapsed,
+                    ..
+                }) = cached.iter().find(|block| {
+                    matches!(
+                        block,
+                        IntermediateBlock::Tool { tool_call_id: id, .. } if id == tool_call_id
+                    )
+                }) {
+                    *collapsed = *cached_collapsed;
+                }
+            }
+            IntermediateBlock::Subagent {
+                subagent_id,
+                collapsed,
+                status,
+                model,
+                subagent_type,
+                output,
+                progress,
+                ..
+            } => {
+                if let Some(IntermediateBlock::Subagent {
+                    collapsed: cached_collapsed,
+                    status: cached_status,
+                    model: cached_model,
+                    subagent_type: cached_subagent_type,
+                    output: cached_output,
+                    progress: cached_progress,
+                    ..
+                }) = cached.iter().find(|block| {
+                    matches!(
+                        block,
+                        IntermediateBlock::Subagent { subagent_id: id, .. } if id == subagent_id
+                    )
+                }) {
+                    *collapsed = *cached_collapsed;
+                    if model.is_none() {
+                        *model = cached_model.clone();
+                    }
+                    if subagent_type.is_none() {
+                        *subagent_type = cached_subagent_type.clone();
+                    }
+                    if output.is_empty() {
+                        *output = cached_output.clone();
+                    }
+                    if progress.is_empty() {
+                        *progress = cached_progress.clone();
+                    }
+                    if matches!(status.as_str(), "pending" | "in_progress" | "running")
+                        && matches!(cached_status.as_str(), "completed" | "failed" | "cancelled")
+                    {
+                        *status = cached_status.clone();
+                    }
+                }
+            }
+            IntermediateBlock::Task {
+                task_id, collapsed, ..
+            } => {
+                if let Some(IntermediateBlock::Task {
+                    collapsed: cached_collapsed,
+                    ..
+                }) = cached.iter().find(|block| {
+                    matches!(
+                        block,
+                        IntermediateBlock::Task { task_id: id, .. } if id == task_id
+                    )
+                }) {
+                    *collapsed = *cached_collapsed;
+                }
+            }
+            IntermediateBlock::Message { .. } => {}
+        }
+    }
+}
+
+/// Apply a child ACP session update to its parent Subagent card.
+///
+/// Codex child threads are independent ACP sessions. Their updates must stay
+/// out of the parent transcript while still feeding the side-rail card.
+/// Returns `(kind, terminal)` when the child/card matched.
+pub(crate) fn apply_subagent_session_update(
+    doc: &mut ChatDocument,
+    subagent_id: &str,
+    update: &Value,
+) -> Option<(String, bool)> {
+    let kind = update
+        .get("sessionUpdate")
+        .or_else(|| update.get("session_update"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if kind.is_empty() {
+        return None;
+    }
+
+    let (parent_status, block) = doc.turns.iter_mut().find_map(|turn| {
+        let parent_status = turn.status.clone();
+        turn.intermediate
+            .iter_mut()
+            .find(|block| {
+                matches!(
+                    block,
+                    IntermediateBlock::Subagent { subagent_id: id, .. } if id == subagent_id
+                )
+            })
+            .map(|block| (parent_status, block))
+    })?;
+    let IntermediateBlock::Subagent {
+        status,
+        output,
+        progress,
+        collapsed,
+        ..
+    } = block
+    else {
+        return None;
+    };
+
+    let phase = update
+        .pointer("/_meta/codex/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut terminal = false;
+
+    match kind.as_str() {
+        // Child history includes the parent conversation before the delegated
+        // turn. Reset at each user turn so the card shows only the child work.
+        "user_message_chunk" => {
+            *status = match parent_status.as_str() {
+                "streaming" | "cancelling" => "running",
+                "error" => "failed",
+                "cancelled" => "cancelled",
+                _ => "completed",
+            }
+            .into();
+            output.clear();
+            progress.clear();
+        }
+        "agent_message_chunk" if phase == "final_answer" => {
+            append_delta(output, &extract_chunk_text(update));
+            *status = "completed".into();
+            *collapsed = false;
+            terminal = true;
+        }
+        "agent_message_chunk" if phase == "commentary" => {
+            if parent_status == "streaming" || parent_status == "cancelling" {
+                *status = "running".into();
+            }
+            append_subagent_progress(progress, &extract_chunk_text(update));
+        }
+        "agent_thought_chunk" => {
+            if parent_status == "streaming" || parent_status == "cancelling" {
+                *status = "running".into();
+            }
+            append_subagent_progress(progress, &extract_chunk_text(update));
+        }
+        "tool_call" => {
+            if parent_status == "streaming" || parent_status == "cancelling" {
+                *status = "running".into();
+            }
+            let title = update
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !title.is_empty() {
+                let line = format!("\n\n• {title}");
+                append_subagent_progress(progress, &line);
+            }
+        }
+        "session_info_update" => {
+            let thread_status = update
+                .pointer("/_meta/codex/threadStatus/type")
+                .or_else(|| update.pointer("/_meta/codex/threadStatus"))
+                .and_then(Value::as_str);
+            if let Some(thread_status) = thread_status {
+                if thread_status == "active" {
+                    *status = "running".into();
+                } else {
+                    *status = if thread_status.to_ascii_lowercase().contains("error") {
+                        "failed".into()
+                    } else {
+                        "completed".into()
+                    };
+                    terminal = true;
+                }
+            }
+        }
+        "turn_completed" => {
+            *status = "completed".into();
+            terminal = true;
+        }
+        _ => {}
+    }
+
+    Some((kind, terminal))
+}
+
+fn append_subagent_progress(progress: &mut String, text: &str) {
+    if text.starts_with("**") && !progress.is_empty() && !progress.ends_with("\n\n") {
+        progress.push_str("\n\n");
+    }
+    append_delta(progress, text);
+    const MAX_PROGRESS_BYTES: usize = 12_000;
+    if progress.len() <= MAX_PROGRESS_BYTES {
+        return;
+    }
+    let mut start = progress.len() - MAX_PROGRESS_BYTES;
+    while !progress.is_char_boundary(start) {
+        start += 1;
+    }
+    progress.drain(..start);
+}
+
+/// Codex ACP surfaces subagent lifecycle activity as ordinary tool calls.
+/// Identity is structural so localized titles do not affect classification.
+fn codex_subagent_activity(raw_input: Option<&Value>) -> Option<(&str, &str, &str)> {
+    let input = raw_input?;
+    let thread_id = json_str(input, "agentThreadId", "agent_thread_id")?;
+    let path = json_str(input, "agentPath", "agent_path")?;
+    let activity = json_str(input, "activityKind", "activity_kind")?;
+    if thread_id.is_empty()
+        || path.is_empty()
+        || !matches!(activity, "started" | "interacted" | "interrupted")
+    {
+        return None;
+    }
+    Some((thread_id, path, activity))
+}
+
+fn upsert_codex_subagent_activity(
+    turn: &mut Turn,
+    tool_call_id: &str,
+    tool_status: &str,
+    raw_input: Option<&Value>,
+) {
+    let Some((thread_id, path, activity)) = codex_subagent_activity(raw_input) else {
+        return;
+    };
+    let description = path
+        .split('/')
+        .rfind(|part| !part.is_empty())
+        .unwrap_or("Subagent")
+        .to_string();
+
+    let status = match activity {
+        "started" if matches!(tool_status, "failed" | "error") => "failed",
+        "started" if matches!(tool_status, "cancelled" | "canceled") => "cancelled",
+        "interrupted" if matches!(tool_status, "completed" | "complete" | "success") => "cancelled",
+        _ => "running",
+    }
+    .to_string();
+
+    if let Some(IntermediateBlock::Subagent {
+        tool_call_id: existing_tool_call_id,
+        description: existing_description,
+        status: existing_status,
+        ..
+    }) = turn.intermediate.iter_mut().find(|block| match block {
+        IntermediateBlock::Subagent { subagent_id, .. } => subagent_id == thread_id,
+        _ => false,
+    }) {
+        if !tool_call_id.is_empty() {
+            *existing_tool_call_id = Some(tool_call_id.to_string());
+        }
+        *existing_description = description;
+        *existing_status = status;
+        return;
+    }
+
+    turn.intermediate.push(IntermediateBlock::Subagent {
+        id: new_id(),
+        subagent_id: thread_id.to_string(),
+        tool_call_id: if tool_call_id.is_empty() {
+            None
+        } else {
+            Some(tool_call_id.to_string())
+        },
+        description,
+        status,
+        model: None,
+        subagent_type: None,
+        output: String::new(),
+        progress: String::new(),
+        collapsed: false,
+    });
 }
 
 /// Grok's spawn_subagent ACP surface: tool_call with variant Task / spawn_subagent.
@@ -948,6 +1456,7 @@ fn upsert_subagent_from_spawn_tool(
             model,
             subagent_type,
             output: String::new(),
+            progress: String::new(),
             collapsed: false, // open by default so the rail is visible
         });
     }
@@ -1092,6 +1601,7 @@ fn apply_subagent_wait_output(
                         Some(parsed_type)
                     },
                     output,
+                    progress: String::new(),
                     collapsed: false,
                 });
                 matched_any = true;
@@ -1322,7 +1832,7 @@ fn rebuild_assistant_message(turn: &mut Turn) {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
-    use crate::store::{ChatDocument, IntermediateBlock, Turn};
+    use crate::store::{ChatDocument, FileAttachment, IntermediateBlock, Turn};
 
     fn empty_turn() -> Turn {
         Turn {
@@ -1524,6 +2034,163 @@ mod stream_tests {
     }
 
     #[test]
+    fn codex_subagent_activity_creates_and_updates_one_card() {
+        let mut doc = doc_with_streaming_turn();
+        let started = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "activity-start",
+            "title": "Start subagent fix_review_findings",
+            "kind": "other",
+            "status": "in_progress",
+            "rawInput": {
+                "activityKind": "started",
+                "agentPath": "/root/fix_review_findings",
+                "agentThreadId": "child-codex-1"
+            }
+        });
+        assert_eq!(
+            apply_one_update(&mut doc, &started).as_deref(),
+            Some("tool_call")
+        );
+
+        let completed = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "activity-start",
+            "status": "completed",
+            "rawInput": {
+                "activityKind": "started",
+                "agentPath": "/root/fix_review_findings",
+                "agentThreadId": "child-codex-1"
+            }
+        });
+        assert_eq!(
+            apply_one_update(&mut doc, &completed).as_deref(),
+            Some("tool_call_update")
+        );
+
+        let blocks = &doc.turns[0].intermediate;
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            IntermediateBlock::Subagent {
+                subagent_id,
+                tool_call_id,
+                description,
+                status,
+                ..
+            } => {
+                assert_eq!(subagent_id, "child-codex-1");
+                assert_eq!(tool_call_id.as_deref(), Some("activity-start"));
+                assert_eq!(description, "fix_review_findings");
+                assert_eq!(status, "running");
+            }
+            _ => panic!("expected Codex activity on the subagent rail"),
+        }
+    }
+
+    #[test]
+    fn codex_child_history_keeps_only_its_delegated_turn() {
+        let mut doc = doc_with_streaming_turn();
+        apply_one_update(
+            &mut doc,
+            &serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "activity-start",
+                "status": "completed",
+                "rawInput": {
+                    "activityKind": "started",
+                    "agentPath": "/root/reviewer",
+                    "agentThreadId": "child-history"
+                }
+            }),
+        );
+
+        for update in [
+            serde_json::json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "old parent prompt"}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "old parent answer"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "delegated prompt"}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "Inspecting"}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": " files"},
+                "_meta": {"codex": {"phase": "commentary"}}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Child result"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+        ] {
+            apply_subagent_session_update(&mut doc, "child-history", &update);
+        }
+
+        match &doc.turns[0].intermediate[0] {
+            IntermediateBlock::Subagent {
+                status,
+                output,
+                progress,
+                ..
+            } => {
+                assert_eq!(status, "completed");
+                assert_eq!(output, "Child result");
+                assert_eq!(progress, "Inspecting files");
+            }
+            _ => panic!("expected child card"),
+        }
+    }
+
+    #[test]
+    fn codex_interrupt_updates_existing_subagent_by_thread_id() {
+        let mut doc = doc_with_streaming_turn();
+        for update in [
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "activity-start",
+                "status": "completed",
+                "rawInput": {
+                    "activityKind": "started",
+                    "agentPath": "/root/reviewer",
+                    "agentThreadId": "child-codex-2"
+                }
+            }),
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "activity-stop",
+                "status": "completed",
+                "rawInput": {
+                    "activityKind": "interrupted",
+                    "agentPath": "/root/reviewer",
+                    "agentThreadId": "child-codex-2"
+                }
+            }),
+        ] {
+            apply_one_update(&mut doc, &update);
+        }
+
+        let subagents: Vec<_> = doc.turns[0]
+            .intermediate
+            .iter()
+            .filter_map(|block| match block {
+                IntermediateBlock::Subagent { status, .. } => Some(status.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subagents, vec!["cancelled"]);
+    }
+
+    #[test]
     fn apply_routes_child_update_to_owning_turn() {
         use crate::store::IntermediateBlock;
         let mut doc = doc_with_streaming_turn();
@@ -1538,6 +2205,7 @@ mod stream_tests {
             model: None,
             subagent_type: None,
             output: String::new(),
+            progress: String::new(),
             collapsed: true,
         });
         let mut t2 = empty_turn();
@@ -1603,5 +2271,217 @@ mod stream_tests {
                 .any(|b| matches!(b, IntermediateBlock::Tool { .. })),
             "spawn tool should be removed after promote"
         );
+    }
+
+    #[test]
+    fn promote_historical_codex_activity_to_subagent_card() {
+        let mut doc = doc_with_streaming_turn();
+        doc.turns[0].status = "complete".into();
+        doc.turns[0].intermediate.push(IntermediateBlock::Tool {
+            id: "x".into(),
+            tool_call_id: "activity-history".into(),
+            title: "Start subagent historical_review".into(),
+            kind: Some("other".into()),
+            status: "completed".into(),
+            raw_input: Some(serde_json::json!({
+                "activityKind": "started",
+                "agentPath": "/root/historical_review",
+                "agentThreadId": "child-codex-history"
+            })),
+            content: None,
+            raw_output: None,
+            collapsed: true,
+        });
+
+        promote_subagent_tools_in_doc(&mut doc);
+
+        assert!(matches!(
+            &doc.turns[0].intermediate[..],
+            [IntermediateBlock::Subagent {
+                subagent_id,
+                description,
+                ..
+            }] if subagent_id == "child-codex-history" && description == "historical_review"
+        ));
+    }
+
+    #[test]
+    fn replay_rebuilds_with_current_reducer_and_preserves_local_state() {
+        let mut existing = doc_with_streaming_turn();
+        existing.turns[0].id = "cached-turn-1".into();
+        existing.turns[0].user_message = "first prompt".into();
+        existing.turns[0].status = "complete".into();
+        existing.turns[0].intermediate_collapsed = true;
+        existing.turns[0].attachments.push(FileAttachment {
+            id: "attachment-1".into(),
+            name: "notes.txt".into(),
+            kind: "text".into(),
+            mime_type: "text/plain".into(),
+            path: "attachments/notes.txt".into(),
+            data_url: None,
+            size: 12,
+        });
+        let first_created_at = existing.turns[0].created_at;
+        let mut second = empty_turn();
+        second.id = "cached-turn-2".into();
+        second.user_message = "second prompt".into();
+        second.status = "complete".into();
+        second.intermediate.push(IntermediateBlock::Subagent {
+            id: "cached-child-card".into(),
+            subagent_id: "child-replayed".into(),
+            tool_call_id: Some("old-activity".into()),
+            description: "reviewer".into(),
+            status: "completed".into(),
+            model: Some("worker-model".into()),
+            subagent_type: Some("review".into()),
+            output: "cached child report".into(),
+            progress: "cached child progress".into(),
+            collapsed: true,
+        });
+        existing.turns.push(second);
+
+        let replay = vec![
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "wire-user-1",
+                "content": {"type": "text", "text": "first prompt"}
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "first answer"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "wire-user-2",
+                "content": {"type": "text", "text": "second prompt"}
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "activity-1",
+                "title": "Start subagent reviewer",
+                "status": "completed",
+                "rawInput": {
+                    "activityKind": "started",
+                    "agentPath": "/root/reviewer",
+                    "agentThreadId": "child-replayed"
+                }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "second answer"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+        ];
+
+        let rebuilt = rebuild_chat_from_replay(&existing, &replay).expect("complete replay");
+        assert_eq!(rebuilt.turns.len(), 2);
+        assert_eq!(rebuilt.turns[0].id, "cached-turn-1");
+        assert_eq!(rebuilt.turns[0].created_at, first_created_at);
+        assert_eq!(rebuilt.turns[0].attachments.len(), 1);
+        assert!(rebuilt.turns[0].intermediate_collapsed);
+        assert_eq!(rebuilt.turns[0].assistant_message, "first answer");
+        assert_eq!(rebuilt.turns[1].assistant_message, "second answer");
+        let replayed_child = rebuilt.turns[1]
+            .intermediate
+            .iter()
+            .find(|block| {
+                matches!(
+                    block,
+                    IntermediateBlock::Subagent { subagent_id, .. }
+                        if subagent_id == "child-replayed"
+                )
+            })
+            .expect("replayed child card");
+        assert!(matches!(
+            replayed_child,
+            IntermediateBlock::Subagent {
+                status,
+                output,
+                progress,
+                model: Some(model),
+                ..
+            } if status == "completed"
+                && output == "cached child report"
+                && progress == "cached child progress"
+                && model == "worker-model"
+        ));
+    }
+
+    #[test]
+    fn incomplete_replay_keeps_cached_projection() {
+        let mut existing = doc_with_streaming_turn();
+        existing.turns[0].user_message = "first prompt".into();
+        let mut second = empty_turn();
+        second.user_message = "second prompt".into();
+        existing.turns.push(second);
+
+        let replay = vec![
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "first prompt"}
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "first answer"}
+            }),
+        ];
+
+        assert!(rebuild_chat_from_replay(&existing, &replay).is_none());
+    }
+
+    #[test]
+    fn replay_missing_cached_agent_activity_keeps_cached_projection() {
+        let mut existing = doc_with_streaming_turn();
+        existing.turns[0].status = "error".into();
+        existing.turns[0].assistant_message = "adapter error".into();
+
+        let replay = vec![json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "hi"}
+        })];
+
+        assert!(rebuild_chat_from_replay(&existing, &replay).is_none());
+    }
+
+    #[test]
+    fn replay_without_terminal_event_preserves_cancelled_status() {
+        let mut existing = doc_with_streaming_turn();
+        existing.turns[0].status = "cancelled".into();
+
+        let replay = vec![
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "hi"}
+            }),
+            json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "partial work"}
+            }),
+        ];
+
+        let rebuilt = rebuild_chat_from_replay(&existing, &replay).expect("matching replay");
+        assert_eq!(rebuilt.turns[0].status, "cancelled");
+    }
+
+    #[test]
+    fn replay_preserves_cancelled_status_even_if_adapter_has_a_final_tail() {
+        let mut existing = doc_with_streaming_turn();
+        existing.turns[0].status = "cancelled".into();
+
+        let replay = vec![
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "hi"}
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "late final"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+        ];
+
+        let rebuilt = rebuild_chat_from_replay(&existing, &replay).expect("matching replay");
+        assert_eq!(rebuilt.turns[0].status, "cancelled");
     }
 }

@@ -40,6 +40,7 @@ let applyDrainRunning = false;
 let applyDrainPromise: Promise<void> = Promise.resolve();
 let pendingUiChat: ChatDocument | null = null;
 let uiRaf: number | null = null;
+let deferredDrainTimer: number | null = null;
 
 const URGENT_KINDS = new Set([
   "tool_call",
@@ -122,6 +123,18 @@ export function resolveChatIdForSession(
   if (active?.acpSessionId === sessionId && runtimeMatches(active.id)) {
     return active.id;
   }
+  if (
+    active &&
+    runtimeMatches(active.id) &&
+    active.turns.some((turn) =>
+      turn.intermediate.some(
+        (block) =>
+          block.type === "subagent" && block.subagentId === sessionId,
+      ),
+    )
+  ) {
+    return active.id;
+  }
   const inflight = get().inflightChatId;
   if (inflight && runtimeMatches(inflight)) {
     const meta = get().chats.find((c) => c.id === inflight);
@@ -137,6 +150,19 @@ function updateKind(update: unknown): string {
     return String((update as { sessionUpdate?: string }).sessionUpdate ?? "");
   }
   return "";
+}
+
+function isChildSession(get: GetFn, chatId: string, sessionId: string) {
+  const active = get().activeChat;
+  return (
+    active?.id === chatId &&
+    active.turns.some((turn) =>
+      turn.intermediate.some(
+        (block) =>
+          block.type === "subagent" && block.subagentId === sessionId,
+      ),
+    )
+  );
 }
 
 export function enqueueSessionUpdate(
@@ -164,6 +190,28 @@ export function enqueueSessionUpdate(
   });
 }
 
+/** Child history replays can contain thousands of inherited parent updates. */
+export function scheduleSessionApplies(
+  set: SetFn,
+  get: GetFn,
+  sessionId: string,
+) {
+  const active = get().activeChat;
+  const childSession =
+    active != null && isChildSession(get, active.id, sessionId);
+  if (!childSession) {
+    void drainSessionApplies(set, get);
+    return;
+  }
+  if (deferredDrainTimer != null) {
+    window.clearTimeout(deferredDrainTimer);
+  }
+  deferredDrainTimer = window.setTimeout(() => {
+    deferredDrainTimer = null;
+    void drainSessionApplies(set, get);
+  }, 500);
+}
+
 export function drainSessionApplies(set: SetFn, get: GetFn): Promise<void> {
   if (applyDrainRunning) return applyDrainPromise;
   applyDrainRunning = true;
@@ -189,6 +237,20 @@ export function drainSessionApplies(set: SetFn, get: GetFn): Promise<void> {
           batch.backend,
         );
         if (!targetId) continue;
+
+        if (isChildSession(get, targetId, batch.sessionId)) {
+          // A Codex child fork replays the inherited parent turns first. Keep
+          // only the latest turn in this buffered history batch.
+          let lastUserTurn = -1;
+          batch.updates.forEach((update, index) => {
+            if (updateKind(update) === "user_message_chunk") {
+              lastUserTurn = index;
+            }
+          });
+          if (lastUserTurn > 0) {
+            batch.updates = batch.updates.slice(lastUserTurn);
+          }
+        }
 
         try {
           const rawUpdated = await invoke<ChatDocument>("apply_session_updates", {
@@ -230,7 +292,13 @@ export function drainSessionApplies(set: SetFn, get: GetFn): Promise<void> {
 export async function waitForApplyDrain(): Promise<void> {
   for (let i = 0; i < 500; i++) {
     await applyDrainPromise;
-    if (!applyDrainRunning && pendingBatches.length === 0) return;
+    if (
+      !applyDrainRunning &&
+      pendingBatches.length === 0 &&
+      deferredDrainTimer == null
+    ) {
+      return;
+    }
     await new Promise((r) => setTimeout(r, 0));
   }
 }

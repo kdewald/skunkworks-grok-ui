@@ -21,8 +21,8 @@ import {
 } from "./types";
 import { formatContextChips } from "./contextChips";
 import {
-  drainSessionApplies,
   enqueueSessionUpdate,
+  scheduleSessionApplies,
 } from "./state/stream";
 import {
   dispatchSend,
@@ -99,6 +99,7 @@ function normalizeChatDocument(chat: ChatDocument): ChatDocument {
       accessModeId: chat.agentConfig?.accessModeId ?? null,
       accessModeName: chat.agentConfig?.accessModeName ?? null,
       availableAccessModes: chat.agentConfig?.availableAccessModes ?? [],
+      accessModeExplicit: chat.agentConfig?.accessModeExplicit ?? false,
     },
   };
 }
@@ -227,6 +228,7 @@ type AppStore = {
   clearMessageQueue: (chatId?: string) => void;
   cancelPrompt: () => Promise<void>;
   refreshChat: (chatId?: string) => Promise<void>;
+  reloadConversation: () => Promise<void>;
   applySessionUpdate: (
     sessionId: string,
     update: unknown,
@@ -1527,6 +1529,66 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
+  reloadConversation: async () => {
+    const chat = get().activeChat;
+    if (!chat) return;
+    if (
+      get().inflightChatId === chat.id ||
+      chat.turns.some(
+        (turn) =>
+          turn.status === "streaming" || turn.status === "cancelling",
+      )
+    ) {
+      throw new Error("Cannot reload a conversation while a response is running");
+    }
+
+    set({ error: null });
+    try {
+      const project = get().projects.find(
+        (candidate) => candidate.id === chat.projectId,
+      );
+      const environmentId =
+        project?.environmentId || get().activeEnvironmentId;
+      if (!get().isRuntimeConnected(environmentId, chat.backend)) {
+        await get().connectAgent(environmentId, chat.backend);
+      }
+      const result = await invoke<{
+        chat: ChatDocument;
+        status: string;
+        message: string;
+      }>("reload_chat_session", { chatId: chat.id });
+      const replayed = normalizeChatDocument(result.chat);
+
+      if (replayed.backend === "codex") {
+        const childIds = [
+          ...new Set(
+            replayed.turns.flatMap((turn) =>
+              turn.intermediate
+                .filter((block) => block.type === "subagent")
+                .map((block) => block.subagentId),
+            ),
+          ),
+        ];
+        await Promise.allSettled(
+          childIds.map((subagentId) =>
+            invoke("watch_subagent_session", {
+              chatId: replayed.id,
+              subagentId,
+            }),
+          ),
+        );
+      }
+
+      await get().refreshChat(chat.id);
+      get().pushLog(`[session] Reloaded ${chat.title}`);
+    } catch (error) {
+      if (get().activeChatId === chat.id) {
+        set({ error: String(error) });
+      }
+      throw error;
+    }
+  },
+
   applySessionUpdate: async (
     sessionId: string,
     update: unknown,
@@ -1536,7 +1598,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     // Buffer only — never await per-token IPC. That was the "agent finished but
     // UI still drips" bug: hundreds of serial invokes behind a drained stream.
     enqueueSessionUpdate(sessionId, update, environmentId, backend);
-    void drainSessionApplies(set, get);
+    scheduleSessionApplies(set, get, sessionId);
   },
 
   setTurnCollapsed: async (turnId, collapsed) => {

@@ -133,10 +133,10 @@ export function formatToolPayload(value: unknown): {
 
 export function formatToolInput(value: unknown): string {
   if (value == null) return "";
-  if (typeof value === "string") return value;
+  if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
   if (typeof value === "object" && value !== null) {
     const rec = value as Record<string, unknown>;
-    // Common tool input fields — show the interesting bit first
+    // Prefer a single interesting field for the one-line tool hint.
     for (const key of [
       "command",
       "target_file",
@@ -145,24 +145,31 @@ export function formatToolInput(value: unknown): string {
       "query",
       "pattern",
       "url",
+      "file_path",
+      "filePath",
     ]) {
-      if (typeof rec[key] === "string") {
-        const rest = { ...rec };
-        // keep compact single-line when mostly one field
-        const keys = Object.keys(rec);
-        if (keys.length <= 3) {
-          return Object.entries(rec)
-            .map(([k, v]) =>
-              typeof v === "string" ? `${k}: ${v}` : `${k}: ${JSON.stringify(v)}`,
-            )
-            .join("\n");
-        }
-        void rest;
+      if (typeof rec[key] === "string" && rec[key].trim()) {
+        return String(rec[key]).replace(/\s+/g, " ").trim();
       }
+    }
+    const keys = Object.keys(rec);
+    if (keys.length > 0 && keys.length <= 3) {
+      return keys
+        .map((k) => {
+          const v = rec[k];
+          if (typeof v === "string") return `${k}=${v.replace(/\s+/g, " ").trim()}`;
+          try {
+            return `${k}=${JSON.stringify(v)}`;
+          } catch {
+            return `${k}=…`;
+          }
+        })
+        .join(" ");
     }
   }
   try {
-    return JSON.stringify(value, null, 2);
+    // Compact JSON for rare shapes — never pretty multi-line in the row hint.
+    return JSON.stringify(value);
   } catch {
     return String(value);
   }

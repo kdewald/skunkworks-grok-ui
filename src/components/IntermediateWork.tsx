@@ -73,6 +73,12 @@ function PayloadView({ value, label }: { value: unknown; label: string }) {
   );
 }
 
+function formatThoughtMarkdown(text: string) {
+  // Some adapters emit consecutive bold status fragments without whitespace:
+  // `**Checking…****Inspecting…**`. Give CommonMark a real block boundary.
+  return text.replace(/(^|[^*])\*{4}(?!\*)/g, "$1**\n\n**");
+}
+
 /**
  * Reasoning / agent_thought_chunk stream — mirrors Grok TUI ThinkingBlock:
  * header "Thinking…" while live, "Thought" when settled; collapsed by default
@@ -125,13 +131,9 @@ function ThoughtStream({
       </button>
       {open && (
         <div className="thought-stream-body">
-          {/*
-            Prefer pre-wrap plain text for stream fidelity. CommonMark treats a
-            single newline as a soft break (often rendered as a space), which
-            turns model fragments like "min\\nion" into "min ion". Grok's wire
-            is opaque deltas — preserve them exactly here.
-          */}
-          <pre className="thought-stream-text">{text}</pre>
+          <Markdown className="thought-stream-text markdown">
+            {formatThoughtMarkdown(text)}
+          </Markdown>
         </div>
       )}
     </div>
@@ -251,11 +253,12 @@ function BlockView({
     output.text.trim() &&
     output.text !== content.text;
   const hasDetail = !!(inputText || primary || showRawOut);
-  // One-line hint of path/command when collapsed (keeps rows scannable).
+  // One-line hint only — multi-line JSON/paths caused row paint overlap.
   const hint =
     inputText.trim().length > 0
-      ? inputText.replace(/\s+/g, " ").trim().slice(0, 72)
+      ? inputText.replace(/\s+/g, " ").trim().slice(0, 64)
       : "";
+  const title = (block.title || "Tool").replace(/\s+/g, " ").trim();
 
   return (
     <div className={`block compact tool ${statusClass(block.status)}`}>
@@ -265,12 +268,14 @@ function BlockView({
           hasDetail && setBlockCollapsed(turnId, block.id, !block.collapsed)
         }
         disabled={!hasDetail}
-        title={block.title + (hint ? `\n${hint}` : "")}
+        title={title + (hint ? `\n${hint}` : "")}
       >
         <span className="block-type-icon">
           <ToolIcon kind={block.kind} />
         </span>
-        <span className="block-label">{block.title}</span>
+        <span className="block-label" title={title}>
+          {title}
+        </span>
         {hint && block.collapsed && (
           <span className="block-hint mono" title={hint}>
             {hint}
@@ -296,13 +301,14 @@ function BlockView({
       {!block.collapsed && hasDetail && (
         <div className="block-body compact">
           {inputText && (
-            <details open={inputText.length < 400}>
+            // Don't auto-open large payloads — 36 tools × open details = paint chaos.
+            <details open={inputText.length < 200}>
               <summary>Input</summary>
               <pre className="code">{inputText}</pre>
             </details>
           )}
           {primary && (
-            <details open={primary.text.length < 600}>
+            <details open={primary.text.length < 280}>
               <summary>Result</summary>
               <pre className="code">{primary.text}</pre>
             </details>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentBackend, ChatMeta } from "../types";
+import type { AgentBackend, ChatDocument, ChatMeta } from "../types";
 import { resolveChatIdForSession } from "./stream";
 
 function chat(id: string, backend: AgentBackend): ChatMeta {
@@ -47,5 +47,56 @@ describe("resolveChatIdForSession", () => {
     expect(
       resolveChatIdForSession(() => state, "shared-session", "local"),
     ).toBe("grok-chat");
+  });
+
+  it("routes a child ACP session to its active parent chat", () => {
+    const activeChat: ChatDocument = {
+      id: "codex-chat",
+      projectId: "project",
+      backend: "codex",
+      title: "Codex",
+      acpSessionId: "parent-session",
+      agentConfig: {
+        availableModels: [],
+        availableAccessModes: [],
+      },
+      turns: [
+        {
+          id: "turn",
+          userMessage: "delegate",
+          assistantMessage: "",
+          status: "streaming",
+          intermediateCollapsed: false,
+          createdAt: "",
+          intermediate: [
+            {
+              type: "subagent",
+              id: "block",
+              subagentId: "child-session",
+              description: "reviewer",
+              status: "running",
+              output: "",
+              collapsed: false,
+            },
+          ],
+        },
+      ],
+      createdAt: "",
+      updatedAt: "",
+    };
+    const activeState = {
+      ...state,
+      activeChatId: activeChat.id,
+      activeChat,
+    };
+
+    expect(
+      resolveChatIdForSession(
+        () => activeState,
+        "child-session",
+        "local",
+        "codex",
+      ),
+    ).toBe("codex-chat");
   });
 });

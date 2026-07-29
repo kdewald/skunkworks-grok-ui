@@ -121,6 +121,10 @@ pub struct AcpConnection {
     stdin: AsyncMutex<ChildStdin>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<RpcId, oneshot::Sender<Result<Value>>>>>,
+    /// `session/load` history notifications captured until its response arrives.
+    /// Captured replay is reduced atomically instead of streaming stale history
+    /// through the live UI.
+    replay_captures: Mutex<HashMap<String, Vec<Value>>>,
     /// Outstanding agent→client permission request IDs awaiting UI response.
     /// Value is the ACP session id the permission belongs to.
     pending_permissions: Mutex<HashMap<RpcId, String>>,
@@ -231,6 +235,7 @@ impl AcpConnection {
             stdin: AsyncMutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            replay_captures: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
             active_prompts: Arc::new(Mutex::new(HashMap::new())),
             app: app.clone(),
@@ -361,6 +366,7 @@ impl AcpConnection {
             let _ = tx.send(Err(anyhow!("{reason}")));
         }
         self.active_prompts.lock().clear();
+        self.replay_captures.lock().clear();
         // Drop permission waiters (UI will clear on agent-status).
         self.pending_permissions.lock().clear();
         if n > 0 {
@@ -450,6 +456,10 @@ impl AcpConnection {
                     .unwrap_or("")
                     .to_string();
                 let update = params.get("update").cloned().unwrap_or(Value::Null);
+                if let Some(capture) = self.replay_captures.lock().get_mut(&session_id) {
+                    capture.push(update);
+                    return Ok(());
+                }
                 let _ = self.app.emit(
                     "session-update",
                     SessionUpdateEvent {
@@ -730,6 +740,33 @@ impl AcpConnection {
             }),
         )
         .await
+    }
+
+    /// Load a session while capturing its replay updates. Notifications are
+    /// ordered before the JSON-RPC response on the same stdout stream, so the
+    /// capture is complete when `session/load` resolves.
+    pub async fn session_load_with_replay(
+        &self,
+        session_id: &str,
+        cwd: &str,
+    ) -> Result<(Value, Vec<Value>)> {
+        {
+            let mut captures = self.replay_captures.lock();
+            if captures
+                .insert(session_id.to_string(), Vec::new())
+                .is_some()
+            {
+                anyhow::bail!("session replay already in progress: {session_id}");
+            }
+        }
+
+        let result = self.session_load(session_id, cwd).await;
+        let replay = self
+            .replay_captures
+            .lock()
+            .remove(session_id)
+            .unwrap_or_default();
+        result.map(|response| (response, replay))
     }
 
     pub async fn session_set_mode(&self, session_id: &str, mode_id: &str) -> Result<Value> {

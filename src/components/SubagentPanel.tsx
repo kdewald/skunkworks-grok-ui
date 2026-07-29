@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Bot, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type { ChatDocument, IntermediateBlock } from "../types";
 import { useAppStore } from "../store";
@@ -65,6 +66,9 @@ function SubagentCard({
   useEffect(() => {
     if (block.output) setOpen(true);
   }, [block.output]);
+  useEffect(() => {
+    if (block.progress) setOpen(true);
+  }, [block.progress]);
 
   return (
     <div className={`subagent-card ${statusClass(block.status)}`}>
@@ -96,11 +100,23 @@ function SubagentCard({
       </button>
       {open && (
         <div className="subagent-card-body">
-          {block.output ? (
-            <Markdown className="markdown subagent-card-md">
-              {block.output}
-            </Markdown>
-          ) : (
+          {block.progress && (
+            <>
+              <div className="subagent-card-section-label">Progress</div>
+              <Markdown className="markdown subagent-card-md subagent-card-progress">
+                {block.progress}
+              </Markdown>
+            </>
+          )}
+          {block.output && (
+            <>
+              <div className="subagent-card-section-label">Result</div>
+              <Markdown className="markdown subagent-card-md">
+                {block.output}
+              </Markdown>
+            </>
+          )}
+          {!block.progress && !block.output && (
             <div className="subagent-card-empty">
               {running
                 ? "Running in the background… results appear here when done."
@@ -126,6 +142,37 @@ export function SubagentPanel({ chat, focusTurnId }: Props) {
   const subagentsOpen = useAppStore((s) => s.subagentsOpen);
   const items = useMemo(() => collectSubagents(chat), [chat]);
   const anyRunning = items.some((i) => isRunning(i.block.status));
+  const subagentSessionIds = items
+    .map(({ block }) => block.subagentId)
+    .sort()
+    .join("\n");
+
+  // Codex child agents are separate ACP sessions. Loading them replays existing
+  // history and subscribes to live progress; polling also recovers after an
+  // adapter restart without creating duplicate subscriptions.
+  useEffect(() => {
+    if (!chat || chat.backend !== "codex" || !subagentSessionIds) return;
+    const sessionIds = subagentSessionIds.split("\n");
+    let watchRunning = false;
+    const watch = async () => {
+      if (watchRunning) return;
+      watchRunning = true;
+      for (const subagentId of sessionIds) {
+        try {
+          await invoke("watch_subagent_session", {
+            chatId: chat.id,
+            subagentId,
+          });
+        } catch {
+          // The agent may still be reconnecting. The interval retries.
+        }
+      }
+      watchRunning = false;
+    };
+    void watch();
+    const timer = window.setInterval(() => void watch(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [chat?.backend, chat?.id, subagentSessionIds]);
 
   // Nothing to show — header button is also hidden.
   if (items.length === 0 || !subagentsOpen) return null;
