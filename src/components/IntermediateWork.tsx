@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   Brain,
   ChevronDown,
@@ -7,6 +7,7 @@ import {
   FileSearch,
   Globe,
   Loader2,
+  MessageSquareQuote,
   Search,
   Terminal,
   Timer,
@@ -17,6 +18,7 @@ import type { IntermediateBlock, Turn } from "../types";
 import { useAppStore } from "../store";
 import { formatToolInput, formatToolPayload } from "../contentFormat";
 import { Markdown } from "../Markdown";
+import { chipId } from "../contextChips";
 
 function ToolIcon({ kind }: { kind?: string | null }) {
   const props = { size: 12, strokeWidth: 1.75 as const };
@@ -520,7 +522,13 @@ export function IntermediateWork({ turn }: { turn: Turn }) {
     <div className="turn-timeline">
       {timeline.map((run, idx) => {
         if (run.kind === "message") {
-          return <AssistantMessage key={run.key} text={run.text} />;
+          return (
+            <AssistantMessage
+              key={run.key}
+              text={run.text}
+              turnId={turn.id}
+            />
+          );
         }
         if (run.kind === "thought") {
           // A thought run is "live" only if the turn is streaming and no
@@ -550,16 +558,129 @@ export function IntermediateWork({ turn }: { turn: Turn }) {
           />
         );
       })}
-      {legacyText && <AssistantMessage text={legacyText} />}
+      {legacyText && (
+        <AssistantMessage text={legacyText} turnId={turn.id} />
+      )}
     </div>
   );
 }
 
+type AnnotateMenu = {
+  x: number;
+  y: number;
+  text: string;
+};
+
 export const AssistantMessage = React.memo(function AssistantMessage({
   text,
+  turnId,
 }: {
   text: string;
+  turnId?: string;
 }) {
+  const addContextChip = useAppStore((s) => s.addContextChip);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [menu, setMenu] = useState<AnnotateMenu | null>(null);
+
+  const dismiss = useCallback(() => setMenu(null), []);
+
+  useEffect(() => {
+    if (!menu) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (wrapRef.current?.contains(t)) return;
+      // Allow the annotate button itself (portaled-style fixed inside wrap).
+      dismiss();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") dismiss();
+    };
+    const onScroll = () => dismiss();
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [menu, dismiss]);
+
   if (!text) return null;
-  return <Markdown className="assistant-msg markdown">{text}</Markdown>;
+
+  function onMouseUp() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      setMenu(null);
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const root = wrapRef.current;
+    if (!root) return;
+    const anchor = range.commonAncestorContainer;
+    if (!root.contains(anchor)) {
+      setMenu(null);
+      return;
+    }
+    const selected = sel.toString().replace(/\u00a0/g, " ").trim();
+    if (!selected) {
+      setMenu(null);
+      return;
+    }
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      setMenu(null);
+      return;
+    }
+    setMenu({
+      x: Math.min(
+        Math.max(8, rect.left + rect.width / 2),
+        window.innerWidth - 8,
+      ),
+      y: Math.max(8, rect.top - 8),
+      text: selected,
+    });
+  }
+
+  function addAnnotation() {
+    if (!menu) return;
+    addContextChip({
+      id: chipId(),
+      kind: "annotation",
+      path: turnId ? `turn:${turnId.slice(0, 8)}` : "assistant",
+      content: menu.text,
+    });
+    setMenu(null);
+    window.getSelection()?.removeAllRanges();
+  }
+
+  return (
+    <div
+      ref={wrapRef}
+      className="assistant-msg-wrap"
+      onMouseUp={onMouseUp}
+    >
+      <Markdown className="assistant-msg markdown">{text}</Markdown>
+      {menu && (
+        <div
+          className="annotate-selection-bar"
+          style={{ left: menu.x, top: menu.y }}
+          role="toolbar"
+          aria-label="Selection actions"
+        >
+          <button
+            type="button"
+            className="annotate-selection-btn"
+            // Keep the browser selection while clicking the button.
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={addAnnotation}
+            title="Add selection as an annotation on your next message"
+          >
+            <MessageSquareQuote size={13} strokeWidth={1.85} />
+            Annotate
+          </button>
+        </div>
+      )}
+    </div>
+  );
 });

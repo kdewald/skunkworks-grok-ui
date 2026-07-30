@@ -285,17 +285,24 @@ export type WorkspaceGitStatus = {
 };
 
 /**
- * Structured context sent with a message (from Files view).
+ * Structured context sent with a message (from Files view or chat selection).
  * Expanded into markdown on send — not a separate attachment type.
  */
 export type ContextChip = {
   id: string;
-  kind: "file" | "dir" | "range";
-  /** Project-relative path. */
+  /**
+   * - file/dir/range: workspace paths from Files
+   * - annotation: excerpt the user highlighted from an assistant reply
+   */
+  kind: "file" | "dir" | "range" | "annotation";
+  /**
+   * Project-relative path for file/dir/range.
+   * For annotations: short source label (e.g. `assistant` or turn id).
+   */
   path: string;
   note?: string;
   startLine?: number;
   endLine?: number;
-  /** Pinned snippet for range chips (captured at add time). */
+  /** Pinned snippet (range capture or annotation body). */
   content?: string;
 };

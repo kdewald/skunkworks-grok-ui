@@ -23,6 +23,11 @@ type Props = {
   modelPath?: string;
   /** When false (default for binary/truncated), editing is disabled. */
   editable?: boolean;
+  /**
+   * When the host pane becomes visible again (e.g. Chat → Files), bump or set
+   * true so Monaco re-layouts after `display: none` (scroll/cursor stay put).
+   */
+  visible?: boolean;
   onChange?: (value: string) => void;
   onSelectionChange?: (range: LineRange | null) => void;
   /** Cmd/Ctrl+S */
@@ -64,6 +69,7 @@ export function MonacoViewer({
   path,
   modelPath: modelPathProp,
   editable = false,
+  visible = true,
   onChange,
   onSelectionChange,
   onSave,
@@ -186,6 +192,18 @@ export function MonacoViewer({
       cancelled = true;
     };
   }, [path, language, monacoLang]); // content only on open — not every keystroke
+
+  // Host panes use display:none when inactive; re-measure when shown again so
+  // the same scroll/cursor position paints into the correct viewport size.
+  useEffect(() => {
+    if (!visible) return;
+    const ed = edRef.current;
+    if (!ed) return;
+    const id = requestAnimationFrame(() => {
+      ed.layout();
+    });
+    return () => cancelAnimationFrame(id);
+  }, [visible]);
 
   return (
     <div className="code-viewer-host monaco-viewer-host">

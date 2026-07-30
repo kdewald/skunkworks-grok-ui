@@ -328,6 +328,33 @@ pub fn write_local(root: &Path, rel: &str, content: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Delete a file or directory under the local project root.
+pub fn delete_local(root: &Path, rel: &str) -> Result<(), String> {
+    let rel = normalize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("cannot delete the project root".into());
+    }
+    let target = join_root(root, &rel)?;
+    if !target.exists() {
+        return Err(format!("not found: {rel}"));
+    }
+    // Refuse to delete outside root (join_root already checks; re-check after canonicalize).
+    let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let target_canon = fs::canonicalize(&target).map_err(|e| e.to_string())?;
+    if !target_canon.starts_with(&root_canon) {
+        return Err("path must stay inside the project".into());
+    }
+    if target_canon == root_canon {
+        return Err("cannot delete the project root".into());
+    }
+    if target.is_dir() {
+        fs::remove_dir_all(&target).map_err(|e| format!("delete dir {rel}: {e}"))?;
+    } else {
+        fs::remove_file(&target).map_err(|e| format!("delete file {rel}: {e}"))?;
+    }
+    Ok(())
+}
+
 pub fn list_remote(host: &str, root: &str, rel: &str) -> Result<WorkspaceListing, String> {
     let rel = normalize_rel(rel)?;
     // Build remote path. root may contain $HOME for scratch.
@@ -575,6 +602,57 @@ cat > "$target"
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ssh write failed: {}", err.trim()));
+    }
+    Ok(())
+}
+
+/// Delete a file or directory under a remote project root over SSH.
+pub fn delete_remote(host: &str, root: &str, rel: &str) -> Result<(), String> {
+    let rel = normalize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("cannot delete the project root".into());
+    }
+    let remote_path = if root.contains("$HOME") {
+        format!("{root}/{rel}")
+    } else {
+        format!("{}/{rel}", root.trim_end_matches('/'))
+    };
+
+    let portable = format!(
+        r#"set -e
+target={}
+target=$(eval echo "$target")
+if [ ! -e "$target" ]; then
+  echo "ERR:not found" >&2
+  exit 1
+fi
+# Refuse to delete the expanded root itself.
+root={}
+root=$(eval echo "$root")
+root=$(cd "$root" 2>/dev/null && pwd -P || echo "$root")
+target_real=$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target")
+if [ "$target_real" = "$root" ] || [ "$target" = "$root" ]; then
+  echo "ERR:cannot delete project root" >&2
+  exit 1
+fi
+if [ -d "$target" ]; then
+  rm -rf "$target"
+else
+  rm -f "$target"
+fi
+"#,
+        shell_single_quote(&remote_path),
+        shell_single_quote(root)
+    );
+
+    let output = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host])
+        .arg(format!("bash -lc {}", shell_single_quote(&portable)))
+        .output()
+        .map_err(|e| format!("ssh delete: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh delete failed: {}", err.trim()));
     }
     Ok(())
 }

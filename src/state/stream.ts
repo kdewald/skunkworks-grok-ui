@@ -25,7 +25,8 @@ export type StreamStoreSlice = {
   activeChat: ChatDocument | null;
   chats: ChatMeta[];
   projects: Project[];
-  inflightChatId: string | null;
+  /** Per-chat send slots (used to route session updates while streaming). */
+  inflightPrompts: Record<string, { turnId: string | null; generation: number }>;
 };
 
 type SetFn = (
@@ -135,8 +136,9 @@ export function resolveChatIdForSession(
   ) {
     return active.id;
   }
-  const inflight = get().inflightChatId;
-  if (inflight && runtimeMatches(inflight)) {
+  // Prefer an inflight chat on this runtime whose session id is unknown or matches.
+  for (const inflight of Object.keys(get().inflightPrompts)) {
+    if (!runtimeMatches(inflight)) continue;
     const meta = get().chats.find((c) => c.id === inflight);
     const live = get().activeChat?.id === inflight ? get().activeChat : null;
     const known = live?.acpSessionId ?? meta?.acpSessionId ?? null;

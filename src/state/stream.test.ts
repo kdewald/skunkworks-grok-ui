@@ -29,7 +29,7 @@ describe("resolveChatIdForSession", () => {
         updatedAt: "",
       },
     ],
-    inflightChatId: null,
+    inflightPrompts: {},
   };
 
   it("scopes identical session ids to the selected backend", () => {

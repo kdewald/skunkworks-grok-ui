@@ -3,9 +3,9 @@ use tauri::State;
 
 use crate::commands::AppState;
 use crate::workspace_fs::{
-    git_status_local, git_status_remote, list_local, list_remote, read_local, read_remote,
-    resolve_workspace_root, write_local, write_remote, WorkspaceFileContent, WorkspaceGitStatus,
-    WorkspaceListing,
+    delete_local, delete_remote, git_status_local, git_status_remote, list_local, list_remote,
+    read_local, read_remote, resolve_workspace_root, write_local, write_remote,
+    WorkspaceFileContent, WorkspaceGitStatus, WorkspaceListing,
 };
 
 #[tauri::command]
@@ -93,6 +93,35 @@ pub fn write_workspace_file(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "SSH host missing".to_string())?;
     write_remote(host, &root, &path, &content)
+}
+
+/// Delete a file or directory in the project workspace (local or SSH).
+#[tauri::command]
+pub fn delete_workspace_path(
+    state: State<'_, AppState>,
+    project_id: String,
+    path: String,
+    chat_id: Option<String>,
+) -> Result<(), String> {
+    let data = state.data.lock().clone();
+    let (project, root, remote) =
+        resolve_workspace_root(&data, &project_id, chat_id.as_deref())?;
+
+    if !remote {
+        return delete_local(std::path::Path::new(&root), &path);
+    }
+
+    let env = data
+        .environments
+        .iter()
+        .find(|e| e.id == project.environment_id)
+        .ok_or_else(|| "environment not found".to_string())?;
+    let host = env
+        .ssh_host
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "SSH host missing".to_string())?;
+    delete_remote(host, &root, &path)
 }
 
 /// Absolute local workspace root (for file:// URIs / LSP). Fails for SSH remotes.

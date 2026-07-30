@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { healStuckBusy, isActivelyStreaming, isRetriableQueueError } from "./send";
+import {
+  healStuckBusy,
+  isActivelyStreaming,
+  isChatInflight,
+  isChatSendBusy,
+  isMatchingInflightFinish,
+  isRetriableQueueError,
+  withoutInflight,
+  withInflight,
+} from "./send";
 
 describe("isRetriableQueueError", () => {
   it("matches known transient phrases", () => {
@@ -7,6 +16,43 @@ describe("isRetriableQueueError", () => {
     expect(isRetriableQueueError("in-flight prompt")).toBe(true);
     expect(isRetriableQueueError("Please try again")).toBe(true);
     expect(isRetriableQueueError("hard failure")).toBe(false);
+  });
+});
+
+describe("inflight map helpers", () => {
+  it("withInflight / withoutInflight are immutable", () => {
+    const base = { a: { turnId: "t1", generation: 1 } };
+    const added = withInflight(base, "b", { turnId: null, generation: 2 });
+    expect(added).toEqual({
+      a: { turnId: "t1", generation: 1 },
+      b: { turnId: null, generation: 2 },
+    });
+    expect(base).toEqual({ a: { turnId: "t1", generation: 1 } });
+    expect(withoutInflight(added, "a")).toEqual({
+      b: { turnId: null, generation: 2 },
+    });
+  });
+});
+
+describe("isMatchingInflightFinish", () => {
+  it("rejects missing slot", () => {
+    expect(isMatchingInflightFinish(null, "t1")).toBe(false);
+  });
+
+  it("accepts any finish while turn id not yet adopted", () => {
+    expect(
+      isMatchingInflightFinish({ turnId: null, generation: 1 }, "t1"),
+    ).toBe(true);
+    expect(
+      isMatchingInflightFinish({ turnId: null, generation: 1 }, null),
+    ).toBe(true);
+  });
+
+  it("matches exact turn id once adopted", () => {
+    const slot = { turnId: "t1", generation: 1 };
+    expect(isMatchingInflightFinish(slot, "t1")).toBe(true);
+    expect(isMatchingInflightFinish(slot, "t2")).toBe(false);
+    expect(isMatchingInflightFinish(slot, null)).toBe(true);
   });
 });
 
@@ -18,11 +64,9 @@ describe("healStuckBusy", () => {
         setCount++;
       },
       () => ({
-        busy: true,
         activeChat: null,
-        activeChatId: null,
-        inflightChatId: null,
-        inflightTurnId: null,
+        activeChatId: "c",
+        inflightPrompts: { c: { turnId: null, generation: 1 } },
       }),
       {},
     );
@@ -30,46 +74,79 @@ describe("healStuckBusy", () => {
     expect(setCount).toBe(0);
   });
 
-  it("refuses while inflightChatId is set", () => {
+  it("refuses while this chat is actively streaming", () => {
     const healed = healStuckBusy(
       () => {},
       () => ({
-        busy: true,
-        activeChat: null,
         activeChatId: "c",
-        inflightChatId: "c",
-        inflightTurnId: null,
+        inflightPrompts: { c: { turnId: "t1", generation: 1 } },
+        activeChat: {
+          id: "c",
+          projectId: "p",
+          backend: "grok",
+          title: "t",
+          agentConfig: {
+            availableModels: [],
+            availableAccessModes: [],
+          },
+          turns: [
+            {
+              id: "t1",
+              userMessage: "",
+              intermediate: [],
+              assistantMessage: "",
+              status: "streaming",
+              intermediateCollapsed: false,
+              attachments: [],
+              createdAt: "",
+            },
+          ],
+          createdAt: "",
+          updatedAt: "",
+        },
       }),
-      { force: true },
+      { force: true, chatId: "c" },
     );
     expect(healed).toBe(false);
   });
 
-  it("clears stuck busy with force when idle", () => {
+  it("clears a stuck slot for one chat without touching others", () => {
     let partial: Record<string, unknown> | null = null;
     const healed = healStuckBusy(
       (p) => {
         partial = p as Record<string, unknown>;
       },
       () => ({
-        busy: true,
         activeChat: null,
-        activeChatId: null,
-        inflightChatId: null,
-        inflightTurnId: null,
+        activeChatId: "c",
+        inflightPrompts: {
+          c: { turnId: "t1", generation: 1 },
+          other: { turnId: "t2", generation: 2 },
+        },
       }),
-      { force: true },
+      { force: true, chatId: "c" },
     );
     expect(healed).toBe(true);
     expect(partial).toMatchObject({
-      busy: false,
-      inflightChatId: null,
+      inflightPrompts: { other: { turnId: "t2", generation: 2 } },
     });
   });
 });
 
+describe("isChatInflight / isChatSendBusy", () => {
+  it("detects map membership from getter or state", () => {
+    const state = {
+      inflightPrompts: { c: { turnId: null as string | null, generation: 1 } },
+      activeChat: null as null,
+    };
+    expect(isChatInflight(state, "c")).toBe(true);
+    expect(isChatInflight(() => state, "x")).toBe(false);
+    expect(isChatSendBusy(state, "c")).toBe(true);
+  });
+});
+
 describe("isActivelyStreaming", () => {
-  it("detects streaming turns", () => {
+  it("detects streaming turns on the active chat", () => {
     expect(
       isActivelyStreaming(() => ({
         activeChat: {

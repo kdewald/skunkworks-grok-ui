@@ -6,6 +6,7 @@ import {
   Folder,
   FolderPlus,
   Globe,
+  Loader2,
   MessageSquarePlus,
   MoreVertical,
   Server,
@@ -66,6 +67,7 @@ export function Sidebar() {
     environments,
     activeEnvironmentId,
     activeBackend,
+    inflightPrompts,
     isRuntimeConnected,
     selectProject,
     createChat,
@@ -497,10 +499,12 @@ export function Sidebar() {
 
                 {!isCollapsed && visibleChats.length > 0 && (
                   <div className="project-chats">
-                    {visibleChats.map((c) => (
+                    {visibleChats.map((c) => {
+                      const chatBusy = c.id in inflightPrompts;
+                      return (
                       <div
                         key={c.id}
-                        className={`nested-chat ${c.id === activeChatId ? "active" : ""}`}
+                        className={`nested-chat ${c.id === activeChatId ? "active" : ""} ${chatBusy ? "is-working" : ""}`}
                         onClick={() => void selectChat(c.id)}
                         role="button"
                         tabIndex={0}
@@ -514,6 +518,19 @@ export function Sidebar() {
                         <div className="nested-chat-title">
                           {c.title || "Untitled"}
                         </div>
+                        {chatBusy && (
+                          <span
+                            className="nested-chat-status"
+                            title="Agent is working"
+                            aria-label="Agent is working"
+                          >
+                            <Loader2
+                              className="nested-chat-spinner"
+                              size={12}
+                              strokeWidth={2.25}
+                            />
+                          </span>
+                        )}
                         <button
                           type="button"
                           className="chat-delete"
@@ -526,7 +543,8 @@ export function Sidebar() {
                           <X size={13} strokeWidth={1.75} />
                         </button>
                       </div>
-                    ))}
+                      );
+                    })}
                     {hiddenCount > 0 && (
                       <button
                         type="button"

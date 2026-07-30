@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.0] — 2026-07-30
+
+### Added
+
+- Files tree: delete file/folder (with confirm) for local and SSH workspaces
+- Select text in assistant replies → **Annotate** adds it as context the model
+  receives under a clear `### Annotations` section
+- Sidebar spinner on chats with an in-flight agent turn
+
+### Fixed
+
+- Concurrent chats no longer share a global send slot: each conversation queues
+  and streams independently (frontend matches backend one-prompt-per-chat)
+- Composer draft (text + attachments) survives Chat ↔ Files switches and chat
+  switches (stored per chat, not only in component state)
+- Files view stays mounted across Chat ↔ Files switches so the open file, tree,
+  and Monaco scroll/cursor position are preserved
+
+### Packaging
+
+- Version bump to 0.9.0
+
 ## [0.8.0] — 2026-07-28
 
 ### Added

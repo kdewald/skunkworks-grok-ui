@@ -12,13 +12,14 @@ import {
   ClipboardPaste,
   FileText,
   Folder,
+  MessageSquareQuote,
   Paperclip,
   Plus,
   SendHorizontal,
   Square,
   X,
 } from "lucide-react";
-import { healStuckBusy, useAppStore } from "../store";
+import { healStuckBusy, isChatSendBusy, useAppStore } from "../store";
 import {
   FILE_ACCEPT,
   MAX_ATTACHMENTS,
@@ -35,8 +36,6 @@ type Props = {
 };
 
 export function Composer({ onSend }: Props) {
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
@@ -44,12 +43,12 @@ export function Composer({ onSend }: Props) {
     sendMessage,
     resubmitFromTurn,
     cancelPrompt,
-    busy,
     activeChat,
     activeChatId,
     activeBackend,
     agent,
     messageQueue,
+    inflightPrompts,
     removeQueuedMessage,
     clearMessageQueue,
     contextChips,
@@ -58,14 +57,38 @@ export function Composer({ onSend }: Props) {
     clearContextChips,
     composerEdit,
     clearComposerEdit,
+    composerDrafts,
+    setComposerDraftText,
+    setComposerDraftAttachments,
+    clearComposerDraft,
   } = useAppStore();
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   /** Prevent double Enter while send_message invoke is in flight. */
   const sendingRef = useRef(false);
+  // Draft key survives Chat ↔ Files remounts; pending before first chat.
+  const draftKey = activeChatId ?? "__new__";
+  const draft = composerDrafts[draftKey];
+  const text = draft?.text ?? "";
+  const attachments = draft?.attachments ?? [];
+  const setText = (value: string) => setComposerDraftText(draftKey, value);
+  const setAttachments = (
+    value:
+      | PendingAttachment[]
+      | ((prev: PendingAttachment[]) => PendingAttachment[]),
+  ) => {
+    const next =
+      typeof value === "function" ? value(attachments) : value;
+    setComposerDraftAttachments(draftKey, next);
+  };
   // Only a live streaming turn keeps Stop visible — cancelled/cancelling must not.
   const streaming = activeChat?.turns.some((t) => t.status === "streaming");
+  // Per-chat send busy — other chats streaming must not lock this composer.
+  const chatBusy = isChatSendBusy(
+    () => ({ inflightPrompts, activeChat }),
+    activeChatId,
+  );
   const chatQueue = messageQueue.filter((m) => m.chatId === activeChatId);
   const editing =
     composerEdit?.chatId === activeChatId ? composerEdit : null;
@@ -80,8 +103,9 @@ export function Composer({ onSend }: Props) {
   // Seed the bottom textarea when the user picks Edit on a prior message.
   useEffect(() => {
     if (!composerEdit || composerEdit.chatId !== activeChatId) return;
-    setText(composerEdit.text);
-    setAttachments([]);
+    if (!activeChatId) return;
+    setComposerDraftText(activeChatId, composerEdit.text);
+    setComposerDraftAttachments(activeChatId, []);
     setMenuOpen(false);
     requestAnimationFrame(() => {
       const el = taRef.current;
@@ -90,7 +114,14 @@ export function Composer({ onSend }: Props) {
       const len = el.value.length;
       el.setSelectionRange(len, len);
     });
-  }, [composerEdit?.seed, composerEdit?.chatId, activeChatId]);
+  }, [
+    composerEdit?.seed,
+    composerEdit?.chatId,
+    composerEdit?.text,
+    activeChatId,
+    setComposerDraftText,
+    setComposerDraftAttachments,
+  ]);
 
   // Keep the textarea height in lockstep with content so + / text / send
   // share one row when empty, and grow together when multi-line.
@@ -250,14 +281,17 @@ export function Composer({ onSend }: Props) {
     }
     if (sendingRef.current) return;
 
-    // Lost prompt-finished leaves busy=true with no stream → Send was a no-op.
+    // Lost prompt-finished leaves a stuck slot with no stream → Send was a no-op.
     // Force-heal here: sendingRef already blocks true double-dispatch.
-    healStuckBusy(useAppStore.setState, useAppStore.getState, { force: true });
+    healStuckBusy(useAppStore.setState, useAppStore.getState, {
+      force: true,
+      chatId: activeChatId,
+    });
     const state = useAppStore.getState();
     const nowStreaming = !!state.activeChat?.turns.some(
       (t) => t.status === "streaming",
     );
-    const nowBusy = state.busy;
+    const nowBusy = isChatSendBusy(state, activeChatId);
 
     if (editingNow) {
       if (editingNow.laterCount > 0) {
@@ -286,8 +320,8 @@ export function Composer({ onSend }: Props) {
     }));
     const chipsSnapshot = contextChips;
     const editSnapshot = editingNow;
-    setText("");
-    setAttachments([]);
+    // Clear the store draft immediately; restore on failure.
+    clearComposerDraft(draftKey);
     onSend?.();
     if (!editSnapshot && (nowStreaming || nowBusy)) {
       flash(
@@ -306,10 +340,14 @@ export function Composer({ onSend }: Props) {
       } else {
         await sendMessage(value, toSend);
       }
+      // If createChat minted a real id, drop any leftover __new__ draft.
+      if (draftKey === "__new__") {
+        clearComposerDraft("__new__");
+      }
     } catch (e) {
       // Restore draft so a failed send is not silent data-loss.
-      setText(value);
-      setAttachments(prevAttachments);
+      setComposerDraftText(draftKey, value);
+      setComposerDraftAttachments(draftKey, prevAttachments);
       flash(String(e));
       if (
         chipsSnapshot.length &&
@@ -328,8 +366,7 @@ export function Composer({ onSend }: Props) {
     if (e.key === "Escape" && editing) {
       e.preventDefault();
       clearComposerEdit();
-      setText("");
-      setAttachments([]);
+      clearComposerDraft(draftKey);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -338,17 +375,18 @@ export function Composer({ onSend }: Props) {
     }
   }
 
-  // Grace period: real sends set busy before streaming starts. Only treat
-  // busy&&!streaming as stuck after a few seconds (missed prompt-finished).
+  // Grace period: real sends claim a slot before streaming paints. Only treat
+  // chatBusy&&!streaming as stuck after a few seconds (missed prompt-finished).
   useEffect(() => {
-    if (!busy || streaming) return;
+    if (!chatBusy || streaming) return;
     const t = window.setTimeout(() => {
       healStuckBusy(useAppStore.setState, useAppStore.getState, {
         force: true,
+        chatId: activeChatId,
       });
     }, 5000);
     return () => window.clearTimeout(t);
-  }, [busy, streaming]);
+  }, [chatBusy, streaming, activeChatId]);
 
   const hasContent =
     !!text.trim() ||
@@ -451,11 +489,17 @@ export function Composer({ onSend }: Props) {
             <div
               key={c.id}
               className={`context-chip kind-${c.kind}`}
-              title={c.path}
+              title={
+                c.kind === "annotation"
+                  ? c.content ?? "Annotation"
+                  : c.path
+              }
             >
               <span className="context-chip-icon">
                 {c.kind === "dir" ? (
                   <Folder size={13} strokeWidth={1.75} />
+                ) : c.kind === "annotation" ? (
+                  <MessageSquareQuote size={13} strokeWidth={1.75} />
                 ) : (
                   <FileText size={13} strokeWidth={1.75} />
                 )}
@@ -464,7 +508,11 @@ export function Composer({ onSend }: Props) {
                 <div className="context-chip-name mono">{chipLabel(c)}</div>
                 <input
                   className="context-chip-note"
-                  placeholder="Optional note…"
+                  placeholder={
+                    c.kind === "annotation"
+                      ? "Optional label…"
+                      : "Optional note…"
+                  }
                   value={c.note ?? ""}
                   onChange={(e) => updateContextChipNote(c.id, e.target.value)}
                 />
@@ -588,7 +636,7 @@ export function Composer({ onSend }: Props) {
               ? "Edit your message and press Enter to resend…"
               : !agent.connected
                 ? "Connect to agent, then type a message…"
-                : streaming || busy
+                : streaming || chatBusy
                   ? "Queue a follow-up… (Stop to interrupt the current turn)"
                   : `Message ${backendLabel}…`
           }

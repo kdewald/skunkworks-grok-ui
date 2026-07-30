@@ -123,6 +123,30 @@ button {
   overflow: hidden;
 }
 
+/* Stack chat + files; only one visible. Both stay mounted for session state. */
+.workspace-panes {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-pane.is-hidden {
+  display: none;
+}
+
 /* Sidebar */
 .sidebar {
   display: flex;
@@ -525,6 +549,26 @@ button {
   text-overflow: ellipsis;
   min-width: 0;
   flex: 1;
+}
+
+.nested-chat-status {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+
+.nested-chat-spinner {
+  animation: nested-chat-spin 0.75s linear infinite;
+}
+
+@keyframes nested-chat-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .show-more-chats {
@@ -1701,6 +1745,18 @@ button {
   background: var(--bg-hover);
 }
 
+.files-ctx-item.is-danger {
+  color: var(--danger, #e06c75);
+}
+
+.files-ctx-item.is-danger:hover {
+  background: color-mix(in srgb, var(--danger, #e06c75) 12%, transparent);
+}
+
+.files-ctx-item.is-danger svg {
+  color: var(--danger, #e06c75);
+}
+
 .files-ctx-item svg {
   flex-shrink: 0;
   color: var(--text-faint);
@@ -2593,6 +2649,49 @@ pre.code {
 }
 
 /* Markdown */
+.assistant-msg-wrap {
+  position: relative;
+}
+
+.annotate-selection-bar {
+  position: fixed;
+  z-index: 70;
+  transform: translate(-50%, -100%);
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-1);
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+}
+
+.annotate-selection-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.annotate-selection-btn:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+
+.context-chip.kind-annotation {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-2));
+}
+
 .assistant-msg.markdown {
   line-height: 1.6;
   font-size: 14px;

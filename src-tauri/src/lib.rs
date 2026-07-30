@@ -84,6 +84,7 @@ pub fn run() {
             commands::list_workspace_dir,
             commands::read_workspace_file,
             commands::write_workspace_file,
+            commands::delete_workspace_path,
             commands::get_workspace_abs_root,
             commands::lsp_status,
             commands::lsp_ensure,

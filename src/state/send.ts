@@ -1,5 +1,8 @@
 /**
- * Send-slot ownership, stuck-busy heal, and dispatchSend.
+ * Per-chat send-slot ownership, stuck-slot heal, and dispatchSend.
+ *
+ * Backend enforces one in-flight prompt per chat; the frontend mirrors that
+ * so independent chats can stream concurrently (no global send mutex).
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -20,13 +23,21 @@ export type QueuedAttachment = {
   dataUrl?: string;
 };
 
+/** In-flight prompt claim for a single chat. */
+export type InflightPrompt = {
+  turnId: string | null;
+  generation: number;
+};
+
+export type InflightPrompts = Record<string, InflightPrompt>;
+
 export type SendStoreSlice = {
+  /** UI op lock (connect, create chat, etc.) — not the send/stream mutex. */
   busy: boolean;
   activeChat: ChatDocument | null;
   activeChatId: string | null;
-  inflightChatId: string | null;
-  inflightTurnId: string | null;
-  inflightGeneration: number | null;
+  /** Per-chat send slots. Multiple chats may stream at once. */
+  inflightPrompts: InflightPrompts;
   chats: ChatMeta[];
   projects: Project[];
   activeProjectId: string | null;
@@ -58,33 +69,105 @@ export function queueId() {
   return `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function isActivelyStreaming(
-  get: () => Pick<SendStoreSlice, "activeChat">,
+type InflightSource =
+  | Pick<SendStoreSlice, "inflightPrompts">
+  | (() => Pick<SendStoreSlice, "inflightPrompts">);
+
+type ActiveChatSource =
+  | Pick<SendStoreSlice, "activeChat">
+  | (() => Pick<SendStoreSlice, "activeChat">);
+
+type SendBusySource =
+  | Pick<SendStoreSlice, "inflightPrompts" | "activeChat">
+  | (() => Pick<SendStoreSlice, "inflightPrompts" | "activeChat">);
+
+function resolveInflightPrompts(source: InflightSource | SendBusySource): InflightPrompts {
+  return typeof source === "function"
+    ? source().inflightPrompts
+    : source.inflightPrompts;
+}
+
+function resolveActiveChat(
+  source: ActiveChatSource | SendBusySource,
+): ChatDocument | null {
+  return typeof source === "function" ? source().activeChat : source.activeChat;
+}
+
+export function isChatInflight(
+  source: InflightSource | SendBusySource,
+  chatId: string | null | undefined,
 ): boolean {
-  return !!get().activeChat?.turns.some((t) => t.status === "streaming");
+  return !!chatId && chatId in resolveInflightPrompts(source);
+}
+
+export function getInflight(
+  source: InflightSource | SendBusySource,
+  chatId: string | null | undefined,
+): InflightPrompt | null {
+  if (!chatId) return null;
+  return resolveInflightPrompts(source)[chatId] ?? null;
+}
+
+/** True when the active chat has a streaming turn painted in the UI. */
+export function isActivelyStreaming(
+  source: ActiveChatSource,
+  chatId?: string | null,
+): boolean {
+  const active = resolveActiveChat(source);
+  if (!active) return false;
+  if (chatId != null && active.id !== chatId) return false;
+  return active.turns.some((t) => t.status === "streaming");
 }
 
 /**
- * Clear a stuck composer lock: busy without streaming and without inflight.
+ * Send/composer busy for a chat: owns a slot, or (when viewing it) is streaming.
+ */
+export function isChatSendBusy(
+  source: SendBusySource,
+  chatId: string | null | undefined,
+): boolean {
+  if (!chatId) return false;
+  if (chatId in resolveInflightPrompts(source)) return true;
+  return isActivelyStreaming(source, chatId);
+}
+
+export function withoutInflight(
+  prompts: InflightPrompts,
+  chatId: string,
+): InflightPrompts {
+  if (!(chatId in prompts)) return prompts;
+  const next = { ...prompts };
+  delete next[chatId];
+  return next;
+}
+
+export function withInflight(
+  prompts: InflightPrompts,
+  chatId: string,
+  slot: InflightPrompt,
+): InflightPrompts {
+  return { ...prompts, [chatId]: slot };
+}
+
+/**
+ * Clear a stuck send slot for one chat: has inflight claim but no live stream.
  * Only with force from explicit user send / delayed watchdog.
  */
 export function healStuckBusy(
   set: (partial: Partial<SendStoreSlice>) => void,
   get: () => Pick<
     SendStoreSlice,
-    "busy" | "activeChat" | "activeChatId" | "inflightChatId" | "inflightTurnId"
+    "activeChat" | "activeChatId" | "inflightPrompts"
   >,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; chatId?: string | null } = {},
 ): boolean {
   if (!opts.force) return false;
-  if (!get().busy) return false;
-  if (get().inflightChatId != null) return false;
-  if (isActivelyStreaming(get)) return false;
+  const chatId = opts.chatId ?? get().activeChatId;
+  if (!chatId) return false;
+  if (!(chatId in get().inflightPrompts)) return false;
+  if (isActivelyStreaming(get, chatId)) return false;
   set({
-    busy: false,
-    inflightChatId: null,
-    inflightTurnId: null,
-    inflightGeneration: null,
+    inflightPrompts: withoutInflight(get().inflightPrompts, chatId),
   });
   return true;
 }
@@ -92,6 +175,26 @@ export function healStuckBusy(
 /** True when a queue head error looks transient (re-queue + retry). */
 export function isRetriableQueueError(err: string): boolean {
   return /settling after cancel|in-flight prompt|try again/i.test(err);
+}
+
+/**
+ * Whether a prompt-finished event should release this chat's send slot.
+ * Backend is one-prompt-per-chat; turnId guards against a late finish for an
+ * older turn after a newer send claimed the slot.
+ */
+export function isMatchingInflightFinish(
+  slot: InflightPrompt | null | undefined,
+  finishedTurnId: string | null | undefined,
+): boolean {
+  if (!slot) return false;
+  if (slot.turnId != null) {
+    // Prefer exact match; also accept null finishedTurnId as a soft release
+    // when the backend omitted it (should be rare).
+    return finishedTurnId == null || finishedTurnId === slot.turnId;
+  }
+  // Slot claimed but turn id not yet adopted from send_message / chat-updated.
+  // Accept finishes with or without turnId so a fast prompt cannot brick the slot.
+  return true;
 }
 
 export async function dispatchSend(
@@ -103,10 +206,10 @@ export async function dispatchSend(
 ) {
   const generation = ++sendGeneration;
   set({
-    busy: true,
-    inflightChatId: chatId,
-    inflightTurnId: null,
-    inflightGeneration: generation,
+    inflightPrompts: withInflight(get().inflightPrompts, chatId, {
+      turnId: null,
+      generation,
+    }),
     error: null,
   });
 
@@ -150,36 +253,54 @@ export async function dispatchSend(
       .find((t) => t.status === "streaming");
     const stillStreaming = !!streamingTurn;
     const stillViewing = get().activeChatId === chatId;
-    if (get().inflightGeneration !== generation) {
+    const current = get().inflightPrompts[chatId];
+    if (!current || current.generation !== generation) {
       return;
     }
-    set({
-      activeChat: stillViewing ? chat : get().activeChat,
-      busy: stillStreaming,
-      inflightChatId: stillStreaming ? chatId : null,
-      inflightTurnId: stillStreaming ? streamingTurn?.id ?? null : null,
-      inflightGeneration: stillStreaming ? generation : null,
-      chats: get().chats.map((c) =>
-        c.id === chat.id
-          ? {
-              ...c,
-              title: chat.title,
-              updatedAt: chat.updatedAt,
-              preview: (text || "Attachment").slice(0, 120),
-              acpSessionId: chat.acpSessionId,
-              backend: chat.backend,
-            }
-          : c,
-      ),
-    });
+    if (stillStreaming) {
+      set({
+        activeChat: stillViewing ? chat : get().activeChat,
+        inflightPrompts: withInflight(get().inflightPrompts, chatId, {
+          turnId: streamingTurn?.id ?? null,
+          generation,
+        }),
+        chats: get().chats.map((c) =>
+          c.id === chat.id
+            ? {
+                ...c,
+                title: chat.title,
+                updatedAt: chat.updatedAt,
+                preview: (text || "Attachment").slice(0, 120),
+                acpSessionId: chat.acpSessionId,
+                backend: chat.backend,
+              }
+            : c,
+        ),
+      });
+    } else {
+      set({
+        activeChat: stillViewing ? chat : get().activeChat,
+        inflightPrompts: withoutInflight(get().inflightPrompts, chatId),
+        chats: get().chats.map((c) =>
+          c.id === chat.id
+            ? {
+                ...c,
+                title: chat.title,
+                updatedAt: chat.updatedAt,
+                preview: (text || "Attachment").slice(0, 120),
+                acpSessionId: chat.acpSessionId,
+                backend: chat.backend,
+              }
+            : c,
+        ),
+      });
+    }
   } catch (e) {
-    if (get().inflightGeneration === generation) {
+    const current = get().inflightPrompts[chatId];
+    if (current?.generation === generation) {
       set({
         error: String(e),
-        busy: false,
-        inflightChatId: null,
-        inflightTurnId: null,
-        inflightGeneration: null,
+        inflightPrompts: withoutInflight(get().inflightPrompts, chatId),
       });
     }
     throw e;

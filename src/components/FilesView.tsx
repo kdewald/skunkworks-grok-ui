@@ -18,6 +18,7 @@ import {
   MessageSquarePlus,
   RefreshCw,
   Save,
+  Trash2,
 } from "lucide-react";
 import { useAppStore } from "../store";
 import { chipId } from "../contextChips";
@@ -66,7 +67,7 @@ const emptyTree = (): TreeState => ({
   error: null,
 });
 
-function clampMenuPos(x: number, y: number, w = 200, h = 120) {
+function clampMenuPos(x: number, y: number, w = 200, h = 180) {
   const maxX = Math.max(8, window.innerWidth - w - 8);
   const maxY = Math.max(8, window.innerHeight - h - 8);
   return {
@@ -82,7 +83,9 @@ export function FilesView() {
     projects,
     addContextChip,
     setWorkspaceMode,
+    workspaceMode,
   } = useAppStore();
+  const filesVisible = workspaceMode === "files";
 
   const project = projects.find((p) => p.id === activeProjectId);
   const isScratch =
@@ -272,6 +275,81 @@ export function FilesView() {
       }
     },
     [activeProjectId, chatIdForFs],
+  );
+
+  const deletePath = useCallback(
+    async (path: string, isDir: boolean) => {
+      if (!activeProjectId || !path) return;
+      const label = path.split("/").pop() || path;
+      const ok = window.confirm(
+        isDir
+          ? `Delete folder “${label}” and everything inside it? This cannot be undone.`
+          : `Delete “${label}”? This cannot be undone.`,
+      );
+      if (!ok) return;
+      try {
+        await invoke("delete_workspace_path", {
+          projectId: activeProjectId,
+          path,
+          chatId: chatIdForFs,
+        });
+        // Clear viewer if the open file was removed (or lived under a deleted dir).
+        if (
+          activePath === path ||
+          (isDir && activePath?.startsWith(`${path}/`))
+        ) {
+          fileSessionGen.current += 1;
+          setActivePath(null);
+          setFile(null);
+          setDraft("");
+          setDirty(false);
+          setSaveError(null);
+          setFileError(null);
+          setSelection(null);
+        }
+        // Refresh parent listing (or root).
+        const parent = path.includes("/")
+          ? path.slice(0, path.lastIndexOf("/"))
+          : "";
+        setTree((t) => {
+          const nextChildren = { ...t.children };
+          // Drop cached listings under a deleted directory.
+          if (isDir) {
+            for (const key of Object.keys(nextChildren)) {
+              if (key === path || key.startsWith(`${path}/`)) {
+                delete nextChildren[key];
+              }
+            }
+          }
+          delete nextChildren[parent];
+          const nextExpanded = { ...t.expanded };
+          if (isDir) {
+            for (const key of Object.keys(nextExpanded)) {
+              if (key === path || key.startsWith(`${path}/`)) {
+                delete nextExpanded[key];
+              }
+            }
+          }
+          return {
+            ...t,
+            children: nextChildren,
+            expanded: nextExpanded,
+            error: null,
+          };
+        });
+        await loadDir(parent);
+        void loadGitStatus();
+      } catch (e) {
+        setTree((t) => ({ ...t, error: String(e) }));
+      }
+    },
+    [
+      activeProjectId,
+      chatIdForFs,
+      activePath,
+      loadDir,
+      loadGitStatus,
+    ],
   );
 
   const canEdit =
@@ -635,6 +713,7 @@ export function FilesView() {
                       : undefined
                   }
                   editable={canEdit}
+                  visible={filesVisible}
                   onChange={onDraftChange}
                   onSave={() => void saveFile()}
                   onSelectionChange={setSelection}
@@ -688,21 +767,49 @@ export function FilesView() {
                 <FilePlus2 size={13} strokeWidth={1.75} />
                 Add file to chat
               </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="files-ctx-item is-danger"
+                onClick={() => {
+                  const path = ctxMenu.path;
+                  setCtxMenu(null);
+                  void deletePath(path, false);
+                }}
+              >
+                <Trash2 size={13} strokeWidth={1.75} />
+                Delete file
+              </button>
             </>
           )}
           {ctxMenu.kind === "tree-dir" && (
-            <button
-              type="button"
-              role="menuitem"
-              className="files-ctx-item"
-              onClick={() => {
-                addDirChip(ctxMenu.path);
-                setCtxMenu(null);
-              }}
-            >
-              <FolderPlus size={13} strokeWidth={1.75} />
-              Add folder to chat
-            </button>
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                className="files-ctx-item"
+                onClick={() => {
+                  addDirChip(ctxMenu.path);
+                  setCtxMenu(null);
+                }}
+              >
+                <FolderPlus size={13} strokeWidth={1.75} />
+                Add folder to chat
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="files-ctx-item is-danger"
+                onClick={() => {
+                  const path = ctxMenu.path;
+                  setCtxMenu(null);
+                  void deletePath(path, true);
+                }}
+              >
+                <Trash2 size={13} strokeWidth={1.75} />
+                Delete folder
+              </button>
+            </>
           )}
         </div>
       )}
